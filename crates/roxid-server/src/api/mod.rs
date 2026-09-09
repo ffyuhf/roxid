@@ -24,6 +24,10 @@
 //! 裸 `curl -d` 示例；全部 JSON POST 端点替换 axum Json<T>，原无头/异头
 //! POST 全部 415）；BUG-5 serve 启动错误新变体 ServeStartup（端口绑定失败
 //! 不再误报 llama-server 分类）2026-09-07 19-20
+//! M93 碴B（迭代29）：PullGate 增共享进度快照（completed/total 原子量，
+//! 首任务发事件时顺带写入）+ 等待者 ticker 转发——原「后到请求等待终态
+//! 并转发，无中途进度」使 CLI 中断后二次 run 复用后台任务时全程静默
+//!（方案 A 用户裁决 2026-09-10 06:32）2026-09-10 06-40
 
 pub mod llamacpp;
 pub mod ollama;
@@ -159,6 +163,10 @@ pub struct PullGate {
     done: tokio::sync::Notify,
     /// None=进行中；Some(Ok(()))=拉取成功；Some(Err(错误描述))=拉取失败
     result: std::sync::Mutex<Option<Result<(), String>>>,
+    /// M93 碴B：已完成字节快照（首任务写者唯一，等待者多并发读）
+    progress_completed: std::sync::atomic::AtomicU64,
+    /// M93 碴B：总量快照（0=尚无字节级进度，等待者据此跳过进度帧防 0/0 误显）
+    progress_total: std::sync::atomic::AtomicU64,
 }
 
 impl PullGate {
@@ -167,7 +175,27 @@ impl PullGate {
         Self {
             done: tokio::sync::Notify::new(),
             result: std::sync::Mutex::new(None),
+            progress_completed: std::sync::atomic::AtomicU64::new(0),
+            progress_total: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// M93 碴B：写入进度快照（首任务每下发一条进度事件即调用一次）。
+    ///
+    /// - 参数 completed / total：已完成字节数与该层总量
+    pub fn update_progress(&self, completed: u64, total: u64) {
+        use std::sync::atomic::Ordering;
+        self.progress_completed.store(completed, Ordering::Release);
+        self.progress_total.store(total, Ordering::Release);
+    }
+
+    /// M93 碴B：读取进度快照（等待者 ticker 周期调用转发真实进度）。
+    ///
+    /// - 返回：(completed, total)；total 为 0 表示首任务尚无字节级进度
+    pub fn snapshot_progress(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        let total = self.progress_total.load(Ordering::Acquire);
+        (self.progress_completed.load(Ordering::Acquire), total)
     }
 
     /// 等待任务终态（可多等待者并发等待）。
@@ -454,6 +482,28 @@ mod tests {
         // finish 幂等：终态不被二次覆盖
         gate.finish(Err("late".into()));
         assert!(gate.wait().await.is_ok(), "终态必须保持首次登记值");
+    }
+
+    /// M93 碴B：进度快照读写——未写入时 (0, 0)（等待者据此跳过进度帧），
+    /// 写入后读得最新值；终态语义不受快照影响
+    #[test]
+    fn pull_gate_progress_snapshot_write_then_read() {
+        let gate = PullGate::new();
+        assert_eq!(gate.snapshot_progress(), (0, 0), "未写入时快照必须为零值");
+        gate.update_progress(1024, 91727296);
+        assert_eq!(gate.snapshot_progress(), (1024, 91727296));
+        gate.update_progress(8192, 91727296);
+        assert_eq!(
+            gate.snapshot_progress(),
+            (8192, 91727296),
+            "快照必须随写覆盖为最新值"
+        );
+        gate.finish(Ok(()));
+        assert_eq!(
+            gate.snapshot_progress(),
+            (8192, 91727296),
+            "终态登记不改动快照"
+        );
     }
 
     /// M21 D4d：通配匹配语义

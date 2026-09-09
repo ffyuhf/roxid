@@ -45,6 +45,12 @@
 //! M90（迭代28）：list MODIFIED 列人类可读混合格式（绝对时间 + 中文
 //! 相对短语；RFC3339 双形态解析：roxid Z 秒级 / 官方纳秒偏移；格式与
 //! 短语中文化均为用户裁决 2026-09-10 04:36/04:41）2026-09-10 04-42
+//! M92+M94（迭代29）：M92 进度 spinner 补 enable_steady_tick（indicatif
+//! {spinner} 字符由 tick 计数驱动，set_message 只重绘不推进 tick，原
+//! 永停首字符 ⠁ 形似卡死）；M94 run 启动预检——POST /api/show 判 404，
+//! 未安装先拉取（进度可见）完成后再进输入框（时序对齐官方，用户裁决
+//! 2026-09-10 06:34）；仅 404 触发预拉取，其余放行走既有 chat 报错路径
+//! 2026-09-10 06-42
 
 mod complete;
 mod completion;
@@ -869,16 +875,39 @@ async fn cmd_run(
     verbose: bool,
     runtime_override: Option<String>,
 ) -> i32 {
+    // M94 碴C（迭代29）：run 启动预检——对齐官方「未安装先下载（进度
+    // 可见）完成后再显示输入框」时序（用户裁决 2026-09-10 06:34；原
+    // 实现先进输入框、待首次 chat 404 才触发拉取）。仅明确 404 触发；
+    // 连接失败/5xx 放行，由既有 chat 路径报错（预检不引入新失败面）；
+    // REPL 会话内模型被删仍由 M33 碴8 内层兜底闭环
+    let not_installed = matches!(
+        http()
+            .post(format!("{}/api/show", base_url()))
+            .json(&json!({"model": model}))
+            .send()
+            .await,
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND
+    );
+    if not_installed {
+        eprintln!("模型未安装，正在拉取：{model}");
+        if pull_and_render(model).await != 0 {
+            return 1; // 拉取失败（错误已打印）
+        }
+    }
     let mut rl = rustyline::DefaultEditor::new().expect("初始化 REPL 失败");
     let mut messages: Vec<Value> = Vec::new();
     let single = !first_prompt.is_empty();
+    // 迭代30（M98）：横幅进入会话时打印一次（对齐官方 run；原实现每轮循环
+    // 读取输入前重复打印刷屏，2026-09-10 用户反馈）
+    if !single {
+        println!(">>> 提示词送出，/bye 退出，/clear 清空对话 <<<");
+    }
     let mut prompt = first_prompt;
     // M33 碴8：本会话是否已自动拉取过（防 404 循环拉取，最多一次）
     let mut pulled = false;
 
     loop {
         if !single {
-            println!(">>> 提示词送出，/bye 退出，/clear 清空对话 <<<");
             match rl.readline(format!("{model}> ").as_str()) {
                 Ok(line) => {
                     let line = line.trim().to_string();
@@ -1082,6 +1111,11 @@ async fn consume_ndjson_progress(resp: reqwest::Response) -> Result<(), String> 
             .template("{spinner} {msg}")
             .unwrap(),
     );
+    // M92 碴A（迭代29）：spinner 补 steady tick——indicatif 的 {spinner}
+    // 字符由 tick 计数驱动前进，set_message 只触发重绘不推进 tick，原
+    // 实现 spinner 永停首字符 ⠁ 形似卡死；100ms 后台 tick 对齐官方 Go
+    // 动画周期；非 TTY 路径（spinner 隐藏走文本行）零影响
+    bar.enable_steady_tick(std::time::Duration::from_millis(100));
     use futures::StreamExt;
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();

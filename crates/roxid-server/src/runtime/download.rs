@@ -53,9 +53,9 @@ use tokio::process::Command;
 use crate::config::llama_runtime_root;
 use crate::error::{RoxidError, RoxidResult};
 
-/// 版本锁定的 llama.cpp 构建 tag（来源：用户确认 2026-08-24 18:49：
-/// b10605 才是最新版本；升级需重新回归测试）
-pub const LOCKED_LLAMA_CPP_TAG: &str = "b10605";
+/// 版本锁定的 llama.cpp 构建 tag（来源：用户确认 2026-08-24 18:49 b10605
+/// 为当时最新；2026-09-10 07:15 用户指示硬编码升级为 b10883，覆盖旧裁决）
+pub const LOCKED_LLAMA_CPP_TAG: &str = "b10883";
 
 /// 覆盖运行时二进制的环境变量（来源：用户确认 2026-08-24 18:51 Q10 方案 B：
 /// 用户自编译 CUDA 版 llama-server 时直接复用）
@@ -111,7 +111,7 @@ fn cached_file_proxy_gh() -> Option<String> {
 /// GitHub 原始资产 URL（不经代理）
 ///
 /// - 参数 backend_variant：变体片段，如 "ubuntu-vulkan-x64"
-/// - 参数 tag：版本 tag，如 "b10605"（M36 起参数化，不再锁死）
+/// - 参数 tag：版本 tag，如 "b10883"（M36 起参数化，不再锁死）
 /// - 返回：完整 GitHub URL
 fn github_raw_url(backend_variant: &str, tag: &str) -> String {
     format!(
@@ -158,7 +158,7 @@ pub fn is_valid_tag(tag: &str) -> bool {
 /// 确保 llama-server 可用并返回其路径。
 /// 优先级（M36 更新）：ROXID_LLAMA_SERVER 环境变量 → manual 手动版本
 /// （setup --llama-url 安装）→ config default_version 指定版本的变体缓存
-/// （未安装则告警回退）→ b10605 锁定链（缓存 → 下载解压）。
+/// （未安装则告警回退）→ 锁定链（缓存 → 下载解压；M95 起 b10883）。
 ///
 /// - 参数 backend_variant：探测得到的变体片段（Backend::asset_variant()）
 /// - 返回：llama-server 二进制路径
@@ -195,7 +195,7 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
             "默认后端版本 {tag} 的变体 {backend_variant} 未安装，回退 {LOCKED_LLAMA_CPP_TAG} 锁定链"
         );
     }
-    // 4) b10605 锁定链：缓存命中直接复用，未命中下载解压落位
+    // 4) 锁定链（M95 起 b10883）：缓存命中直接复用，未命中下载解压落位
     let server = variant_cache_dir(backend_variant, LOCKED_LLAMA_CPP_TAG).join("llama-server");
     if server.is_file() {
         return Ok(server);
@@ -205,7 +205,7 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
 }
 
 /// resolve-only 路径解析（M54b 碴B）：按 ensure_llama_server 同序链
-/// （env → manual → default_version 已装 → b10605 锁定链缓存）解析当前
+/// （env → manual → default_version 已装 → 锁定链缓存，M95 起 b10883）解析当前
 /// 应然二进制路径，仅存在性检查、零下载零网络。scheduler 复用判定用它
 /// 与实例记录路径比对，不一致（runtime use 切换默认版本 / env 改指向）
 /// 时触发重建——碴B修复：原仅 ctx/RUNTIME 双键，后端版本切换后运行
@@ -241,7 +241,7 @@ pub fn resolve_llama_server_path(backend_variant: &str) -> Option<PathBuf> {
             return Some(server);
         }
     }
-    // 4) b10605 锁定链缓存（未缓存 None——不下载，下载由 ensure 承担）
+    // 4) 锁定链缓存（M95 起 b10883；未缓存 None——不下载，下载由 ensure 承担）
     let server = variant_cache_dir(backend_variant, LOCKED_LLAMA_CPP_TAG).join("llama-server");
     server.is_file().then_some(server)
 }

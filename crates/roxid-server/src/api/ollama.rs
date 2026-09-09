@@ -64,6 +64,10 @@
 //! Modelfile（resolve_modelfile 三形态分派：modelfile 文本 > from 文本
 //! 兼容 > from 基础模型名；license/quantize/renderer/parser 无对应实现
 //! 注记忽略）2026-09-07 22-12
+//! M93 碴B（迭代29）：pull 等待者分支补进度转发——200ms ticker 读
+//! PullGate 共享快照，下发与首请求同形态进度事件（原「等待终态并转发，
+//! 无中途进度」使 CLI 中断后二次 run 复用后台任务时全程静默数十分钟）；
+//! 首任务事件下发侧顺带写快照（update_gate_snapshot）2026-09-10 06-40
 
 use std::sync::Arc;
 
@@ -105,6 +109,24 @@ fn http() -> reqwest::Client {
 /// Ollama 风格错误响应：{"error": "..."}
 fn error_response(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(json!({"error": msg.to_string()}))).into_response()
+}
+
+/// acquire 错误分类整形（迭代30 碴A，M96）：仅未安装报 404——客户端
+/// （roxid run M33 碴8/M94 预检）依赖 404 触发自动拉取；加载失败/超时等
+/// 其他错误报 500。原实现统一 404，加载失败被客户端误判「未安装」触发
+/// 无效重拉，真实报错被拉取噪音掩盖（2026-09-10 gemma4 案实证：
+/// wrong number of tensors 被报 404 → 重拉 9.6GB → 仍失败）。对齐原版
+/// 语义：404=模型未找到，5xx=服务端加载/运行失败。llamacpp/openai 层
+/// acquire 同语义复用（pub(crate)）。
+///
+/// - 参数 e：acquire 返回的错误
+/// - 返回：分类后的错误响应（ModelNotFound→404，其余→500）
+pub(crate) fn acquire_error_response(e: crate::error::RoxidError) -> Response {
+    if matches!(e, crate::error::RoxidError::ModelNotFound(_)) {
+        error_response(StatusCode::NOT_FOUND, e)
+    } else {
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+    }
 }
 
 /// 上游（llama-server 实例）错误响应体整形为单层人类可读文案（M34 BUG-6）。
@@ -802,7 +824,8 @@ pub async fn chat(
         .await
     {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::NOT_FOUND, e),
+        // 迭代30 碴A（M96）：错误分类整形（原统一 404）
+        Err(e) => return acquire_error_response(e),
     };
     // M28 碴6：acquire 耗时即 load_duration（复用实例≈0，冷加载为真实加载时长）
     let load = request_start.elapsed();
@@ -893,7 +916,8 @@ pub async fn generate(
         .await
     {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::NOT_FOUND, e),
+        // 迭代30 碴A（M96）：错误分类整形（原统一 404）
+        Err(e) => return acquire_error_response(e),
     };
     // M28 碴6：acquire 耗时即 load_duration
     let load = request_start.elapsed();
@@ -1360,7 +1384,34 @@ pub async fn pull(
     if let Some(gate) = existing_gate {
         tokio::spawn(async move {
             // 等待者：终态转发为 NDJSON 事件（与首个请求的终态事件语义一致）
-            let line = match gate.wait().await {
+            // M93 碴B（迭代29）：终态前 200ms ticker 读 PullGate 共享快照，
+            // 转发与首请求同形态的真实进度事件（completed/total 随首任务
+            // 下载递增；200ms 对齐 downloader 既有上报粒度）。total==0
+            //（首任务 manifest 阶段尚无字节级快照）跳过进度帧防 0/0 误显
+            // 100%；tx 发送失败（接收端断开，如 CLI 已退出）即停止转发，
+            // 终态无需再发
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let terminal = loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let (completed, total) = gate.snapshot_progress();
+                        if total > 0 {
+                            let line = json!({
+                                "status": "pulling",
+                                "completed": completed,
+                                "total": total,
+                            })
+                            .to_string();
+                            if tx.send(line).await.is_err() {
+                                return; // 接收端断开：转发无意义，任务收尾
+                            }
+                        }
+                    }
+                    r = gate.wait() => break r,
+                }
+            };
+            let line = match terminal {
                 Ok(()) => json!({"status": "success"}).to_string(),
                 Err(e) => json!({"error": e}).to_string(),
             };
@@ -1382,6 +1433,9 @@ pub async fn pull(
                 crate::registry::HuggingFaceSource::new()
             });
             let root = st.models_root.clone();
+            // M93 碴B：快照写入句柄——回调经此同步进度到 PullGate 供等待者
+            // 转发；克隆须先于下方 guard 对 gate 的 move 消费
+            let progress_gate = gate.clone();
             // M29 碴2：清表键同步使用规范化键（guard 持键与登记键一致）
             let guard = PullGuard::new(st.clone(), pull_key.clone(), gate);
             tokio::spawn(async move {
@@ -1396,12 +1450,14 @@ pub async fn pull(
                     };
                     hf.pull(&repo, tag.as_deref(), &root, |ev| {
                         send_progress_event(&tx, &ev, &mut dropped);
+                        update_gate_snapshot(&progress_gate, &ev);
                     })
                     .await
                 } else {
                     registry
                         .pull_model(&model, &root, |ev| {
                             send_progress_event(&tx, &ev, &mut dropped);
+                            update_gate_snapshot(&progress_gate, &ev);
                         })
                         .await
                 };
@@ -1483,7 +1539,8 @@ pub async fn embed(
         .await
     {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::NOT_FOUND, e),
+        // 迭代30 碴A（M96）：错误分类整形（原统一 404）
+        Err(e) => return acquire_error_response(e),
     };
     let load = request_start.elapsed(); // M29 碴4：acquire 耗时即 load_duration
     let port = lease.port().await;
@@ -1569,7 +1626,8 @@ pub async fn embeddings_legacy(
         .await
     {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::NOT_FOUND, e),
+        // 迭代30 碴A（M96）：错误分类整形（原统一 404）
+        Err(e) => return acquire_error_response(e),
     };
     let port = lease.port().await;
     let resp = match http()
@@ -1917,6 +1975,18 @@ fn send_progress_event(
     if tx.try_send(line).is_err() {
         *dropped += 1;
         tracing::debug!("pull 进度事件丢弃（通道满，慢客户端）：累计 {dropped} 条");
+    }
+}
+
+/// M93 碴B（迭代29）：进度事件同步写入 PullGate 共享快照——首任务每发
+/// 一条进度事件即更新快照，等待者 ticker 据此转发真实进度。completed/
+/// total 缺失的状态事件（pulling manifest 等）跳过，快照保持最近一次
+/// 字节级进度（等待者 manifest 阶段转发最近已知值而非回退为零）。
+///
+/// - 参数 gate / ev：完成门与待下发的进度事件
+fn update_gate_snapshot(gate: &Arc<PullGate>, ev: &crate::registry::PullEvent) {
+    if let (Some(completed), Some(total)) = (ev.completed, ev.total) {
+        gate.update_progress(completed, total);
     }
 }
 

@@ -28,11 +28,14 @@
 //! M54（迭代19 碴B）：Runner 记录实际二进制路径 llama_server_bin——
 //! runtime use 切换默认版本后应然路径与实例记录不一致时触发重建
 //! （碴B：原仅 ctx/RUNTIME 双键，后端版本切换运行实例无感知）2026-09-09 20-25
+//! M97（迭代30 碴A增强）：stderr 尾部环形缓存（12 行）——「启动即退出」
+//! 报错附带 stderr 摘要；gemma4 案实证裸文案无法定位真实失败原因
+//! （wrong number of tensors 湮没在统一 404 与无效重拉噪音中）2026-09-10 07-20
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -46,6 +49,10 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// /health 就绪等待总超时（大模型加载耗时较长，给足余量）
 const HEALTH_READY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// stderr 尾部环形缓存行数（M97：启动失败报错附 stderr 摘要的诊断上限；
+/// 取 12 覆盖 llama-server 加载错误及其上下文行，满额滚动淘汰最早行）
+const STDERR_TAIL_LINES: usize = 12;
 
 /// 默认 slot 并行数（对齐原版 Ollama OLLAMA_NUM_PARALLEL 默认值；
 /// 来源：用户确认 Q2 2026-08-24 22:10「补齐并默认开启」）
@@ -190,6 +197,9 @@ pub struct Runner {
     keep_alive: Duration,
     /// 在途请求数（M27 碴1：非零表示有请求未完成，reaper 不得卸载）
     in_flight: u32,
+    /// stderr 尾部环形缓存（M97：启动即退出报错携带 stderr 摘要的数据源；
+    /// std Mutex——转发任务与 wait_until_healthy 均短临界区、锁内无 await）
+    stderr_tail: Arc<StdMutex<VecDeque<String>>>,
     /// 健康检查复用的 HTTP 客户端（2s 超时）
     http: reqwest::Client,
 }
@@ -270,10 +280,12 @@ impl Runner {
 
         // 后台逐行转发子进程输出到日志，防止管道写满导致子进程阻塞
         if let Some(stdout) = child.stdout.take() {
-            spawn_log_forwarder(stdout, "stdout");
+            spawn_log_forwarder(stdout, "stdout", None);
         }
+        // M97：stderr 同时入尾部缓存（启动失败诊断摘要数据源）
+        let stderr_tail = Arc::new(StdMutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
         if let Some(stderr) = child.stderr.take() {
-            spawn_log_forwarder(stderr, "stderr");
+            spawn_log_forwarder(stderr, "stderr", Some(stderr_tail.clone()));
         }
 
         Ok(Self {
@@ -288,6 +300,7 @@ impl Runner {
             expires_at: Instant::now() + keep_alive,
             keep_alive,
             in_flight: 0,
+            stderr_tail,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
@@ -305,10 +318,21 @@ impl Runner {
                 return Ok(());
             }
             if self.is_process_dead() {
-                return Err(RoxidError::RunnerFailure(format!(
-                    "llama-server 启动即退出：model={}",
-                    self.model_name
-                )));
+                // M97：附带 stderr 尾部摘要——gemma4 案实证裸「启动即退出」
+                // 文案无法定位真实失败原因（锁内无 await，短临界区安全）
+                let tail = self
+                    .stderr_tail
+                    .lock()
+                    .map(|q| q.iter().cloned().collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default();
+                return Err(RoxidError::RunnerFailure(if tail.is_empty() {
+                    format!("llama-server 启动即退出：model={}", self.model_name)
+                } else {
+                    format!(
+                        "llama-server 启动即退出：model={}；stderr 尾部：{tail}",
+                        self.model_name
+                    )
+                }));
             }
             if Instant::now() >= deadline {
                 return Err(RoxidError::RunnerFailure(format!(
@@ -561,10 +585,17 @@ fn parse_vram_csv(text: &str) -> HashMap<u32, u64> {
 }
 
 /// 后台逐行转发子进程输出到日志，防止管道写满导致子进程阻塞。
+/// M97：tail 非 None 时逐行同步入环形缓存（stderr 诊断摘要数据源；
+/// 满额滚动淘汰最早行）。
 ///
 /// - 参数 stream：stdout / stderr 任意一方
 /// - 参数 stream_name：日志标注用的流名
-fn spawn_log_forwarder<R>(stream: R, stream_name: &'static str)
+/// - 参数 tail：尾部缓存（stdout 传 None，stderr 传 Some）
+fn spawn_log_forwarder<R>(
+    stream: R,
+    stream_name: &'static str,
+    tail: Option<Arc<StdMutex<VecDeque<String>>>>,
+)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -572,6 +603,14 @@ where
         let mut lines = BufReader::new(stream).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             tracing::debug!("[llama-server:{stream_name}] {line}");
+            if let Some(t) = &tail {
+                if let Ok(mut q) = t.lock() {
+                    if q.len() == STDERR_TAIL_LINES {
+                        q.pop_front();
+                    }
+                    q.push_back(line);
+                }
+            }
         }
     });
 }

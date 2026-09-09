@@ -72,7 +72,8 @@ async fn proxy_post(st: &Arc<AppState>, path: &str, body: Value) -> Response {
     // llama.cpp 原生协议无 num_ctx 概念：请求级窗口不约束
     let lease = match st.scheduler.acquire(&model, keep_alive, None, None).await {
         Ok(r) => r,
-        Err(e) => return err_json(axum::http::StatusCode::NOT_FOUND, e.to_string()),
+        // 迭代30 碴A（M96）：错误分类整形——404 仅未安装（原统一 404）
+        Err(e) => return crate::api::ollama::acquire_error_response(e),
     };
     let port = lease.port().await;
     let (forward_body, _) = strip_routing_fields(body);
@@ -99,7 +100,8 @@ async fn proxy_get(st: &Arc<AppState>, model: &str, path: &str) -> Response {
     let keep_alive = parse_keep_alive(None);
     let lease = match st.scheduler.acquire(model, keep_alive, None, None).await {
         Ok(r) => r,
-        Err(e) => return err_json(axum::http::StatusCode::NOT_FOUND, e.to_string()),
+        // 迭代30 碴A（M96）：错误分类整形——404 仅未安装（原统一 404）
+        Err(e) => return crate::api::ollama::acquire_error_response(e),
     };
     let port = lease.port().await;
     let resp = match http()

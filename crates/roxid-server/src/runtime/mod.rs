@@ -4,7 +4,8 @@
 //! - GPU 探测：nvidia-smi / vulkaninfo 任一可用 → Vulkan 预编译包；否则 CPU 包
 //!   （实测 Linux 官方预编译无 CUDA 包，NVIDIA 经 Vulkan 加速；
 //!    需原生 CUDA 时设 ROXID_LLAMA_SERVER 复用用户自编译产物）
-//! - 从 llama.cpp 官方 GitHub Releases 下载 tar.gz（锁定链 b10605 兜底；
+//! - 从 llama.cpp 官方 GitHub Releases 下载 tar.gz（锁定链 b10883 兜底
+//!   （M95 升级 2026-09-10 07:17，原 b10605，用户指示）；
 //!   M36 起支持任意 tag 多版本并存 + config default_version 持久默认），
 //!   解压平铺缓存于 {roxid_home}/llama.cpp/{tag}/{variant}/，
 //!   llama-server 的 rpath 含 $ORIGIN，直接运行即可

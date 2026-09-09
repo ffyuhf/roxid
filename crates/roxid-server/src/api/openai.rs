@@ -63,7 +63,8 @@ async fn proxy_json(st: &Arc<AppState>, path: &str, body: Value) -> Response {
     // OpenAI 协议无 num_ctx 概念：请求级窗口不约束（透传原则）
     let lease = match st.scheduler.acquire(&model, keep_alive, None, None).await {
         Ok(r) => r,
-        Err(e) => return err_json(StatusCode::NOT_FOUND, e.to_string()),
+        // 迭代30 碴A（M96）：错误分类整形——404 仅未安装（原统一 404）
+        Err(e) => return crate::api::ollama::acquire_error_response(e),
     };
     let port = lease.port().await;
     // M29 碴3：转发前剥离 roxid 调度字段（model/keep_alive）——原样透传使
