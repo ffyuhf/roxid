@@ -1,0 +1,119 @@
+# roxid 发布工作流：GitHub 发布页创建 Release 时自动编译并上传资产
+# 触发：release published——用户在发布页手动创建/发布 Release（打 tag + 写说明）时触发
+#   （裁决 R1 2026-09-10 02:21：语义贴合「根据发布页 tag」，tag/Release 由用户手动掌控）
+# 平台：仅 Linux amd64/arm64 musl 静态双架构，资产名逐字对齐 roxid_install.sh
+#   resolve_remote_url 拼接约定 roxid-linux-$ARCH.tar.gz（裁决 R2 2026-09-10 02:21）
+# 版本：跟随 tag 注入——构建前 sed 改写工作副本 Cargo.toml 的 workspace version
+#   为 tag 版（CI 内生效，不回传仓库），构建后复核 --version 输出（裁决 R5 2026-09-10 02:25）
+# 资产：双架构 tarball（内含 roxid + roxid_install.sh）+ 各自 sha256 +
+#   独立 roxid_install.sh 资产 + 其 sha256（裁决 R6 2026-09-10 02:29：一次下载全齐）
+# 修改历史：
+#   2026-09-10 02-33 新增（迭代23，计划 v1.2.0 用户批准于 2026-09-10 02:31；
+#                     设计点 D1–D8 见计划书 1.5 表）
+
+name: release
+
+# 发布页创建 Release（release published 事件）时触发（R1）
+on:
+  release:
+    types: [published]
+
+# 最小权限：上传 Release 资产仅需 contents 写权限（D5）
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # 一架构失败不取消另一架构（失败资产不上传，成功架构资产仍可用）
+      fail-fast: false
+      matrix:
+        include:
+          # amd64：标准 runner + x86_64 musl（D2）
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # arm64：GitHub 公共仓库免费原生 arm64 runner + aarch64 musl，无交叉工具链（D2）
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链与 musl 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装 musl 构建工具
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # 版本注入（D1/R5）：tag 为版本唯一真源，仅改写 CI 工作副本，不回传仓库
+      - name: 版本注入（tag 版本写入工作副本 Cargo.toml）
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # 去 v 前缀（无前缀原样保留）
+          VER="${TAG#v}"
+          # 校验版本号形态 MAJOR.MINOR.PATCH[-pre]，防 sed 误写非法值
+          echo "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || { echo "::error::tag 版本号形态非法: ${TAG}（期望 vMAJOR.MINOR.PATCH）"; exit 1; }
+          # 改写 workspace 版本行（Cargo.toml 内唯一裸 version 行，位于 [workspace.package]）
+          sed -i "s/^version = \".*\"$/version = \"${VER}\"/" Cargo.toml
+          grep -q "^version = \"${VER}\"$" Cargo.toml \
+            || { echo "::error::版本注入失败"; exit 1; }
+          echo "已注入版本: ${VER}（来自 tag ${TAG}）"
+
+      - name: 构建（musl 静态）
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 复核（D1/R5）：产物 --version 必须等于 tag 版本，不符即终（无资产上传）
+      - name: 复核构建产物版本
+        run: |
+          EXPECT="${GITHUB_REF_NAME#v}"
+          # clap 输出形如 "roxid 0.2.0"，按后缀比对版本字段
+          ACTUAL="$(./target/${{ matrix.target }}/release/roxid --version)"
+          echo "构建产物: ${ACTUAL} / 期望: roxid ${EXPECT}"
+          case "$ACTUAL" in
+            *"${EXPECT}") ;;
+            *) echo "::error::版本复核失败：--version 输出与 tag 不符"; exit 1 ;;
+          esac
+
+      # 打包（D3/R6）：tarball 顶层含 roxid 二进制 + roxid_install.sh 两文件；
+      # 安装脚本解包用 find -type f -name roxid 精确匹配，脚本文件不同名不误取
+      - name: 打包 tarball（roxid + roxid_install.sh）
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/roxid dist/
+          cp roxid_install.sh dist/
+          tar -czf roxid-linux-${{ matrix.arch }}.tar.gz -C dist roxid roxid_install.sh
+          # 生成 sha256 附随文件（D4）
+          sha256sum roxid-linux-${{ matrix.arch }}.tar.gz > roxid-linux-${{ matrix.arch }}.tar.gz.sha256
+          # 解包自检：包内容与安装脚本取二进制逻辑（find 精确匹配）双核对
+          mkdir -p unpack-check
+          tar -xzf roxid-linux-${{ matrix.arch }}.tar.gz -C unpack-check
+          FOUND="$(find unpack-check -type f -name roxid | head -n 1)"
+          [ -n "$FOUND" ] && [ -f unpack-check/roxid_install.sh ] \
+            || { echo "::error::tarball 自检失败（缺 roxid 或 roxid_install.sh）"; exit 1; }
+          echo "tarball 自检通过: $(tar -tzf roxid-linux-${{ matrix.arch }}.tar.gz)"
+
+      # 上传（D6 覆盖语义；D8 独立脚本资产仅 amd64 job 上传一次防重复）
+      - name: 上传 Release 资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # --clobber：同 Release 重跑时覆盖同名资产，避免重跑即失败（D6）
+          gh release upload "${GITHUB_REF_NAME}" \
+            roxid-linux-${{ matrix.arch }}.tar.gz \
+            roxid-linux-${{ matrix.arch }}.tar.gz.sha256 \
+            --clobber
+          # 独立安装脚本资产（D8）：小体积直取安装器；仅 amd64 job 执行一次
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            sha256sum roxid_install.sh > roxid_install.sh.sha256
+            gh release upload "${GITHUB_REF_NAME}" \
+              roxid_install.sh \
+              roxid_install.sh.sha256 \
+              --clobber
+          fi
