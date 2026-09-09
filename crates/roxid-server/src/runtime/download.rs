@@ -38,6 +38,11 @@
 //! M32 碴8（迭代12）：download_all 响应体读取失败纳入 3 次重试（原
 //! `?` 直接返回，body 中断绕过重试语义）+ ignored 替身测试挂档
 //! 2026-09-07 01-15
+//! M87（迭代27，用户确认 2026-09-10 04:15）：手动安装链代理拼接——
+//! install_manual 对 https://github.com/ 开头的 URL 经 apply_gh_proxy
+//! 前置拼接已配置代理前缀（空前缀=直连），非 GitHub 域名原样直用
+//!（原因：用户确认代理后手动链仍裸连直下，代理配置未覆盖手动链）
+//! 2026-09-10 04-20
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -261,17 +266,42 @@ pub fn url_is_archive(url: &str) -> bool {
     path.ends_with(".tar.gz") || path.ends_with(".tgz")
 }
 
+/// GitHub 域名 URL 的代理前置拼接（M87，迭代27）：仅 `https://github.com/`
+/// 开头的 URL 前置拼接 gh_proxy_prefix()（env 优先 → config 回退，与
+/// asset_url() 拼接语义逐字一致；空前缀 = 直连原样返回）。非 GitHub
+/// 域名（自建镜像 / HF / file:// / 已是代理前缀形态的完整地址）原样
+/// 直用——「完整地址即最终地址」，天然防止对已拼代理的 URL 二次拼接。
+///（来源：用户确认 2026-09-10 04:15「我都确认代理了，那我就是想用代理」）
+///
+/// - 参数 url：用户提供的下载链接
+/// - 返回：实际下载用的 URL
+fn apply_gh_proxy(url: &str) -> String {
+    if url.starts_with("https://github.com/") {
+        format!("{}{}", gh_proxy_prefix(), url)
+    } else {
+        url.to_string()
+    }
+}
+
 /// 手动安装（迭代11 F2）：下载指定 URL 的包并落位为 manual 版本。
 /// tar.gz 走解压流程（strip 顶层目录，$ORIGIN 布局），裸二进制直接落位；
 /// 经 INSTALL_LOCK 互斥 + .installing 暂存原子落位（复用 M29 碴7 先例）。
+/// M87（迭代27）：GitHub 域名 URL 自动前置拼接已配置代理前缀（用户确认
+/// 代理即想用代理，无需手动拼地址）；archive 形态判定与来源记录
+///（[runtime].llama_url）均以用户输入的原始 URL 为准，不受拼接影响。
 ///
 /// - 参数 url：包下载链接（GitHub Releases 形态 tar.gz 或裸 llama-server）
 /// - 返回：落位后的 llama-server 路径
 pub async fn install_manual(url: &str) -> RoxidResult<PathBuf> {
     let _guard = INSTALL_LOCK.lock().await;
     let dir = manual_dir();
-    tracing::info!("手动安装 llama.cpp 运行时：{url}");
-    let bytes = download_all(url).await?;
+    let download_url = apply_gh_proxy(url);
+    if download_url != url {
+        tracing::info!("手动安装 llama.cpp 运行时（经 GitHub 代理）：{download_url}");
+    } else {
+        tracing::info!("手动安装 llama.cpp 运行时：{download_url}");
+    }
+    let bytes = download_all(&download_url).await?;
     place_runtime(&bytes, url_is_archive(url), &dir).await?;
     Ok(manual_server_path())
 }
@@ -560,6 +590,47 @@ mod tests {
         );
         std::env::remove_var(ENV_GH_PROXY);
         std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("ROXID_HOME");
+    }
+
+    /// M87（迭代27）：手动链代理拼接四情形——GitHub 域名 + 代理前置拼接；
+    /// GitHub 域名 + 无代理原样直连；非 GitHub 域名（自建镜像 / file://）
+    /// 原样直用；已是代理前缀形态的完整地址不以 github.com 开头、原样
+    /// 直用（天然防二次拼接）。ROXID_HOME 隔离排除开发机真实 config 干扰。
+    #[test]
+    fn apply_gh_proxy_manual_chain() {
+        let _guard = crate::config::ROXID_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("ROXID_HOME", "/tmp/roxid-gh-manual-test");
+        std::env::set_var(ENV_GH_PROXY, "https://my.mirror.dev/");
+        // 情形1：GitHub 域名 URL 前置拼接代理前缀（与 asset_url 同语义）
+        assert_eq!(
+            apply_gh_proxy("https://github.com/ggml-org/llama.cpp/releases/download/b10883/llama-b10883-bin-ubuntu-vulkan-x64.tar.gz"),
+            "https://my.mirror.dev/https://github.com/ggml-org/llama.cpp/releases/download/b10883/llama-b10883-bin-ubuntu-vulkan-x64.tar.gz"
+        );
+        // 情形4：已是代理前缀形态的完整地址原样直用，不二次拼接
+        assert_eq!(
+            apply_gh_proxy("https://my.mirror.dev/https://github.com/ggml-org/llama.cpp/releases/download/b10883/pkg.tar.gz"),
+            "https://my.mirror.dev/https://github.com/ggml-org/llama.cpp/releases/download/b10883/pkg.tar.gz"
+        );
+        // 情形3：非 GitHub 域名（自建镜像 / file://）原样直用
+        assert_eq!(
+            apply_gh_proxy("https://files.example.com/llama-server"),
+            "https://files.example.com/llama-server"
+        );
+        assert_eq!(
+            apply_gh_proxy("file:///tmp/pkg.tar.gz"),
+            "file:///tmp/pkg.tar.gz"
+        );
+        // 情形2：GitHub 域名但未配置代理（env 清除且无 config）→ 原样直连
+        std::env::remove_var(ENV_GH_PROXY);
+        assert_eq!(
+            apply_gh_proxy(
+                "https://github.com/ggml-org/llama.cpp/releases/download/b10883/pkg.tar.gz"
+            ),
+            "https://github.com/ggml-org/llama.cpp/releases/download/b10883/pkg.tar.gz"
+        );
         std::env::remove_var("ROXID_HOME");
     }
 

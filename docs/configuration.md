@@ -35,7 +35,7 @@ default_version = "b10700"   # default backend version (written by runtime use; 
 | `setup_done` | bool | `false` | — | setup wizard (always set true) |
 | `[proxy].gh` | string? | unset | URL prefix, same semantics as `ROXID_GH_PROXY` | setup wizard |
 | `[proxy].hf` | string? | unset | mirror base, same semantics as `ROXID_HF_PROXY` | setup wizard |
-| `[runtime].llama_url` | string? | unset | tar.gz or bare-binary link | `setup --llama-url` |
+| `[runtime].llama_url` | string? | unset | tar.gz or bare-binary link; `https://github.com/...` URLs are auto-prefixed with the configured GitHub proxy at download time (the recorded value stays as entered) | `setup --llama-url` |
 | `[runtime].default_version` | string? | unset | `b\d+` tag or `"manual"` | `runtime use` |
 
 ## Environment variables
@@ -44,7 +44,7 @@ default_version = "b10700"   # default backend version (written by runtime use; 
 
 | Variable | Precedence | Description |
 |---|---|---|
-| `ROXID_GH_PROXY` | env > `[proxy].gh` > direct | GitHub proxy prefix (backend downloads and other GitHub assets) |
+| `ROXID_GH_PROXY` | env > `[proxy].gh` > direct | GitHub proxy prefix (backend auto/manual downloads and other GitHub assets; manual-chain URLs starting with `https://github.com/` are auto-prefixed, other links are used verbatim) |
 | `ROXID_HF_PROXY` | env > `HF_ENDPOINT` > `[proxy].hf` > official | HuggingFace mirror base (replaces the official domain) |
 | `ROXID_LLAMA_SERVER` | **top of the backend chain**: env → manual → `default_version` → locked tag `b10605` | direct path to a llama-server binary (escape hatch for self-built CUDA versions; cannot be overridden by config) |
 | `ROXID_HOME` | env > `~/.roxid` | roxid data root (config.toml / models / llama.cpp / auth.json all follow) |
@@ -62,7 +62,7 @@ default_version = "b10700"   # default backend version (written by runtime use; 
 
 ### Installer side (read only during installation; see the [installation guide](installation.md))
 
-`ROXID_INSTALL_SCOPE` / `ROXID_INSTALL_SOURCE` / `ROXID_LOCAL_BIN` / `ROXID_DOWNLOAD_URL` / `ROXID_VERSION`
+`ROXID_INSTALL_SCOPE` / `ROXID_INSTALL_SOURCE` / `ROXID_LOCAL_BIN` / `ROXID_DOWNLOAD_URL` / `ROXID_VERSION` / `ROXID_GH_PROXY` (shared with the server side — prefix semantics, applied to the built-in release base only) / `ROXID_RELEASE_BASE`
 
 ## Overriding: config file vs environment vs CLI arguments
 

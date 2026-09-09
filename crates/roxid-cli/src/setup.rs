@@ -20,6 +20,11 @@
 //! cfg 全量覆盖写抹掉——来源记录在交互路径丢失）2026-09-07 01-05
 //! M58（迭代20 裁决 2026-09-09 21:30）：向导末尾新增「安装 shell 补全」
 //! 一步（默认 Y，调用 completion::install_completion 同一内核）2026-09-09 21-58
+//! M88（迭代27，用户确认 2026-09-10 04:15）：引导「立即下载安装」分支
+//! 安装前先落盘本次 cfg——install_manual 对 GitHub 域名 URL 自动拼代理
+//! 时经 gh_proxy_prefix 读 env 优先 → config 回退，原实现引导末尾才
+//! save，安装时刻读取链两路皆空（原因：代理已确认却对手动链不生效）
+//! 2026-09-10 04-21
 
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -126,6 +131,15 @@ async fn run_wizard() {
             ask_prefilled_value("llama.cpp 包链接（tar.gz 或裸 llama-server）", prefill)
         {
             if ask_yes_no("是否立即下载安装？") {
+                // M88（迭代27）：安装前先落盘本次 cfg——install_manual 对
+                // GitHub 域名 URL 自动拼代理（gh_proxy_prefix：env 优先 →
+                // config 回退），原实现引导末尾才 save，此刻读取链两路皆
+                // 空、本次确认的代理读不到。save 失败仅警告不中止（下载
+                // 退回直连，安装本身不依赖 config；引导末尾仍有全量 save
+                // 兜底，成功路径的 llama_url 回写链 M32 碴1 语义不变）。
+                if let Err(e) = config::save_persist_config(&cfg) {
+                    eprintln!("配置提前落盘失败：{e}（本次下载可能不经代理直连）");
+                }
                 // 返回码仅作屏显（失败已在内部打印）；引导不因安装失败中止。
                 // M32 碴1：安装成功必须回写 cfg——install_manual_and_record 的
                 // 内部落盘会被引导末尾的基线 cfg 全量覆盖写抹掉（原实现仅

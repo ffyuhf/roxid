@@ -37,10 +37,12 @@ You can also use [`roxid_install.sh`](../roxid_install.sh) from the repository r
 安装范围 [1]系统全局 /usr/local/bin  [2]用户级 ~/.local/bin: ← default 1 as root, 2 otherwise
 二进制来源 [1]本地构建产物  [2]远程下载（默认: 1）:          ← local defaults to target/release/roxid
 本地 roxid 路径（回车使用默认）:                            ← asked only when source = local
+GitHub 代理前缀（回车直连）:                                ← asked only when source = remote and neither
+                                                            ROXID_GH_PROXY nor ROXID_DOWNLOAD_URL is set
 ```
 
 - **Install scope**: system-wide lands in `/usr/local/bin` (sudo added automatically for non-root); user-level lands in `~/.local/bin` (no sudo at all).
-- **Binary source**: local build artifact or remote download. Remote URL resolution order: full direct link in `ROXID_DOWNLOAD_URL` > built-in release base + `ROXID_VERSION` (default `latest`), asset name `roxid-linux-<arch>.tar.gz`; URLs ending in `.tar.gz`/`.tgz`/`.tar.zst` are unpacked first, anything else is treated as a raw binary.
+- **Binary source**: local build artifact or remote download. Remote URL resolution order: full direct link in `ROXID_DOWNLOAD_URL` (highest priority, never proxied) > optional GitHub proxy prefix + built-in release base + `ROXID_VERSION` (default `latest`), asset name `roxid-linux-<arch>.tar.gz`; URLs ending in `.tar.gz`/`.tgz`/`.tar.zst` are unpacked first, anything else is treated as a raw binary. The proxy prefix uses the same prefix-concatenation semantics as the roxid runtime `ROXID_GH_PROXY` (see [Configuration](configuration.md)); a missing trailing `/` is appended automatically. The built-in release base itself can also be overridden via the `ROXID_RELEASE_BASE` environment variable (self-hosted mirror scenarios).
 - **Overwrite protection**: if roxid is running, the script asks whether to terminate it (default Y).
 - **After placement**: `install -m755` overwrites, then verifies executability; if `~/.local/bin` is not on PATH, guidance is printed.
 
@@ -62,8 +64,10 @@ Set environment variables to skip the corresponding prompts:
 | `ROXID_INSTALL_SCOPE` | `user` / `system` | Install scope |
 | `ROXID_INSTALL_SOURCE` | `local` / `remote` | Binary source |
 | `ROXID_LOCAL_BIN` | file path | Local build artifact path (when source = local) |
-| `ROXID_DOWNLOAD_URL` | full direct link | Remote download URL (highest priority) |
+| `ROXID_DOWNLOAD_URL` | full direct link | Remote download URL (highest priority, never prefixed by the proxy) |
 | `ROXID_VERSION` | tag (default `latest`) | Combined with the built-in release base |
+| `ROXID_GH_PROXY` | proxy prefix | GitHub proxy prefix prepended to the built-in release base URLs (same semantics as the roxid runtime variable); when set, the proxy prompt is skipped |
+| `ROXID_RELEASE_BASE` | release base URL | Overrides the built-in release base (self-hosted mirror) |
 
 ## Option 2: Manual binary install
 

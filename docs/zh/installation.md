@@ -37,10 +37,12 @@ sh roxid_install.sh
 安装范围 [1]系统全局 /usr/local/bin  [2]用户级 ~/.local/bin: ← root 运行默认 1，非 root 默认 2
 二进制来源 [1]本地构建产物  [2]远程下载（默认: 1）:          ← 本地默认 target/release/roxid，可输入自定义路径
 本地 roxid 路径（回车使用默认）:                            ← 仅来源=本地时询问
+GitHub 代理前缀（回车直连）:                                ← 仅来源=远程且未设 ROXID_GH_PROXY、
+                                                            ROXID_DOWNLOAD_URL 时询问
 ```
 
 - **安装范围**：系统全局落位 `/usr/local/bin`（非 root 自动加 sudo）；用户级落位 `~/.local/bin`（全程免 sudo）。
-- **二进制来源**：本地构建产物或远程下载。远程 URL 解析优先级：`ROXID_DOWNLOAD_URL` 完整直链 > 脚本内置基地址 + `ROXID_VERSION`（默认 latest），资产名 `roxid-linux-<arch>.tar.gz`；URL 以 `.tar.gz`/`.tgz`/`.tar.zst` 结尾先解压取包内 `roxid`，否则视为裸二进制直落。
+- **二进制来源**：本地构建产物或远程下载。远程 URL 解析优先级：`ROXID_DOWNLOAD_URL` 完整直链（最高优先，永不拼代理）> 可选 GitHub 代理前缀 + 脚本内置基地址 + `ROXID_VERSION`（默认 latest），资产名 `roxid-linux-<arch>.tar.gz`；URL 以 `.tar.gz`/`.tgz`/`.tar.zst` 结尾先解压取包内 `roxid`，否则视为裸二进制直落。代理前缀与 roxid 运行时 `ROXID_GH_PROXY` 同语义（前缀拼接，见[配置](configuration.md)）；输入缺尾斜杠时自动补齐。内置基地址本身亦可由 `ROXID_RELEASE_BASE` 环境变量覆盖（自建镜像场景）。
 - **覆盖安装保护**：检测到 roxid 正在运行时询问是否终止（默认 Y）。
 - **落位后**：`install -m755` 覆盖式落位并校验可执行；用户级且 `~/.local/bin` 不在 PATH 时打印加入 PATH 的指引。
 
@@ -62,8 +64,10 @@ sh roxid_install.sh
 | `ROXID_INSTALL_SCOPE` | `user` / `system` | 安装范围 |
 | `ROXID_INSTALL_SOURCE` | `local` / `remote` | 二进制来源 |
 | `ROXID_LOCAL_BIN` | 文件路径 | 本地构建产物路径（来源=local 时） |
-| `ROXID_DOWNLOAD_URL` | 完整直链 | 远程下载地址（优先级最高） |
+| `ROXID_DOWNLOAD_URL` | 完整直链 | 远程下载地址（优先级最高，永不拼代理） |
 | `ROXID_VERSION` | tag（默认 `latest`） | 配合内置基地址拼接资产 URL |
+| `ROXID_GH_PROXY` | 代理前缀 | 拼接在内置基地址 URL 之前的 GitHub 代理前缀（与 roxid 运行时同名变量语义一致）；设置后跳过代理问句 |
+| `ROXID_RELEASE_BASE` | 基地址 URL | 覆盖脚本内置发布基地址（自建镜像） |
 
 ## 方式二：手动安装二进制
 

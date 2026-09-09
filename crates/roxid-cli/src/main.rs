@@ -42,6 +42,9 @@
 //! 中文/其余英文，裁决 2026-09-09 21:28）、__complete 候选统一源与
 //! completion 子命令族（bash/zsh/fish shim + install 自动落位，裁决
 //! 2026-09-09 21:30）2026-09-09 21-55
+//! M90（迭代28）：list MODIFIED 列人类可读混合格式（绝对时间 + 中文
+//! 相对短语；RFC3339 双形态解析：roxid Z 秒级 / 官方纳秒偏移；格式与
+//! 短语中文化均为用户裁决 2026-09-10 04:36/04:41）2026-09-10 04-42
 
 mod complete;
 mod completion;
@@ -1196,7 +1199,117 @@ async fn cmd_signout() -> i32 {
     0
 }
 
-/// list：模型表格
+/// M90（迭代28）：公历日期 → epoch 天数（Howard Hinnant 算法，
+/// 服务端 registry::civil_from_days 的逆运算，单测权威锚点互证）。
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// M90（迭代28）：RFC3339 时间串 → epoch 秒（双形态解析）。
+/// 兼容 roxid 自家 `YYYY-MM-DDTHH:MM:SSZ`（秒级 UTC，now_rfc3339 生成）
+/// 与官方 Ollama `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn±HH:MM`（纳秒 + 本地
+/// 偏移——CLI 可能连官方实例，实机警告证实必须双兼容）；纳秒位忽略，
+/// `±HHMM` 紧凑形态一并接受，无时区后缀按 UTC（宽松）。
+/// - 参数 s：modified_at 原始串
+/// - 返回：epoch 秒；结构非法时 None（调用方兜底原样输出）
+fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+    let two = |at: usize| -> Option<i64> { s.get(at..at + 2)?.parse().ok() };
+    let sep = |at: usize, c: u8| s.as_bytes().get(at) == Some(&c);
+    if s.len() < 19
+        || !sep(4, b'-')
+        || !sep(7, b'-')
+        || !sep(10, b'T')
+        || !sep(13, b':')
+        || !sep(16, b':')
+    {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let (mon, day, hour, min, sec) = (two(5)?, two(8)?, two(11)?, two(14)?, two(17)?);
+    let mut rest = s.get(19..)?;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let n = frac.chars().take_while(|c| c.is_ascii_digit()).count();
+        rest = rest.get(1 + n..)?;
+    }
+    if !rest.is_ascii() {
+        return None;
+    }
+    let offset = match rest.as_bytes().first() {
+        None => 0,
+        Some(b'Z') | Some(b'z') => 0,
+        Some(&sign @ (b'+' | b'-')) => {
+            let digits: String = rest[1..].chars().filter(|&c| c != ':').collect();
+            if digits.len() != 4 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let oh: i64 = digits[..2].parse().ok()?;
+            let om: i64 = digits[2..].parse().ok()?;
+            (if sign == b'-' { -1 } else { 1 }) * (oh * 3600 + om * 60)
+        }
+        Some(_) => return None,
+    };
+    Some(
+        days_from_civil(year, mon as u32, day as u32) * 86400 + hour * 3600 + min * 60 + sec
+            - offset,
+    )
+}
+
+/// M90（迭代28）：epoch 秒差 → 中文相对时间短语（分段阈值对齐官方
+/// ollama humanize 语义；短语中文化为用户裁决 2026-09-10 04:41）。
+/// 差值 ≤ 0（时钟偏差/未来时间）显示「刚刚」（计划书 D3）。
+fn humanize_age(delta_secs: i64) -> String {
+    if delta_secs <= 0 {
+        return "刚刚".into();
+    }
+    let mins = delta_secs / 60;
+    if mins < 1 {
+        return format!("{delta_secs} 秒前");
+    }
+    let hours = mins / 60;
+    if hours < 1 {
+        return format!("{mins} 分钟前");
+    }
+    let days = hours / 24;
+    if days < 1 {
+        return format!("{hours} 小时前");
+    }
+    if days < 7 {
+        return format!("{days} 天前");
+    }
+    if days < 30 {
+        return format!("{} 周前", days / 7);
+    }
+    if days < 365 {
+        return format!("{} 个月前", days / 30);
+    }
+    format!("{} 年前", days / 365)
+}
+
+/// M90（迭代28）：modified_at 原始串 → `YYYY-MM-DD HH:MM (N 单位前)`
+/// 混合格式。绝对部分直取串前 16 位（T 换空格：偏移形态即本地时间，
+/// Z 形态为 UTC 值——std 零依赖无本地时区 API，计划书 D2 如实取舍）；
+/// 解析失败原样输出整串（D4 兜底，不吞数据）。
+/// - 参数 s：/api/tags 返回的 modified_at 字符串
+/// - 参数 now_secs：当前 epoch 秒（相对时间基准）
+/// - 返回：混合格式渲染串
+fn fmt_modified(s: &str, now_secs: i64) -> String {
+    match parse_rfc3339_secs(s) {
+        Some(t) => format!(
+            "{} ({})",
+            format!("{} {}", &s[..10], &s[11..16]),
+            humanize_age(now_secs - t)
+        ),
+        None => s.to_string(),
+    }
+}
+
+/// list：模型表格（M90：MODIFIED 列混合格式渲染——绝对时间 + 中文相对短语）
 async fn cmd_list() -> i32 {
     let v: Value = http()
         .get(format!("{}/api/tags", base_url()))
@@ -1206,6 +1319,10 @@ async fn cmd_list() -> i32 {
         .json()
         .await
         .unwrap_or(Value::Null);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     println!("{:<32} {:>12}  {}", "NAME", "SIZE", "MODIFIED");
     for m in v["models"].as_array().cloned().unwrap_or_default() {
         let size = m["size"].as_u64().unwrap_or(0);
@@ -1213,7 +1330,7 @@ async fn cmd_list() -> i32 {
             "{:<32} {:>10} MB  {}",
             m["name"].as_str().unwrap_or("?"),
             size / 1048576,
-            m["modified_at"].as_str().unwrap_or("?")
+            fmt_modified(m["modified_at"].as_str().unwrap_or("?"), now_secs)
         );
     }
     0
@@ -1325,5 +1442,75 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "凭据文件必须仅属主可读写");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M90（迭代28）：days_from_civil 与服务端 civil_from_days 权威锚点
+    /// 互证（epoch-days 20689 = 2026-08-24 UTC，来源同 registry 单测）
+    #[test]
+    fn days_from_civil_anchor() {
+        assert_eq!(super::days_from_civil(2026, 8, 24), 20689);
+        assert_eq!(super::days_from_civil(1970, 1, 1), 0);
+    }
+
+    /// M90（迭代28）：RFC3339 双形态解析——roxid Z 秒级 / 官方纳秒偏移，
+    /// 同一时刻三种写法换算必须一致；非法输入 None
+    #[test]
+    fn rfc3339_dual_form_parsing() {
+        let z = super::parse_rfc3339_secs("2026-09-07T00:00:00Z").unwrap();
+        // 官方 Ollama 形态：纳秒 + 正偏移（+08:00 同一时刻）
+        let plus = super::parse_rfc3339_secs("2026-09-07T08:00:00.123456789+08:00").unwrap();
+        // 纳秒 + 负偏移紧凑形态（-0800 同一时刻）
+        let minus = super::parse_rfc3339_secs("2026-09-06T16:00:00.5-0800").unwrap();
+        assert_eq!(z, plus);
+        assert_eq!(z, minus);
+        // 结构非法 → None（兜底原样输出路径）
+        assert!(super::parse_rfc3339_secs("not-a-time").is_none());
+        assert!(super::parse_rfc3339_secs("2026-09-07T00:00").is_none());
+    }
+
+    /// M90（迭代28）：混合格式渲染与七段中文短语边界（固定基准
+    /// now = 1_800_000_000 = 2027-01-15T08:00:00Z，锚点见 days 互证）
+    #[test]
+    fn fmt_modified_mixed_form_and_age_tiers() {
+        let now = 1_800_000_000i64;
+        // 45 秒 → 秒段；绝对部分 T 换空格直取前 16 位
+        assert_eq!(
+            super::fmt_modified("2027-01-15T07:59:15Z", now),
+            "2027-01-15 07:59 (45 秒前)"
+        );
+        // 90 秒 → 分钟段（官方偏移形态 + 纳秒位忽略）
+        assert_eq!(
+            super::fmt_modified("2027-01-15T07:58:30.9+00:00", now),
+            "2027-01-15 07:58 (1 分钟前)"
+        );
+        // 2 小时 → 小时段
+        assert_eq!(
+            super::fmt_modified("2027-01-15T06:00:00Z", now),
+            "2027-01-15 06:00 (2 小时前)"
+        );
+        // 3 天 → 天段
+        assert_eq!(
+            super::fmt_modified("2027-01-12T08:00:00Z", now),
+            "2027-01-12 08:00 (3 天前)"
+        );
+        // 14 天 → 周段
+        assert_eq!(
+            super::fmt_modified("2027-01-01T08:00:00Z", now),
+            "2027-01-01 08:00 (2 周前)"
+        );
+        // 97 天 → 个月段（97/30 = 3）
+        assert_eq!(
+            super::fmt_modified("2026-10-10T08:00:00Z", now),
+            "2026-10-10 08:00 (3 个月前)"
+        );
+        // 400 天 → 年段（400/365 = 1）
+        assert_eq!(
+            super::fmt_modified("2025-12-11T08:00:00Z", now),
+            "2025-12-11 08:00 (1 年前)"
+        );
+        // 差值 0 / 未来时间 → 刚刚（计划书 D3）
+        assert!(super::fmt_modified("2027-01-15T08:00:00Z", now).ends_with("(刚刚)"));
+        // 解析失败兜底原样输出（计划书 D4，不吞数据）
+        assert_eq!(super::fmt_modified("?", now), "?");
     }
 }

@@ -166,7 +166,7 @@ roxid signout
 
 ## list (ls)
 
-表格列出本地模型：`NAME` / `SIZE` / `MODIFIED` 三列。
+表格列出本地模型：`NAME` / `SIZE` / `MODIFIED` 三列。`MODIFIED` 为人类可读混合格式——绝对时间 + 中文相对短语，如 `2026-06-04 03:04 (3 个月前)`（分段：秒 / 分钟 / 小时 / 天 / 周 / 个月 / 年 前；差值 ≤0 显示 `刚刚`；无法解析的时间串原样输出）。
 
 ```text
 roxid list    # 别名：roxid ls
@@ -218,7 +218,7 @@ roxid setup [--llama-url <url>]
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `--llama-url` | string | — | 手动指定 llama.cpp 包下载链接（tar.gz 或裸 llama-server 二进制）并立即安装；安装成功记录至 config.toml `[runtime].llama_url` |
+| `--llama-url` | string | — | 手动指定 llama.cpp 包下载链接（tar.gz 或裸 llama-server 二进制）并立即安装；安装成功记录至 config.toml `[runtime].llama_url`。`https://github.com/` 开头的链接自动经已配置的 GitHub 代理前缀下载，其余链接原样直用 |
 
 交互向导流程：中国网络环境检测（时区 / locale）→ 代理配置（推荐值预填，可改可清除）→ 自定义 llama.cpp 链接（可选，默认跳过）→ shell 补全安装（默认 Y）。联网命令（serve / pull / create / runtime install）首次运行时自动触发引导（config.toml 存在即不再触发）。
 

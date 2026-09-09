@@ -35,7 +35,7 @@ default_version = "b10700"   # 默认后端版本（runtime use 写入；特殊�
 | `setup_done` | bool | `false` | — | setup 向导（恒置 true） |
 | `[proxy].gh` | string? | 未设置 | URL 前缀，语义同 `ROXID_GH_PROXY` | setup 向导 |
 | `[proxy].hf` | string? | 未设置 | 镜像基址，语义同 `ROXID_HF_PROXY` | setup 向导 |
-| `[runtime].llama_url` | string? | 未设置 | tar.gz 或裸二进制链接 | `setup --llama-url` |
+| `[runtime].llama_url` | string? | 未设置 | tar.gz 或裸二进制链接；`https://github.com/` 开头的链接下载时自动前置拼接已配置的 GitHub 代理前缀（记录值保持用户输入原样） | `setup --llama-url` |
 | `[runtime].default_version` | string? | 未设置 | `b\d+` 形态 tag 或 `"manual"` | `runtime use` |
 
 ## 环境变量全表
@@ -44,7 +44,7 @@ default_version = "b10700"   # 默认后端版本（runtime use 写入；特殊�
 
 | 变量 | 覆盖优先级 | 说明 |
 |---|---|---|
-| `ROXID_GH_PROXY` | env > `[proxy].gh` > 直连 | GitHub 代理前缀（后端下载、HF 镜像回退链等 GitHub 资源） |
+| `ROXID_GH_PROXY` | env > `[proxy].gh` > 直连 | GitHub 代理前缀（后端自动/手动下载、HF 镜像回退链等 GitHub 资源；手动链 `https://github.com/` 开头自动拼接，其余链接原样直用） |
 | `ROXID_HF_PROXY` | env > `HF_ENDPOINT` > `[proxy].hf` > 官方 | HuggingFace 镜像基址（整体替换官方域名） |
 | `ROXID_LLAMA_SERVER` | **后端解析链最高**：env → manual → `default_version` → 锁定链 `b10605` | 直指 llama-server 二进制路径（自编译 CUDA 版逃生口；不可被配置覆盖） |
 | `ROXID_HOME` | env > `~/.roxid` | roxid 数据根目录（config.toml / models / llama.cpp / auth.json 全部随之迁移） |
@@ -62,7 +62,7 @@ default_version = "b10700"   # 默认后端版本（runtime use 写入；特殊�
 
 ### 安装脚本侧（仅安装过程读取，详见 [安装文档](installation.md)）
 
-`ROXID_INSTALL_SCOPE` / `ROXID_INSTALL_SOURCE` / `ROXID_LOCAL_BIN` / `ROXID_DOWNLOAD_URL` / `ROXID_VERSION`
+`ROXID_INSTALL_SCOPE` / `ROXID_INSTALL_SOURCE` / `ROXID_LOCAL_BIN` / `ROXID_DOWNLOAD_URL` / `ROXID_VERSION` / `ROXID_GH_PROXY`（与服务端共用同名变量——前缀拼接语义，仅作用于脚本内置基地址）/ `ROXID_RELEASE_BASE`
 
 ## 配置文件 / 环境变量 / 命令行参数覆盖关系
 

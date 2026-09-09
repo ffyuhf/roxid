@@ -166,7 +166,7 @@ roxid signout
 
 ## list (ls)
 
-List local models in a table: columns `NAME` / `SIZE` / `MODIFIED`.
+List local models in a table: columns `NAME` / `SIZE` / `MODIFIED`. `MODIFIED` is rendered in a human-readable hybrid form — absolute time plus a Chinese relative phrase, e.g. `2026-06-04 03:04 (3 个月前)` (tiers: 秒 / 分钟 / 小时 / 天 / 周 / 个月 / 年 前; ≤0 delta shows `刚刚`; unparseable timestamps are printed verbatim).
 
 ```text
 roxid list    # alias: roxid ls
@@ -218,7 +218,7 @@ roxid setup [--llama-url <url>]
 
 | Argument | Type | Default | Description |
 |---|---|---|---|
-| `--llama-url` | string | — | Manually specified llama.cpp package download link (tar.gz or a bare llama-server binary), installed immediately; recorded in config.toml `[runtime].llama_url` on success |
+| `--llama-url` | string | — | Manually specified llama.cpp package download link (tar.gz or a bare llama-server binary), installed immediately; recorded in config.toml `[runtime].llama_url` on success. Links starting with `https://github.com/` are automatically downloaded through the configured GitHub proxy prefix; other links are used verbatim |
 
 Wizard flow: mainland-China network detection (timezone / locale) → proxy configuration (recommended prefills, editable/clearable) → optional custom llama.cpp link (skipped by default) → shell completion install (default Y). Networked commands (serve / pull / create / runtime install) trigger the wizard automatically on first run (suppressed once config.toml exists).
 
