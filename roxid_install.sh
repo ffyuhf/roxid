@@ -21,10 +21,17 @@
 #   ROXID_INSTALL_SCOPE=user|system    安装范围
 #   ROXID_INSTALL_SOURCE=local|remote  二进制来源
 #   ROXID_LOCAL_BIN=<路径>             本地构建产物路径（来源=local 时）
-#   ROXID_DOWNLOAD_URL=<直链>          远程完整直链（来源=remote 时，最高优先）
+#   ROXID_DOWNLOAD_URL=<直链>          远程完整直链（来源=remote 时，最高优先，不拼代理）
 #   ROXID_VERSION=<tag>                远程版本号（默认 latest，配合 ROXID_RELEASE_BASE）
+#   ROXID_GH_PROXY=<前缀>              GitHub 代理前缀（来源=remote 且非直链时生效；非空即用
+#                                      并跳过代理问句；语义同软件本体：前缀拼接在 Releases
+#                                      URL 之前；ROXID_DOWNLOAD_URL 直链不受影响）
 #
 # 修改历史：
+#   2026-09-10 03-25 远程下载支持 GitHub 代理前缀（迭代25，计划 v1.0.0 用户批准于
+#                     2026-09-10 03:21；裁决 Q1/Q2 2026-09-10 03:17/03:18：env
+#                     ROXID_GH_PROXY 优先 + 交互问句兜底、直链不拼代理；尾斜杠卫生 D3；
+#                     ROXID_RELEASE_BASE 改可环境变量覆盖 D8；其余安装/卸载逻辑零变化）
 #   2026-09-10 02-35 远程基地址填入（迭代23，计划 v1.2.0 用户批准于 2026-09-10 02:31；
 #                     裁决 R3/R4 2026-09-10 02:22：仓库地址 https://github.com/ffyuhf/roxid；
 #                     仅填常量与注释，安装/卸载逻辑零变化；tarball 资产内亦随包分发本脚本）
@@ -34,8 +41,9 @@
 #                     六项裁决 Q1–Q6 见 计划书 1.4 表）
 
 # 远程下载基地址（迭代23 填入，裁决 R3/R4 2026-09-10 02:22——仓库 https://github.com/ffyuhf/roxid；
-# 配合 ROXID_VERSION 拼接资产名 roxid-linux-<arch>.tar.gz；ROXID_DOWNLOAD_URL 直链优先级更高）
-ROXID_RELEASE_BASE="https://github.com/ffyuhf/roxid/releases"
+# 配合 ROXID_VERSION 拼接资产名 roxid-linux-<arch>.tar.gz；ROXID_DOWNLOAD_URL 直链优先级更高；
+# 迭代25 D8：同名环境变量可覆盖默认值——服务 e2e 模拟与自建镜像，未设置时行为与常量一致）
+ROXID_RELEASE_BASE="${ROXID_RELEASE_BASE:-https://github.com/ffyuhf/roxid/releases}"
 
 # Wrap script in main function so that a truncated partial download doesn't end
 # up executing half a script.
@@ -453,6 +461,9 @@ fi
 ###########################################
 
 # 解析最终下载 URL 并输出；无法解析（两处地址皆空）时返回非 0
+# 迭代25：直链分支原样返回不拼代理（Q2 裁决 2026-09-10 03:18）；Releases 分支前置
+# 拼接 GH_PROXY（Q1 裁决 03:17，语义同软件本体 download.rs asset_url 的直接字符串
+# 拼接；GH_PROXY 为空即直连，与现状一致）
 resolve_remote_url() {
     if [ -n "${ROXID_DOWNLOAD_URL:-}" ]; then
         printf '%s\n' "$ROXID_DOWNLOAD_URL"
@@ -463,13 +474,33 @@ resolve_remote_url() {
     fi
     ROXID_VER="${ROXID_VERSION:-latest}"
     if [ "$ROXID_VER" = "latest" ]; then
-        printf '%s\n' "$ROXID_RELEASE_BASE/latest/download/roxid-linux-$ARCH.tar.gz"
+        printf '%s\n' "${GH_PROXY}${ROXID_RELEASE_BASE}/latest/download/roxid-linux-$ARCH.tar.gz"
     else
-        printf '%s\n' "$ROXID_RELEASE_BASE/download/$ROXID_VER/roxid-linux-$ARCH.tar.gz"
+        printf '%s\n' "${GH_PROXY}${ROXID_RELEASE_BASE}/download/$ROXID_VER/roxid-linux-$ARCH.tar.gz"
     fi
 }
 
 if [ "$SOURCE" = "remote" ]; then
+    # GitHub 代理前缀解析（迭代25，裁决 Q1 2026-09-10 03:17）：
+    #   ROXID_GH_PROXY 非空即用且跳过问句；未设置时交互询问，回车默认空=直连；
+    #   ROXID_DOWNLOAD_URL 直链已设时代理无作用（Q2：直链不拼），跳过问句不打扰；
+    #   语义同软件本体 gh_proxy_prefix()：前缀拼接在 GitHub Releases URL 之前，
+    #   脚本不写死任何默认代理网址（对齐本体 Q11 裁决精神 2026-08-24 19:04）
+    GH_PROXY=''
+    if [ -z "${ROXID_DOWNLOAD_URL:-}" ]; then
+        if [ -n "${ROXID_GH_PROXY:-}" ]; then
+            GH_PROXY="$ROXID_GH_PROXY"
+        else
+            ask_with_default "GitHub 代理前缀（回车直连）: " ""
+            GH_PROXY="$REPLY"
+        fi
+        # 尾斜杠卫生（D3）：前缀非空且不以 / 结尾时补齐，防手敲漏斜杠产生坏地址
+        case "$GH_PROXY" in
+            ''|*/) ;;
+            *) GH_PROXY="$GH_PROXY/" ;;
+        esac
+    fi
+
     # tar.zst 资产需要额外工具，按形态按需声明
     REMOTE_NEEDS="curl tar"
     if ! DOWNLOAD_URL=$(resolve_remote_url); then
@@ -491,6 +522,10 @@ if [ "$SOURCE" = "remote" ]; then
         exit 1
     fi
 
+    # D5：代理生效时两行展示（前缀 + 最终拼接地址），供用户目视确认
+    if [ -n "$GH_PROXY" ]; then
+        status "GitHub 代理前缀: $GH_PROXY"
+    fi
     status "下载地址: $DOWNLOAD_URL"
     mkdir -p "$TEMP_DIR/unpack"
     # 形态判定：压缩包先下载到 TEMP_DIR 再本地解压取包内 roxid；其余视为裸二进制
