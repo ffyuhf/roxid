@@ -28,6 +28,12 @@
 #                                      URL 之前；ROXID_DOWNLOAD_URL 直链不受影响）
 #
 # 修改历史：
+#   2026-09-10 03-55 修复两缺陷（迭代26，计划 v1.0.0 用户批准于 2026-09-10 03:55）：
+#                     缺陷1 用户实例探测仅凭退出码把 degraded（存在无关失败 unit，
+#                     用户总线仍可用）误判不可用，改按 running|degraded 输出状态匹配
+#                     对齐系统实例分支；缺陷2 install_success 无条件宣称 API 已可用，
+#                     改 SERVICE_STARTED 标志按实际启动状态分支，未启动时打印手动
+#                     启动指引（roxid serve 前台运行 / 重跑脚本配置 systemd 服务）
 #   2026-09-10 03-25 远程下载支持 GitHub 代理前缀（迭代25，计划 v1.0.0 用户批准于
 #                     2026-09-10 03:21；裁决 Q1/Q2 2026-09-10 03:17/03:18：env
 #                     ROXID_GH_PROXY 优先 + 交互问句兜底、直链不拼代理；尾斜杠卫生 D3；
@@ -599,8 +605,20 @@ if [ "$SCOPE" = "user" ]; then
     esac
 fi
 
+# 服务启动标志（迭代26 缺陷2 修正 2026-09-10 03-55）：仅当 systemd 服务实际执行
+# enable --now 成功才置 1（set -eu 下失败即中止到不了置位行）；install_success 据
+# 此分支——未启动（探测跳过/用户拒绝创建/无 systemctl）时不再虚假宣称 API 已可用
+SERVICE_STARTED=0
+
 install_success() {
-    status 'The roxid API is now available at 127.0.0.1:11434.'
+    if [ "$SERVICE_STARTED" -eq 1 ]; then
+        status 'The roxid API is now available at 127.0.0.1:11434.'
+    else
+        status '未配置 roxid 自启动服务。手动启动方式：'
+        status "  前台运行: $BINDIR/roxid serve"
+        status '  或重新运行本脚本，在 systemd 服务询问处选择 y 创建并启动'
+        status '服务启动后 API 监听 127.0.0.1:11434。'
+    fi
     status "安装完成。可执行文件: $BINDIR/roxid"
     status '首次运行 roxid 将进入 setup 引导（llama.cpp 后端下载源配置）。'
 }
@@ -656,6 +674,7 @@ WantedBy=default.target
 EOF
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable --now roxid
+    SERVICE_STARTED=1   # enable --now 成功后置位（迭代26 缺陷2，2026-09-10 03-55）
     status "系统实例服务已创建并启动。"
 }
 
@@ -685,6 +704,7 @@ WantedBy=default.target
 EOF
     systemctl --user daemon-reload
     systemctl --user enable --now roxid
+    SERVICE_STARTED=1   # enable --now 成功后置位（迭代26 缺陷2，2026-09-10 03-55）
     status "用户实例服务已创建并启动。"
 
     # linger：开启后服务开机即运行（无需登录）；默认 N（不开启则随登录会话启停）
@@ -718,15 +738,23 @@ if [ "$SCOPE" = "system" ]; then
         warning "未找到 systemctl，跳过系统实例服务配置。"
     fi
 else
-    # 用户实例探测：is-system-running 可用即认为用户总线就绪
-    if systemctl --user is-system-running >/dev/null 2>&1; then
-        configure_systemd_user
-    else
-        warning "systemd 用户实例不可用，跳过用户实例服务配置。"
-        if [ "$IS_WSL2" = true ]; then
-            warning "参见 https://learn.microsoft.com/en-us/windows/wsl/systemd#how-to-enable-systemd 启用 WSL2 systemd"
-        fi
-    fi
+    # 用户实例探测（迭代26 缺陷1 修正 2026-09-10 03-55）：对齐系统实例分支，按
+    # is-system-running 输出状态匹配 running|degraded——degraded 仅表示存在无关
+    # 失败 unit，用户总线仍可用；原实现仅凭退出码（degraded 退出码为 1）误判不可用。
+    # stderr 静默：真不可用时 systemctl 的报错噪音不混入安装输出；|| true 护栏
+    # 兼容 set -eu（对齐系统实例分支 708 行写法）
+    SYSTEMCTL_USER_RUNNING="$(systemctl --user is-system-running 2>/dev/null || true)"
+    case "$SYSTEMCTL_USER_RUNNING" in
+        running|degraded)
+            configure_systemd_user
+            ;;
+        *)
+            warning "systemd 用户实例不可用，跳过用户实例服务配置。"
+            if [ "$IS_WSL2" = true ]; then
+                warning "参见 https://learn.microsoft.com/en-us/windows/wsl/systemd#how-to-enable-systemd 启用 WSL2 systemd"
+            fi
+            ;;
+    esac
 fi
 
 # 提示：本行之后逻辑已全部完成，EXIT trap 输出 install_success 收尾
