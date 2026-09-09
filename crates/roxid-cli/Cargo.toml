@@ -1,0 +1,24 @@
+[package]
+name = "roxid-cli"
+description = "roxid 命令行入口：serve/run/pull 等 15 命令（命令集以原版 ollama --help 为准）"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "roxid"
+path = "src/main.rs"
+
+[dependencies]
+roxid-server = { path = "../roxid-server" }
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+rustyline.workspace = true
+indicatif.workspace = true
+rpassword.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+bytes.workspace = true

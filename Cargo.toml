@@ -1,0 +1,37 @@
+# roxid：Ollama 全功能复刻（Rust 实现，llama.cpp llama-server 子进程后端）
+# 架构决策来源：用户确认 2026-08-24 18:22（Q1 子进程模式）
+[workspace]
+resolver = "2"
+members = ["crates/roxid-server", "crates/roxid-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# 依赖统一在工作区声明，子 crate 以 xxx.workspace = true 引用，保证版本一致
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+sha2 = "0.10"
+rustyline = "13"
+indicatif = "0.17"
+# M17 引入（用户裁决 R2-2A 2026-08-24 19:59）：signin 令牌隐蔽输入
+rpassword = "7"
+# M24 引入（迭代4 裁决 Q2 2026-08-26 05:24）：config.toml 结构化读写（纯 Rust，不影响 musl 静态单二进制）
+toml = "0.8"
+# M21 引入（迭代3计划 D4d）：网关 CORS 中间件（axum 0.7 配套版本）
+tower-http = { version = "0.5", features = ["cors"] }
+# M46 引入（迭代18 BUG-10）：runner 孤儿防护 prctl(PR_SET_PDEATHSIG)
+libc = "0.2"
+
+[profile.release]
+lto = true

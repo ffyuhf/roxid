@@ -1,0 +1,24 @@
+[package]
+name = "roxid-server"
+description = "roxid 服务端核心库：三套 API 网关、推理调度、模型仓库（Ollama 复刻，llama.cpp 子进程后端）"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+sha2.workspace = true
+# M21 D4d：CORS 中间件
+tower-http.workspace = true
+# M46（迭代18 BUG-10）：PDEATHSIG 孤儿防护（pre_exec prctl）
+libc.workspace = true
+# M24（迭代4 Q2）：config.toml 持久化读写
+toml.workspace = true
