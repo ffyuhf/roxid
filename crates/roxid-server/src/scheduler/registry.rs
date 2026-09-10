@@ -72,6 +72,17 @@ pub struct RunningModel {
     /// 每 slot 上下文长度（真实生效值；0/未知省略键。M35 D5）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
+    /// GPU 层数（stderr 加载日志解析；None=未解析，原因见 gpu_layers_note。
+    /// 迭代36 M126，Q3/Q8 裁决 2026-09-11）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_layers: Option<u32>,
+    /// 模型总层数（同上来源；与 gpu_layers 成对出现）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_layers: Option<u32>,
+    /// 层数解析失败原因（gpu_layers 为 None 时输出；Q3 裁决：
+    /// 失败直书原因不降级，来源 2026-09-11 05:52）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_layers_note: Option<String>,
 }
 
 /// Runner 注册表
@@ -242,6 +253,8 @@ impl RunnerRegistry {
                 }
                 Err(_) => serde_json::json!({}),
             };
+            // 迭代36 M126：本实例层卸载解析结果（None → note 说明原因）
+            let layer_split = guard.gpu_layer_split();
             out.push(RunningModel {
                 name: full.clone(),
                 model: model.to_string(),
@@ -256,6 +269,11 @@ impl RunnerRegistry {
                     0 => None,
                     c => Some(c),
                 },
+                // 迭代36 M126：层占比（Q3 精确口径——解析失败直书原因不降级）
+                gpu_layers: layer_split.map(|(g, _)| g),
+                total_layers: layer_split.map(|(_, t)| t),
+                gpu_layers_note: layer_split
+                    .map_or_else(|| Some("stderr 未匹配层卸载行".to_string()), |_| None),
             });
         }
         out

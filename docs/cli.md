@@ -135,6 +135,8 @@ Stop (unload) a running model instance. Prints `已停止 {model}` on success (g
 roxid stop <model>
 ```
 
+Tab completion offers **running models only** (live query via `/api/ps`, 1s timeout; zero candidates when serve is down) — unlike `run` / `show` which complete all local models.
+
 ## pull
 
 Pull a model from a registry. Supports both the Ollama registry and direct HuggingFace references; resumable downloads, NDJSON progress, and digest-level skipping of layers already present locally.
@@ -179,7 +181,7 @@ roxid signout
 
 List local models in a table: columns `NAME` / `SIZE` / `MODIFIED`. `MODIFIED` is rendered in a human-readable hybrid form — absolute time plus a Chinese relative phrase, e.g. `2026-06-04 03:04 (3 个月前)` (tiers: 秒 / 分钟 / 小时 / 天 / 周 / 个月 / 年 前; ≤0 delta shows `刚刚`; unparseable timestamps are printed verbatim).
 
-Width adaptation: `NAME` truncates to the terminal width with a trailing `…` (CJK-aware); `SIZE` adapts its unit (KB/MB/GB, two decimals); on narrow terminals (<60 columns) `MODIFIED` keeps only the relative phrase so all three columns converge within the terminal width (no overflow at 40 columns).
+Column alignment & width adaptation: `NAME` pads to the longest name of the batch (dynamic column width, the same aligned form as the official `ollama` table); names wider than the terminal budget truncate with a trailing `…` (CJK-aware); `SIZE` adapts its unit (KB/MB/GB, two decimals, right-aligned); on narrow terminals (<60 columns) `MODIFIED` keeps only the relative phrase so all three columns converge within the terminal width (no overflow at 40 columns).
 
 ```text
 roxid list    # alias: roxid ls
@@ -187,7 +189,16 @@ roxid list    # alias: roxid ls
 
 ## ps
 
-List running models: columns `NAME` / `SIZE`.
+List running models in six columns:
+
+| Column | Meaning |
+|---|---|
+| `NAME` | Model name (padded to the longest running name for alignment; truncated on narrow terminals; all six columns kept) |
+| `ID` | First 12 chars of content digest |
+| `SIZE` | Model size in bytes (adaptive unit) |
+| `PROCESSOR` | GPU/CPU layer split (e.g. `20%/80% CPU/GPU`, parsed from backend load log; failure reason shown verbatim) |
+| `CONTEXT` | Context window total (e.g. `4096 token`; no usage ratio) |
+| `UNTIL` | Time left before keep_alive unload (Chinese phrase, e.g. `5 分钟后`; `即将卸载` when expired) |
 
 ```text
 roxid ps

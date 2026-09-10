@@ -125,8 +125,15 @@ where
 /// - 参数 words：到光标为止的全部 token（末位为正在输入的词，可为空串）
 /// - 参数 models：本地已装模型名（完整 model:tag 形态）
 /// - 参数 runtime_tags：已装 runtime tag（含可用时的 manual）
+/// - 参数 running_models：运行中模型名（stop 值位专用源，来自 /api/ps；
+///   serve 未运行时为空。迭代36 M125，Q1 裁决 2026-09-11 05:43）
 /// - 返回：候选列表（调用方逐行打印）
-pub fn complete_for(words: &[String], models: &[String], runtime_tags: &[String]) -> Vec<String> {
+pub fn complete_for(
+    words: &[String],
+    models: &[String],
+    runtime_tags: &[String],
+    running_models: &[String],
+) -> Vec<String> {
     let cur = words.last().map(String::as_str).unwrap_or("");
     let prior = &words[..words.len().saturating_sub(1)];
     let (path, positional) = analyze(prior);
@@ -145,13 +152,15 @@ pub fn complete_for(words: &[String], models: &[String], runtime_tags: &[String]
         ("roxid runtime use", 0) | ("roxid runtime rm", 0) => {
             filter_prefix(runtime_tags.iter().map(String::as_str), cur)
         }
+        // stop 值位：仅运行中模型（stop 只作用于活跃实例；官方差异——
+        // 用户实测报告全列出无法辨别。迭代36 M125，Q1 裁决 2026-09-11 05:43）
+        ("roxid stop", 0) => filter_prefix(running_models.iter().map(String::as_str), cur),
         // model 动态值位：本地已装模型名（cp 两位置参数均补；
         // run 第二位起为 prompt 不补；create 不在裁决清单不补）
         ("roxid cp", 0)
         | ("roxid cp", 1)
         | ("roxid run", 0)
         | ("roxid show", 0)
-        | ("roxid stop", 0)
         | ("roxid pull", 0)
         | ("roxid push", 0)
         | ("roxid rm", 0) => filter_prefix(models.iter().map(String::as_str), cur),
@@ -181,12 +190,56 @@ fn local_runtime_tags() -> Vec<String> {
     tags
 }
 
-/// `__complete` 子命令入口：计算候选并逐行打印到 stdout
+/// `__complete` 子命令入口：计算候选并逐行打印到 stdout。
+/// 迭代36 M125（Q1/Q7 裁决 2026-09-11 05:43/06:02）：stop 值位候选改为
+/// 运行中模型——GET /api/ps，客户端 1s 超时；serve 未运行/超时/响应异常
+/// → 零候选静默（Tab 不卡顿不报错）。其余命令保持本地直读零网络。
 ///
 /// - 参数 words：光标上下文 token（到当前词为止，不含程序名与 __complete）
-pub fn complete(words: &[String]) {
-    for candidate in complete_for(words, &local_model_names(), &local_runtime_tags()) {
+pub async fn complete(words: &[String]) {
+    // 仅 stop 值位发起网络查询；选项位（- 开头词）走 complete_for 选项分支
+    let cur = words.last().map(String::as_str).unwrap_or("");
+    let (path, positional) = analyze(&words[..words.len().saturating_sub(1)]);
+    let is_stop_value =
+        path == "roxid stop" && positional == 0 && !(cur.starts_with('-') && cur != "-");
+    let running = if is_stop_value {
+        running_model_names().await
+    } else {
+        Vec::new()
+    };
+    let candidates = complete_for(words, &local_model_names(), &local_runtime_tags(), &running);
+    for candidate in candidates {
         println!("{candidate}");
+    }
+}
+
+/// 运行中模型名（stop 值位候选源；迭代36 M125）。
+///
+/// - 返回：模型名列表；1s 超时 / serve 未运行 / 响应异常时为空
+///   （Q7 裁决超时 1 秒；Q1 裁决失败零候选）
+async fn running_model_names() -> Vec<String> {
+    let fetch = async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()?;
+        let v: serde_json::Value = client
+            .get(format!("{}/api/ps", crate::base_url()))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok::<_, reqwest::Error>(v)
+    };
+    match fetch.await {
+        Ok(v) => v["models"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -203,76 +256,118 @@ mod tests {
 
     const MODELS: &[&str] = &["llama3.2:3b", "qwen3:4b", "hf.co/deepseek/r1:Q4"];
     const TAGS: &[&str] = &["b10605", "b10700", "manual"];
+    /// 运行中模型（迭代36 M125：stop 值位专用候选源；刻意为 MODELS
+    /// 的真子集以验证 stop 不再吃本地全量）
+    const RUNNING: &[&str] = &["qwen3:4b"];
 
     /// 顶层子命令位：空当前词出全量（含 ls 别名）；前缀过滤生效
     #[test]
     fn top_level_subcommand_position() {
-        let all = complete_for(&v(&[]), &sv(MODELS), &sv(TAGS));
+        let all = complete_for(&v(&[]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert!(all.contains(&"serve".to_string()));
         assert!(all.contains(&"ls".to_string()));
         assert_eq!(all.len(), TOP_COMMAND_COUNT);
 
-        let s = complete_for(&v(&["s"]), &sv(MODELS), &sv(TAGS));
+        let s = complete_for(&v(&["s"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert_eq!(
             s,
             vec!["serve", "show", "stop", "signin", "signout", "setup"]
         );
     }
 
-    /// model 值位：run/show/stop/pull/push/rm 首位补本地模型名
+    /// model 值位：run/show/pull/push/rm 首位补本地模型名
     #[test]
     fn model_value_position() {
-        let out = complete_for(&v(&["run", ""]), &sv(MODELS), &sv(TAGS));
+        let out = complete_for(&v(&["run", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert_eq!(out, sv(MODELS));
         // 前缀过滤
-        let out = complete_for(&v(&["run", "ll"]), &sv(MODELS), &sv(TAGS));
+        let out = complete_for(&v(&["run", "ll"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert_eq!(out, vec!["llama3.2:3b".to_string()]);
+    }
+
+    /// stop 值位只补运行中模型（迭代36 M125，Q1 裁决 2026-09-11 05:43）：
+    /// 候选来自 running 源而非本地全量；serve 未运行（running 空）零候选
+    #[test]
+    fn stop_value_position_uses_running_models() {
+        let out = complete_for(&v(&["stop", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        assert_eq!(out, sv(RUNNING), "stop 候选必须是运行中模型而非本地全量");
+        // 前缀过滤：本地有但未运行的不出现
+        let out = complete_for(&v(&["stop", "ll"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        assert!(out.is_empty(), "未运行的 llama3.2:3b 不得出现在 stop 候选");
+        // serve 未运行：零候选静默
+        let out = complete_for(&v(&["stop", ""]), &sv(MODELS), &sv(TAGS), &[]);
+        assert!(out.is_empty(), "running 为空时 stop 零候选");
     }
 
     /// cp 两位置参数均补模型；run 第二位起（prompt 段）不补
     #[test]
     fn cp_both_positions_and_prompt_silent() {
-        let src = complete_for(&v(&["cp", ""]), &sv(MODELS), &sv(TAGS));
+        let src = complete_for(&v(&["cp", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert_eq!(src, sv(MODELS));
-        let dst = complete_for(&v(&["cp", "llama3.2:3b", ""]), &sv(MODELS), &sv(TAGS));
+        let dst = complete_for(
+            &v(&["cp", "llama3.2:3b", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+        );
         assert_eq!(dst, sv(MODELS));
-        let prompt = complete_for(&v(&["run", "llama3.2:3b", ""]), &sv(MODELS), &sv(TAGS));
+        let prompt = complete_for(
+            &v(&["run", "llama3.2:3b", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+        );
         assert!(prompt.is_empty(), "prompt 段不补全");
     }
 
     /// runtime 族：二级子命令位与 use/rm 的动态 tag 位
     #[test]
     fn runtime_nested_and_tag_values() {
-        let subs = complete_for(&v(&["runtime", ""]), &sv(MODELS), &sv(TAGS));
+        let subs = complete_for(&v(&["runtime", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert_eq!(subs, vec!["list", "install", "use", "rm"]);
-        let use_tags = complete_for(&v(&["runtime", "use", ""]), &sv(MODELS), &sv(TAGS));
+        let use_tags = complete_for(
+            &v(&["runtime", "use", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+        );
         assert_eq!(use_tags, vec!["b10605", "b10700", "manual"]);
-        let rm_b = complete_for(&v(&["runtime", "rm", "b1"]), &sv(MODELS), &sv(TAGS));
+        let rm_b = complete_for(
+            &v(&["runtime", "rm", "b1"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+        );
         assert_eq!(rm_b, vec!["b10605", "b10700"]);
     }
 
     /// 选项位：- 前缀词补该命令选项；全局选项仅在顶层上下文
     #[test]
     fn option_position() {
-        let run_opts = complete_for(&v(&["run", "--"]), &sv(MODELS), &sv(TAGS));
+        let run_opts = complete_for(&v(&["run", "--"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert_eq!(run_opts, vec!["--hf", "--runtime", "--help"]);
-        let top_opts = complete_for(&v(&["--"]), &sv(MODELS), &sv(TAGS));
+        let top_opts = complete_for(&v(&["--"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert!(top_opts.contains(&"--nowordwrap".to_string()));
-        let prefix = complete_for(&v(&["run", "--h"]), &sv(MODELS), &sv(TAGS));
+        let prefix = complete_for(&v(&["run", "--h"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert_eq!(prefix, vec!["--hf", "--help"]);
     }
 
     /// ls 别名归一：进入 list 后上下文正确（无动态值位，零候选）
     #[test]
     fn ls_alias_canonicalized() {
-        let out = complete_for(&v(&["ls", "x"]), &sv(MODELS), &sv(TAGS));
+        let out = complete_for(&v(&["ls", "x"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
         assert!(out.is_empty(), "list 无位置参数，第二 token 后零候选");
     }
 
     /// completion 二级子命令位候选
     #[test]
     fn completion_subcommands() {
-        let out = complete_for(&v(&["completion", ""]), &sv(MODELS), &sv(TAGS));
+        let out = complete_for(
+            &v(&["completion", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+        );
         assert_eq!(out, vec!["bash", "zsh", "fish", "install"]);
     }
 

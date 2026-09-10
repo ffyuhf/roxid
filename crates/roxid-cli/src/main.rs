@@ -421,10 +421,10 @@ async fn main() {
         }
         Commands::Setup { llama_url } => setup::run_setup_command(llama_url).await,
         Commands::Runtime { cmd } => cmd_runtime(cmd).await,
-        // 迭代20：补全族与候选源均为本地操作（同步执行，不经 serve）
+        // 迭代20：补全族本地操作；迭代36 M125：stop 值位候选经 /api/ps（1s 超时）
         Commands::Completion { cmd } => completion::cmd_completion(cmd),
         Commands::Complete { words } => {
-            complete::complete(&words);
+            complete::complete(&words).await;
             0
         }
     };
@@ -1275,6 +1275,40 @@ fn truncate_cols(s: &str, max_cols: usize) -> String {
     out
 }
 
+/// 按显示宽度右补空格（M130，迭代37：list/ps 列对齐——与 truncate_cols
+/// 截断配对构成列基建，对齐 ollama tabwriter 动态列宽形态；Q2 裁决
+/// 来源：用户确认 2026-09-11 06:51）。
+///
+/// - 参数 s：原串；width：目标显示宽度（统一列宽）
+/// - 返回：补空格后的串；显示宽已达/超过 width 时原样返回
+///   （截断职责归 truncate_cols，调用方先截断后补齐）
+fn pad_cols(s: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(s));
+    if pad == 0 {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + pad);
+    out.push_str(s);
+    out.push_str(&" ".repeat(pad));
+    out
+}
+
+/// NAME 统一列宽计算（M130/M131，迭代37）：本轮全部行显示宽最大值
+/// （表头 "NAME" 参与下限），受终端宽分配上限约束（M112 窄终端截断
+/// 收敛语义保留——超上限行截断后补齐到上限宽）。
+///
+/// - 参数 names：全部行 NAME 串；cap：终端宽分配上限（name_col）
+/// - 返回：统一列宽（≤ cap；空列表退化为表头宽 4）
+fn name_col_width(names: &[&str], cap: usize) -> usize {
+    names
+        .iter()
+        .map(|n| display_width(n))
+        .chain(std::iter::once(display_width("NAME")))
+        .max()
+        .unwrap_or(4)
+        .min(cap)
+}
+
 /// 层摘要短形态（M110/M111）：`sha256:3c1c9d…` → `3c1c9d`（前 8 位，
 /// 层身份可辨即可——官方 CLI 同样以摘要前缀标识层）。
 ///
@@ -1860,36 +1894,58 @@ async fn cmd_list() -> i32 {
     // M112：列宽分配——SIZE 右对齐 10 列；MODIFIED 常规 25 列（绝对 16
     // + 括注约 9），窄终端（<60 列）仅保留相对短语（40 列终端三列总宽
     // 收敛 ≤40）；NAME 取剩余宽度，超出 CJK 感知截尾 …（M109 基建复用）
+    // M130（迭代37）：改两遍渲染——先收集全部行，NAME 统一列宽取本轮
+    // 最长（含表头），截断后 pad_cols 补齐，三列起点固定全表对齐
+    // （来源：用户确认 Q2「动态列宽（ollama 形态）」2026-09-11 06:51）
     let width = term_width();
     let narrow = width < 60;
     let modified_col = if narrow { 9 } else { 25 };
     let name_col = width.saturating_sub(10 + modified_col + 4).max(4);
+    let rows: Vec<(String, String, String)> = v["models"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            let modified = m["modified_at"].as_str().unwrap_or("?");
+            let modified_cell = if narrow {
+                fmt_modified_rel(modified, now_secs)
+            } else {
+                fmt_modified(modified, now_secs)
+            };
+            (
+                m["name"].as_str().unwrap_or("?").to_string(),
+                fmt_bytes(m["size"].as_u64().unwrap_or(0)),
+                modified_cell,
+            )
+        })
+        .collect();
+    let nw = name_col_width(
+        &rows.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
+        name_col,
+    );
     let sc = stdout_color();
     println!(
-        "{}  {:>10}  {}",
-        paint(sc, "1", &truncate_cols("NAME", name_col)),
-        "SIZE",
-        "MODIFIED"
+        "{}  {:>10}  MODIFIED",
+        paint(sc, "1", &pad_cols("NAME", nw)),
+        "SIZE"
     );
-    for m in v["models"].as_array().cloned().unwrap_or_default() {
-        let size = m["size"].as_u64().unwrap_or(0);
-        let modified = m["modified_at"].as_str().unwrap_or("?");
-        let modified_cell = if narrow {
-            fmt_modified_rel(modified, now_secs)
-        } else {
-            fmt_modified(modified, now_secs)
-        };
+    for (name, size, modified_cell) in &rows {
         println!(
             "{}  {:>10}  {}",
-            truncate_cols(m["name"].as_str().unwrap_or("?"), name_col),
-            fmt_bytes(size),
+            pad_cols(&truncate_cols(name, nw), nw),
+            size,
             modified_cell
         );
     }
     0
 }
 
-/// ps：运行中模型（M112：NAME 按终端宽截断 + SIZE 量纲自适应）
+/// ps：运行中模型六列表格（迭代36 M127，Q2 裁决 2026-09-11 05:46：
+/// NAME/ID/SIZE/PROCESSOR/CONTEXT/UNTIL；Q6 裁决六列不删、NAME 弹性截断）。
+/// 各列口径：ID=digest 剥 sha256: 前缀取前 12 位；PROCESSOR=层数百分比
+/// `X%/Y% CPU/GPU`，解析失败直书原因不降级（Q3）；CONTEXT=仅窗口总量
+/// `{N} token`，无使用率（Q4）；UNTIL=中文未来短语（Q5）。
 async fn cmd_ps() -> i32 {
     let v: Value = http()
         .get(format!("{}/api/ps", base_url()))
@@ -1899,21 +1955,134 @@ async fn cmd_ps() -> i32 {
         .json()
         .await
         .unwrap_or(Value::Null);
-    let name_col = term_width().saturating_sub(12).max(4);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 列宽预算：固定列 ID12+SIZE10+PROCESSOR16+CONTEXT12+UNTIL10=60，
+    // 间隙 2×5=10；NAME 取终端剩余宽（Q6：六列不删，窄终端 NAME 压缩）
+    // M131（迭代37）：改两遍渲染——NAME 统一列宽取本轮最长（含表头），
+    // 截断后 pad_cols 补齐，六列起点固定全表对齐（来源：用户确认 Q1
+    // 「list + ps 一并修」2026-09-11 06:51）
+    let name_col = term_width().saturating_sub(70).max(4);
+    let rows: Vec<(String, String, String, String, String, String)> = v["models"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            (
+                m["name"].as_str().unwrap_or("?").to_string(),
+                short_id12(m["digest"].as_str().unwrap_or("")).to_string(),
+                fmt_bytes(m["size"].as_u64().unwrap_or(0)),
+                fmt_processor(&m),
+                fmt_context_total(&m),
+                fmt_until_rel(m["expires_at"].as_str().unwrap_or(""), now_secs),
+            )
+        })
+        .collect();
+    let nw = name_col_width(
+        &rows.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
+        name_col,
+    );
     let sc = stdout_color();
     println!(
-        "{}  {:>10}",
-        paint(sc, "1", &truncate_cols("NAME", name_col)),
-        "SIZE"
+        "{}  {:<12}  {:>10}  {:<16}  {:<12}  UNTIL",
+        paint(sc, "1", &pad_cols("NAME", nw)),
+        "ID",
+        "SIZE",
+        "PROCESSOR",
+        "CONTEXT"
     );
-    for m in v["models"].as_array().cloned().unwrap_or_default() {
+    for (name, id, size, processor, context, until) in &rows {
         println!(
-            "{}  {:>10}",
-            truncate_cols(m["name"].as_str().unwrap_or("?"), name_col),
-            fmt_bytes(m["size"].as_u64().unwrap_or(0))
+            "{}  {:<12}  {:>10}  {:<16}  {:<12}  {}",
+            pad_cols(&truncate_cols(name, nw), nw),
+            id,
+            size,
+            processor,
+            context,
+            until
         );
     }
     0
+}
+
+/// ID 列：digest 剥 `sha256:` 前缀取前 12 位（迭代36 M127，Q2 裁决）。
+/// 与 short_digest（8 位，错误摘要用）区分——本处固定 12 位对齐官方 ps。
+///
+/// - 参数 digest：完整摘要串（空串/缺前缀均容忍）
+/// - 返回：12 位十六进制片段；空串输入返回 "?"
+fn short_id12(digest: &str) -> String {
+    let hex = digest.rsplit(':').next().unwrap_or(digest);
+    if hex.is_empty() {
+        return "?".to_string();
+    }
+    hex.chars().take(12).collect()
+}
+
+/// PROCESSOR 列：层数换算 `X%/Y% CPU/GPU`（迭代36 M127，Q3 裁决：
+/// 精确口径 stderr 层数解析；失败直书原因不降级，来源 2026-09-11 05:52）。
+///
+/// - 参数 m：/api/ps 单条模型对象
+/// - 返回：百分比形态或失败原因原文；两者皆缺返回 "?"
+fn fmt_processor(m: &Value) -> String {
+    match (m["gpu_layers"].as_u64(), m["total_layers"].as_u64()) {
+        (Some(gpu), Some(total)) if total > 0 => {
+            let gpu_pct = gpu * 100 / total;
+            format!("{}%/{}% CPU/GPU", 100 - gpu_pct, gpu_pct)
+        }
+        _ => m["gpu_layers_note"].as_str().unwrap_or("?").to_string(),
+    }
+}
+
+/// CONTEXT 列：仅窗口总量 `{N} token`（迭代36 M127，Q4 裁决
+/// 2026-09-11 06:02：不查子进程、无使用率百分比）。
+///
+/// - 参数 m：/api/ps 单条模型对象
+/// - 返回：如 `8192 token`；字段缺失返回 "?"
+fn fmt_context_total(m: &Value) -> String {
+    match m["context_length"].as_u64() {
+        Some(ctx) => format!("{ctx} token"),
+        None => "?".to_string(),
+    }
+}
+
+/// UNTIL 列：expires_at（RFC3339）→ 中文未来短语（迭代36 M127，Q5 裁决
+/// 2026-09-11 06:02：如「4 分钟后」）；已到期显示「即将卸载」；
+/// 解析失败原样输出整串（不吞数据，D4 兜底语义）。
+///
+/// - 参数 s：/api/ps 返回的 expires_at 字符串
+/// - 参数 now_secs：当前 epoch 秒（相对时间基准）
+/// - 返回：未来短语或原串
+fn fmt_until_rel(s: &str, now_secs: i64) -> String {
+    match parse_rfc3339_secs(s) {
+        Some(t) => humanize_remaining(t - now_secs),
+        None => s.to_string(),
+    }
+}
+
+/// 剩余时长 → 中文未来短语（UNTIL 列专用；与 humanize_age 的过去方向
+/// 「N 前」对偶，本处为「N 后」；分段粒度同迭代28：秒/分/时/天）。
+///
+/// - 参数 secs：剩余秒数（到期时刻 - 当前时刻）
+/// - 返回：如「4 分钟后」；≤0 返回「即将卸载」
+fn humanize_remaining(secs: i64) -> String {
+    if secs <= 0 {
+        return "即将卸载".to_string();
+    }
+    let mins = secs / 60;
+    if secs < 60 {
+        return format!("{secs} 秒后");
+    }
+    if mins < 60 {
+        return format!("{mins} 分钟后");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours} 小时后");
+    }
+    format!("{} 天后", hours / 24)
 }
 
 /// cp：复制模型（M117：成功回显——原成功零输出无确认；官方差异挂账：
@@ -2182,6 +2351,60 @@ mod tests {
         assert_eq!(super::fmt_modified_rel("?", now), "?");
     }
 
+    /// 迭代36 M127：ps 六列渲染族（ID/PROCESSOR/CONTEXT/UNTIL 各列口径）
+    #[test]
+    fn ps_six_column_rendering() {
+        // ID：剥前缀取 12 位；空串容错
+        assert_eq!(super::short_id12("sha256:6a4c9f1b2c3d4e5f"), "6a4c9f1b2c3d");
+        assert_eq!(super::short_id12("6a4c9f1b"), "6a4c9f1b");
+        assert_eq!(super::short_id12(""), "?");
+        // PROCESSOR：33/41 → 80% GPU → 「20%/80% CPU/GPU」；全 GPU；纯 CPU；
+        // 失败直书原因（Q3）；双缺 "?"
+        let m = json!({"gpu_layers": 33, "total_layers": 41});
+        assert_eq!(super::fmt_processor(&m), "20%/80% CPU/GPU");
+        assert_eq!(
+            super::fmt_processor(&json!({"gpu_layers": 41, "total_layers": 41})),
+            "0%/100% CPU/GPU"
+        );
+        assert_eq!(
+            super::fmt_processor(&json!({"gpu_layers": 0, "total_layers": 41})),
+            "100%/0% CPU/GPU"
+        );
+        assert_eq!(
+            super::fmt_processor(&json!({"gpu_layers_note": "stderr 未匹配层卸载行"})),
+            "stderr 未匹配层卸载行"
+        );
+        assert_eq!(super::fmt_processor(&json!({})), "?");
+        // CONTEXT：仅窗口总量（Q4），无使用率
+        assert_eq!(
+            super::fmt_context_total(&json!({"context_length": 8192})),
+            "8192 token"
+        );
+        assert_eq!(super::fmt_context_total(&json!({})), "?");
+    }
+
+    /// 迭代36 M127：UNTIL 未来短语（Q5 中文形态）+ 兜底
+    #[test]
+    fn until_relative_phrase() {
+        let now = 1_800_000_000i64; // 2027-01-15T08:00:00Z
+        assert_eq!(
+            super::fmt_until_rel("2027-01-15T08:04:00Z", now),
+            "4 分钟后"
+        );
+        assert_eq!(super::fmt_until_rel("2027-01-15T08:00:30Z", now), "30 秒后");
+        // 23 小时仍在时段；24 小时整落入天段「1 天后」（分段同迭代28）
+        assert_eq!(
+            super::fmt_until_rel("2027-01-16T07:00:00Z", now),
+            "23 小时后"
+        );
+        assert_eq!(super::fmt_until_rel("2027-01-16T08:00:00Z", now), "1 天后");
+        assert_eq!(
+            super::fmt_until_rel("2027-01-15T07:59:00Z", now),
+            "即将卸载"
+        );
+        assert_eq!(super::fmt_until_rel("?", now), "?");
+    }
+
     /// M111（迭代33 碴4）：非 TTY 层汇总行形态（digest 前 8 位 + 百分比
     /// + 总量）——层结束各落一行对齐官方
     #[test]
@@ -2216,5 +2439,92 @@ mod tests {
             .map(|cli| cli.verbose)
             .map_err(|e| e.to_string());
         assert!(matches!(before, Ok(true)), "前置形态同样合法：{before:?}");
+    }
+
+    /// M130/M131（迭代37）：动态列宽对齐——pad_cols 补齐语义、
+    /// name_col_width 最长取宽受 cap 约束、list/ps 行渲染列位一致性
+    /// （用户实测样例：长短名混合行 SIZE 域终点与 MODIFIED/ID 起点一致）
+    #[test]
+    fn list_ps_column_alignment() {
+        // pad_cols：短补齐 / CJK 按 2 列计补 / 已满与超宽原样（截断归 truncate_cols）
+        assert_eq!(super::pad_cols("ab", 5), "ab   ");
+        assert_eq!(super::pad_cols("模型", 6), "模型  ");
+        assert_eq!(super::pad_cols("abc", 3), "abc");
+        assert_eq!(super::pad_cols("abcdef", 5), "abcdef");
+        // name_col_width：取最长 / 表头 4 下限 / cap 收敛
+        assert_eq!(
+            super::name_col_width(&["gemma4:latest", "smollm2:135m"], 41),
+            13
+        );
+        assert_eq!(super::name_col_width(&[], 41), 4);
+        assert_eq!(
+            super::name_col_width(&["hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M"], 20),
+            20
+        );
+        // list 对齐快照（用户样例三行）：SIZE 右端对齐（域终点一致）
+        // + MODIFIED 起点逐行一致（SIZE 为 {:>10} 右对齐域）
+        let names = [
+            "gemma4:latest",
+            "smollm2:135m",
+            "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M",
+        ];
+        let sizes = ["8.95 GB", "258.34 MB", "2.55 GB"];
+        let nw = super::name_col_width(&names, 80);
+        assert_eq!(nw, 36);
+        let (mut size_ends, mut mod_starts) = (Vec::new(), Vec::new());
+        for (n, s) in names.iter().zip(&sizes) {
+            let line = format!(
+                "{}  {:>10}  2026-09-09 22:53 (23 小时前)",
+                super::pad_cols(&super::truncate_cols(n, nw), nw),
+                s
+            );
+            size_ends.push(line.find(s).unwrap() + s.len());
+            mod_starts.push(line.find("2026-09-09").unwrap());
+        }
+        assert!(
+            size_ends.windows(2).all(|w| w[0] == w[1]),
+            "SIZE 域终点不一致：{size_ends:?}"
+        );
+        assert_eq!(size_ends[0], 36 + 2 + 10);
+        assert!(
+            mod_starts.windows(2).all(|w| w[0] == w[1]),
+            "MODIFIED 起点不一致：{mod_starts:?}"
+        );
+        assert_eq!(mod_starts[0], 36 + 2 + 10 + 2);
+        // 截断与对齐共存（窄终端）：cap 20 下截断补齐后 SIZE 域起点固定
+        let nw20 = super::name_col_width(&names, 20);
+        assert_eq!(nw20, 20);
+        let head = format!(
+            "{}  {:>10}",
+            super::pad_cols(&super::truncate_cols(names[0], nw20), nw20),
+            "8.95 GB"
+        );
+        assert_eq!(head.find("8.95 GB"), Some(22 + 3));
+        // ps 六列对齐快照：ID 起点逐行一致（与 NAME 长短无关）
+        let ps_names = ["smollm2:135m", "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M"];
+        let ids = ["b0f58c4c1a3c", "ea35d2362372"];
+        let pw = super::name_col_width(&ps_names, 40);
+        let id_starts: Vec<usize> = ps_names
+            .iter()
+            .zip(&ids)
+            .map(|(n, id)| {
+                format!(
+                    "{}  {:<12}  {:>10}  {:<16}  {:<12}  {}",
+                    super::pad_cols(&super::truncate_cols(n, pw), pw),
+                    id,
+                    "258.34 MB",
+                    "stderr 未匹配层卸载行",
+                    "4096 token",
+                    "5 分钟后"
+                )
+                .find(id)
+                .unwrap()
+            })
+            .collect();
+        assert!(
+            id_starts.windows(2).all(|w| w[0] == w[1]),
+            "ID 起点不一致：{id_starts:?}"
+        );
+        assert_eq!(id_starts[0], 36 + 2);
     }
 }

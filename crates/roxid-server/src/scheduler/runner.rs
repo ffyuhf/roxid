@@ -217,6 +217,10 @@ pub struct Runner {
     /// stderr 尾部环形缓存（M97：启动即退出报错携带 stderr 摘要的数据源；
     /// std Mutex——转发任务与 wait_until_healthy 均短临界区、锁内无 await）
     stderr_tail: Arc<StdMutex<VecDeque<String>>>,
+    /// GPU/总层数（迭代36 M126，Q3 裁决精确口径：日志转发路径逐行解析命中即存
+    /// ——环形缓存仅留 12 行，运行期日志会把层卸载行滚出，事后再读必漏；
+    /// std Mutex 短临界区锁内无 await；替身进程恒 None，原因见 gpu_layers_note）
+    gpu_layers: Arc<StdMutex<Option<(u32, u32)>>>,
     /// 健康检查复用的 HTTP 客户端（2s 超时）
     http: reqwest::Client,
 }
@@ -319,12 +323,19 @@ impl Runner {
 
         // 后台逐行转发子进程输出到日志，防止管道写满导致子进程阻塞
         if let Some(stdout) = child.stdout.take() {
-            spawn_log_forwarder(stdout, "stdout", None);
+            spawn_log_forwarder(stdout, "stdout", None, None);
         }
         // M97：stderr 同时入尾部缓存（启动失败诊断摘要数据源）
         let stderr_tail = Arc::new(StdMutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        // 迭代36 M126：stderr 层卸载行解析结果槽（转发任务命中即写入）
+        let gpu_layers: Arc<StdMutex<Option<(u32, u32)>>> = Arc::new(StdMutex::new(None));
         if let Some(stderr) = child.stderr.take() {
-            spawn_log_forwarder(stderr, "stderr", Some(stderr_tail.clone()));
+            spawn_log_forwarder(
+                stderr,
+                "stderr",
+                Some(stderr_tail.clone()),
+                Some(gpu_layers.clone()),
+            );
         }
 
         Ok(Self {
@@ -340,6 +351,7 @@ impl Runner {
             keep_alive,
             in_flight: 0,
             stderr_tail,
+            gpu_layers,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
@@ -396,6 +408,13 @@ impl Runner {
     /// - 返回：拉起时下发的 per-slot ctx
     pub fn ctx_per_slot(&self) -> u32 {
         self.ctx_per_slot
+    }
+
+    /// GPU/总层数（迭代36 M126：/api/ps PROCESSOR 列数据源；替身恒 None）。
+    ///
+    /// - 返回：Some((gpu 层数, 总层数))；None = stderr 未匹配层卸载行
+    pub fn gpu_layer_split(&self) -> Option<(u32, u32)> {
+        self.gpu_layers.lock().ok().and_then(|g| *g)
     }
 
     /// 生效的 RUNTIME 启动参数串（M39：请求级 runtime 重建比较键；替身 None）。
@@ -626,14 +645,17 @@ fn parse_vram_csv(text: &str) -> HashMap<u32, u64> {
 /// 后台逐行转发子进程输出到日志，防止管道写满导致子进程阻塞。
 /// M97：tail 非 None 时逐行同步入环形缓存（stderr 诊断摘要数据源；
 /// 满额滚动淘汰最早行）。
+/// 迭代36 M126：gpu_layers 非 None 时逐行解析层卸载行命中即存（Q3 精确口径）。
 ///
 /// - 参数 stream：stdout / stderr 任意一方
 /// - 参数 stream_name：日志标注用的流名
 /// - 参数 tail：尾部缓存（stdout 传 None，stderr 传 Some）
+/// - 参数 gpu_layers：层卸载解析结果槽（stdout 传 None，stderr 传 Some）
 fn spawn_log_forwarder<R>(
     stream: R,
     stream_name: &'static str,
     tail: Option<Arc<StdMutex<VecDeque<String>>>>,
+    gpu_layers: Option<Arc<StdMutex<Option<(u32, u32)>>>>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -646,11 +668,37 @@ fn spawn_log_forwarder<R>(
                     if q.len() == STDERR_TAIL_LINES {
                         q.pop_front();
                     }
-                    q.push_back(line);
+                    q.push_back(line.clone());
+                }
+            }
+            // 迭代36 M126：命中层卸载行即写入结果槽（首条生效，后续重复行幂等）
+            if let Some(g) = &gpu_layers {
+                if let Some(split) = parse_gpu_layer_line(&line) {
+                    if let Ok(mut slot) = g.lock() {
+                        *slot = Some(split);
+                    }
                 }
             }
         }
     });
+}
+
+/// 解析 stderr 行中的 llama-server 层卸载信息（迭代36 M126，Q3 裁决）。
+/// 目标形态（b10xxx 族）：`load_tensors: offloaded 33/41 layers to GPU`
+/// ——含 GPU 数与总数，可直接换算百分比；老形态 `offloading 60 layers`
+/// 无总数不可换算，不采纳（按 Q3「失败直书原因」由调用方输出 note）。
+/// 手写定位解析，不引入 regex 依赖；任一环节不匹配返回 None。
+///
+/// - 参数 line：子进程 stderr 单行
+/// - 返回：Some((gpu 层数, 总层数))；total 为 0 或 gpu > total 的畸形行返回 None
+pub(crate) fn parse_gpu_layer_line(line: &str) -> Option<(u32, u32)> {
+    let idx = line.find("offloaded ")?;
+    let rest = &line[idx + "offloaded ".len()..];
+    let end = rest.find(" layers")?;
+    let (gpu, total) = rest[..end].split_once('/')?;
+    let gpu: u32 = gpu.trim().parse().ok()?;
+    let total: u32 = total.trim().parse().ok()?;
+    (total > 0 && gpu <= total).then_some((gpu, total))
 }
 
 /// 测试辅助：健康替身返回 200 的 python 单行服务
@@ -670,6 +718,30 @@ HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 迭代36 M126：层卸载行解析（Q3 精确口径）——b10xxx 新形态含总数
+    /// 可换算百分比；老形态无总数、畸形行、无关行均拒绝
+    #[test]
+    fn parse_gpu_layer_line_forms() {
+        assert_eq!(
+            parse_gpu_layer_line("load_tensors: offloaded 33/41 layers to GPU"),
+            Some((33, 41))
+        );
+        assert_eq!(
+            parse_gpu_layer_line("load_tensors: offloaded 41/41 layers to GPU"),
+            Some((41, 41))
+        );
+        // 老形态无总数：不可换算百分比 → 拒绝（由调用方输出 note）
+        assert_eq!(parse_gpu_layer_line("offloading 60 layers to GPU"), None);
+        // 畸形与无关行
+        assert_eq!(parse_gpu_layer_line("offloaded 45/41 layers to GPU"), None);
+        assert_eq!(parse_gpu_layer_line("offloaded x/41 layers to GPU"), None);
+        assert_eq!(
+            parse_gpu_layer_line("llm_load_print_meta: n_layer = 36"),
+            None
+        );
+        assert_eq!(parse_gpu_layer_line(""), None);
+    }
 
     /// 进程管理：sleep 替身的存活与关闭
     #[tokio::test]
