@@ -157,6 +157,9 @@ pub async fn rerank(
 }
 
 /// GET /v1/models：OpenAI 模型列表（本地仓库视图）
+/// M101（迭代32 碴2）：created 填充真实创建时间（原硬编码 0）——数据源
+/// meta.created_at（RFC3339，与 /api/tags modified_at 同源）经双形态
+/// 解析转 epoch 秒；老数据/结构非法兜底 0（不劣于原值）
 pub async fn models(State(st): State<Arc<AppState>>) -> Response {
     let list: Vec<Value> = crate::repo::list_models(&st.models_root)
         .into_iter()
@@ -164,7 +167,7 @@ pub async fn models(State(st): State<Arc<AppState>>) -> Response {
             json!({
                 "id": m.name,
                 "object": "model",
-                "created": 0,
+                "created": crate::repo::parse_rfc3339_secs(&m.created_at).unwrap_or(0),
                 "owned_by": "roxid",
             })
         })

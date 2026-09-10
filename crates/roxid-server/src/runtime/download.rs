@@ -43,13 +43,24 @@
 //! 前置拼接已配置代理前缀（空前缀=直连），非 GitHub 域名原样直用
 //!（原因：用户确认代理后手动链仍裸连直下，代理配置未覆盖手动链）
 //! 2026-09-10 04-20
+//! M99（迭代31，用户裁决 Q3/Q4 2026-09-10 18:17/18:21）：ensure/resolve
+//! 命中已装缓存时 ELF 架构校验（确认不匹配 ensure 报 ArchMismatch、
+//! resolve 视为未命中终止——双链同序对齐）；新增 warn_installed_arch_
+//! mismatch（serve 启动扫描 warn 不阻断）与 installed_variant_arch_
+//! mismatch（runtime list 标注数据源）2026-09-10 18-30
+//! M105（迭代32 碴6a）：下载进度回调链——download_all_with_progress
+//! 流式累计（content-length 为总量）+ install_version/install_manual
+//! 透传回调 + serve 自动下载场景 5s 周期日志（原全程静默无总量/速度/
+//! 剩余时间，下大包形似卡死；用户实测报告）2026-09-10 21-38
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio::process::Command;
 
+use super::backend::diagnose_arch_mismatch;
 use crate::config::llama_runtime_root;
 use crate::error::{RoxidError, RoxidResult};
 
@@ -155,18 +166,49 @@ pub fn is_valid_tag(tag: &str) -> bool {
     }
 }
 
+/// M99（迭代31，Q3 校验 2，用户裁决 2026-09-10 18:17）：ELF 架构校验——
+/// ensure 链命中已装缓存时防止架构不匹配放行（x64 包误装 arm64 宿主即
+/// ENOENT，原实现放行到 spawn 阶段才裸报 os error 2）。宽容语义：ELF
+/// 解析失败 / 未知 e_machine 跳过校验（不误伤自备非常规二进制，
+/// android bionic 包 e_machine 同为 0xb7 不受影响）。
+///
+/// - 参数 bin：已装 llama-server 路径
+/// - 参数 ctx：报错文案上下文（如 "锁定链 b10883 变体 ubuntu-arm64"）
+/// - 返回：Ok(()) 放行；Err 确认不匹配（含 rm 重装 / env 逃生口指引）
+fn ensure_arch_matches(bin: &std::path::Path, ctx: &str) -> RoxidResult<()> {
+    if let Some((bin_arch, host_arch)) = diagnose_arch_mismatch(bin) {
+        return Err(RoxidError::ArchMismatch(format!(
+            "{ctx} 的 llama-server 为 {bin_arch} 构建，与宿主 {host_arch} 不匹配，无法执行；\
+             可 `roxid runtime rm <tag>` 清理后重装本机架构版本，或设置 {ENV_LLAMA_SERVER_OVERRIDE} 指向自编译产物"
+        )));
+    }
+    Ok(())
+}
+
+/// M99（迭代31）：resolve 侧同款判定——确认不匹配视为不可用（与 ensure
+/// 的 Err 终止对齐：resolve None → 调用方保守放行，诊断报错由 ensure 承担）。
+///
+/// - 参数 bin：已装 llama-server 路径
+/// - 返回：true 表示可用（匹配 / ELF 无法判定宽容）；false 确认不匹配
+fn arch_ok(bin: &std::path::Path) -> bool {
+    diagnose_arch_mismatch(bin).is_none()
+}
+
 /// 确保 llama-server 可用并返回其路径。
 /// 优先级（M36 更新）：ROXID_LLAMA_SERVER 环境变量 → manual 手动版本
 /// （setup --llama-url 安装）→ config default_version 指定版本的变体缓存
 /// （未安装则告警回退）→ 锁定链（缓存 → 下载解压；M95 起 b10883）。
+/// M99（迭代31）：各分支命中已装缓存时 ELF 架构校验，不匹配报 ArchMismatch。
 ///
 /// - 参数 backend_variant：探测得到的变体片段（Backend::asset_variant()）
 /// - 返回：llama-server 二进制路径
 pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> {
-    // 1) 环境变量逃生口：用户自编译产物直接复用（仅校验存在性，不校验版本）
+    // 1) 环境变量逃生口：用户自编译产物直接复用（仅校验存在性，不校验版本；
+    //    M99：架构不匹配在此即报诊断，不再放行到 spawn 裸 ENOENT）
     if let Ok(custom) = std::env::var(ENV_LLAMA_SERVER_OVERRIDE) {
         let path = PathBuf::from(&custom);
         if path.is_file() {
+            ensure_arch_matches(&path, &format!("{ENV_LLAMA_SERVER_OVERRIDE}={custom}"))?;
             return Ok(path);
         }
         return Err(RoxidError::RunnerFailure(format!(
@@ -178,6 +220,7 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
     //    default_version == "manual" 时同样落到此处（特殊保留字）
     let manual = manual_server_path();
     if manual.is_file() {
+        ensure_arch_matches(&manual, "manual 手动版本")?;
         return Ok(manual);
     }
     // 3) M36：config default_version 指定版本优先于锁定链（use 命令的生效点）
@@ -188,6 +231,7 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
     {
         let server = variant_cache_dir(backend_variant, &tag).join("llama-server");
         if server.is_file() {
+            ensure_arch_matches(&server, &format!("默认版本 {tag} 变体 {backend_variant}"))?;
             return Ok(server);
         }
         // 指定版本未安装（如被手删目录）：告警回退锁定链，不硬失败
@@ -198,9 +242,20 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
     // 4) 锁定链（M95 起 b10883）：缓存命中直接复用，未命中下载解压落位
     let server = variant_cache_dir(backend_variant, LOCKED_LLAMA_CPP_TAG).join("llama-server");
     if server.is_file() {
+        ensure_arch_matches(
+            &server,
+            &format!("锁定链 {LOCKED_LLAMA_CPP_TAG} 变体 {backend_variant}"),
+        )?;
         return Ok(server);
     }
-    install_version(LOCKED_LLAMA_CPP_TAG, backend_variant).await?;
+    // M105（迭代32 碴6a）：serve 自动下载场景进度——5s 周期日志（无 TTY
+    // 无 spinner，原全程静默）；CLI 显式安装场景由调用方传渲染回调
+    install_version(
+        LOCKED_LLAMA_CPP_TAG,
+        backend_variant,
+        periodic_log_progress(),
+    )
+    .await?;
     Ok(server)
 }
 
@@ -219,18 +274,22 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
 /// - 返回：Some(路径) 表示已存在可用；None 表示全链未命中
 pub fn resolve_llama_server_path(backend_variant: &str) -> Option<PathBuf> {
     // 1) 环境变量逃生口（不校验报错面：指向不存在时 None 放行，
-    //    显式报错由加载路径的 ensure 完整链承担）
+    //    显式报错由加载路径的 ensure 完整链承担；
+    //    M99：命中但架构不匹配同样 None——对齐 ensure 该分支的 Err 终止）
     if let Ok(custom) = std::env::var(ENV_LLAMA_SERVER_OVERRIDE) {
         let path = PathBuf::from(&custom);
-        return path.is_file().then_some(path);
+        return path.is_file().then_some(path).filter(|p| arch_ok(p));
     }
-    // 2) 手动版本（default_version == "manual" 特殊保留字同落此处）
+    // 2) 手动版本（default_version == "manual" 特殊保留字同落此处；
+    //    M99：命中但不匹配 → None 终止，不落后续分支——ensure 同分支
+    //    在此 Err 终止，双链命中面必须一致）
     let manual = manual_server_path();
     if manual.is_file() {
-        return Some(manual);
+        return arch_ok(&manual).then_some(manual);
     }
     // 3) config default_version 指定版本（仅已装命中；未装回退锁定链，
-    //    不打 warn——本函数每请求调用，告警刷屏；留痕由 ensure 承担）
+    //    不打 warn——本函数每请求调用，告警刷屏；留痕由 ensure 承担；
+    //    M99：已装但不匹配 → None 终止（ensure 同分支 Err 终止，对齐））
     if let Some(tag) = crate::config::load_persist_config()
         .runtime
         .default_version
@@ -238,12 +297,13 @@ pub fn resolve_llama_server_path(backend_variant: &str) -> Option<PathBuf> {
     {
         let server = variant_cache_dir(backend_variant, &tag).join("llama-server");
         if server.is_file() {
-            return Some(server);
+            return arch_ok(&server).then_some(server);
         }
     }
-    // 4) 锁定链缓存（M95 起 b10883；未缓存 None——不下载，下载由 ensure 承担）
+    // 4) 锁定链缓存（M95 起 b10883；未缓存 None——不下载，下载由 ensure 承担；
+    //    M99：已缓存但不匹配同样 None）
     let server = variant_cache_dir(backend_variant, LOCKED_LLAMA_CPP_TAG).join("llama-server");
-    server.is_file().then_some(server)
+    server.is_file().then_some(server).filter(|p| arch_ok(p))
 }
 
 /// 手动版本缓存目录：{roxid_home}/llama.cpp/manual（R2 裁决：单目录不分变体）
@@ -291,8 +351,13 @@ fn apply_gh_proxy(url: &str) -> String {
 ///（[runtime].llama_url）均以用户输入的原始 URL 为准，不受拼接影响。
 ///
 /// - 参数 url：包下载链接（GitHub Releases 形态 tar.gz 或裸 llama-server）
+/// - 参数 on_progress：进度回调（已下载字节, 总量 Option——HTTP 头缺失
+///   时 None；M105 迭代32 碴6a）
 /// - 返回：落位后的 llama-server 路径
-pub async fn install_manual(url: &str) -> RoxidResult<PathBuf> {
+pub async fn install_manual<F>(url: &str, mut on_progress: F) -> RoxidResult<PathBuf>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let _guard = INSTALL_LOCK.lock().await;
     let dir = manual_dir();
     let download_url = apply_gh_proxy(url);
@@ -301,7 +366,7 @@ pub async fn install_manual(url: &str) -> RoxidResult<PathBuf> {
     } else {
         tracing::info!("手动安装 llama.cpp 运行时：{download_url}");
     }
-    let bytes = download_all(&download_url).await?;
+    let bytes = download_all_with_progress(&download_url, on_progress).await?;
     place_runtime(&bytes, url_is_archive(url), &dir).await?;
     Ok(manual_server_path())
 }
@@ -320,8 +385,17 @@ static INSTALL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 ///
 /// - 参数 tag：版本 tag（b\d+ 形态，调用方校验）
 /// - 参数 backend_variant：变体片段
+/// - 参数 on_progress：进度回调（已下载字节, 总量 Option——HTTP 头缺失
+///   时 None；M105 迭代32 碴6a）
 /// - 返回：落位后的 llama-server 路径
-pub async fn install_version(tag: &str, backend_variant: &str) -> RoxidResult<PathBuf> {
+pub async fn install_version<F>(
+    tag: &str,
+    backend_variant: &str,
+    mut on_progress: F,
+) -> RoxidResult<PathBuf>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let _guard = INSTALL_LOCK.lock().await;
     let cache_dir = variant_cache_dir(backend_variant, tag);
     let server = cache_dir.join("llama-server");
@@ -332,7 +406,7 @@ pub async fn install_version(tag: &str, backend_variant: &str) -> RoxidResult<Pa
 
     let url = asset_url(backend_variant, tag);
     tracing::info!("下载 llama.cpp 运行时：{url}");
-    let bytes = download_all(&url).await?;
+    let bytes = download_all_with_progress(&url, on_progress).await?;
     place_runtime(&bytes, true, &cache_dir).await?;
     Ok(server)
 }
@@ -392,6 +466,41 @@ pub fn remove_version(tag: &str) -> RoxidResult<()> {
     }
     tokio::task::block_in_place(|| std::fs::remove_dir_all(dir))
         .map_err(|e| RoxidError::RunnerFailure(format!("删除 {tag} 失败：{e}")))
+}
+
+/// serve 启动扫描已装变体架构健康度（M99，迭代31，Q4 第一项：用户裁决
+/// 「三项全做：启动扫描 warn（不阻断）」2026-09-10 18:21）——确认不匹配
+/// 打 warn 提前暴露（原实现静默，用户要到首次推理 ENOENT 才发现）；
+/// 不阻断启动、不自动删除（Q3：存量误装目录保留）。本地读文件毫秒级。
+pub fn warn_installed_arch_mismatch() {
+    for (tag, variants) in list_installed() {
+        for variant in variants {
+            let bin = llama_runtime_root()
+                .join(&tag)
+                .join(&variant)
+                .join("llama-server");
+            if let Some((bin_arch, host_arch)) = diagnose_arch_mismatch(&bin) {
+                tracing::warn!(
+                    "已装运行时 {tag}/{variant} 的 llama-server 为 {bin_arch}，\
+                     与宿主 {host_arch} 不匹配，推理时将报错；\
+                     可 `roxid runtime rm {tag}` 清理后重装"
+                );
+            }
+        }
+    }
+}
+
+/// 已装变体架构匹配性（M99，迭代31，Q3 校验 3：`roxid runtime list`
+/// 标注数据源——不匹配变体名旁标「与宿主架构不匹配」警示）。
+///
+/// - 参数 tag / variant：list_installed 条目
+/// - 返回：true 表示确认不匹配（ELF 解析失败 / 未知 e_machine 按 false 宽容）
+pub fn installed_variant_arch_mismatch(tag: &str, variant: &str) -> bool {
+    let bin = llama_runtime_root()
+        .join(tag)
+        .join(variant)
+        .join("llama-server");
+    diagnose_arch_mismatch(&bin).is_some()
 }
 
 /// 通用落位段（M31 抽取）：bytes → staging 解压或直接落位 → 校验
@@ -477,10 +586,62 @@ fn installing_dir_of(cache_dir: &std::path::Path) -> std::path::PathBuf {
 /// 模型 blob 的分块并发与断点续传引擎在 registry 模块实现（M5 落地）。
 /// M32 碴8：响应体读取失败同样计入重试——原实现 `?` 直接返回，连接
 /// 中断/慢速下载的 body 中断绕过「3 次重试」语义直接 fail。
+/// 字节量纲自适应（M105：周期日志共用；服务端仅日志用途保持简单两位精度）。
+///
+/// - 参数 n：字节数
+/// - 返回：人类可读量纲串（MB/GB）
+fn fmt_bytes(n: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let v = n as f64;
+    if v >= 1024.0 * MB {
+        format!("{:.2} GB", v / (1024.0 * MB))
+    } else {
+        format!("{:.2} MB", v / MB)
+    }
+}
+
+/// serve 自动下载场景的 5s 周期进度日志回调（M105，迭代32 碴6a）。
+/// serve 进程无 TTY 无法渲染 spinner，以周期 info 行呈现总量/百分比；
+/// 首 chunk 即打一行（下载开始可见），此后每 5s 一行。
+///
+/// - 返回：进度回调闭包（已下载字节, 总量 Option）
+fn periodic_log_progress() -> impl FnMut(u64, Option<u64>) {
+    let mut last_log: Option<std::time::Instant> = None;
+    move |done: u64, total: Option<u64>| {
+        let now = std::time::Instant::now();
+        let due = last_log
+            .map(|t| now.duration_since(t) >= Duration::from_secs(5))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        match total {
+            Some(t) if t > 0 => tracing::info!(
+                "运行时下载进度：{}/{}（{}%）",
+                fmt_bytes(done),
+                fmt_bytes(t),
+                done * 100 / t
+            ),
+            _ => tracing::info!("运行时下载进度：{}", fmt_bytes(done)),
+        }
+        last_log = Some(now);
+    }
+}
+
 /// M49（迭代18 BUG-13）：4xx 确定性失败（404 tag 不存在等）立即报错
 /// 不重试——重试必然同果，徒增 3 次等待与日志噪音；429（限流）属
 /// 瞬态保留重试，与 5xx/网络错误/超时同通道。
-async fn download_all(url: &str) -> RoxidResult<Vec<u8>> {
+/// M105（迭代32 碴6a）：body 改流式累计并逐 chunk 回调进度
+///（content-length 为总量；头缺失时 None）——原 resp.bytes() 一次性
+/// 读取全程静默。重试语义不变（body 中断落 last_error 重试）。
+///
+/// - 参数 url：下载地址
+/// - 参数 on_progress：进度回调（已下载字节, 总量 Option）
+/// - 返回：完整字节
+async fn download_all_with_progress<F>(url: &str, mut on_progress: F) -> RoxidResult<Vec<u8>>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(600))
@@ -491,12 +652,27 @@ async fn download_all(url: &str) -> RoxidResult<Vec<u8>> {
     for attempt in 1..=3 {
         match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
+                let total = resp.content_length();
+                let mut buf: Vec<u8> =
+                    Vec::with_capacity(total.unwrap_or(0).min(64 << 20) as usize);
+                let mut stream = resp.bytes_stream();
                 // M32 碴8：body 读取失败记入 last_error 落入重试（不直接返回）
-                match resp.bytes().await {
-                    Ok(bytes) => return Ok(bytes.to_vec()),
-                    Err(e) => {
-                        last_error = format!("读取响应体失败：{e}");
+                let mut body_failed = false;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            buf.extend_from_slice(&bytes);
+                            on_progress(buf.len() as u64, total);
+                        }
+                        Err(e) => {
+                            last_error = format!("读取响应体失败：{e}");
+                            body_failed = true;
+                            break;
+                        }
                     }
+                }
+                if !body_failed {
+                    return Ok(buf);
                 }
             }
             Ok(resp) => {
@@ -883,7 +1059,7 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
                 .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let err = download_all(&format!("http://127.0.0.1:{port}/pkg"))
+        let err = download_all_with_progress(&format!("http://127.0.0.1:{port}/pkg"), |_, _| {})
             .await
             .expect_err("body 中断必须重试耗尽后报错");
         assert!(
@@ -923,7 +1099,7 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let start = std::time::Instant::now();
-        let err = download_all(&format!("http://127.0.0.1:{port}/pkg"))
+        let err = download_all_with_progress(&format!("http://127.0.0.1:{port}/pkg"), |_, _| {})
             .await
             .expect_err("404 必须报错");
         assert!(
@@ -948,6 +1124,87 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
         // 二次调用必须命中缓存且路径一致（无重复下载）
         let again = ensure_llama_server("ubuntu-x64").await.unwrap();
         assert_eq!(path, again);
+        std::env::remove_var("ROXID_HOME");
+    }
+
+    /// 构造与宿主交叉架构的 ELF64LE 假头（M99 测试工具：x64 宿主产 arm64
+    /// 头、arm64 宿主产 x64 头——测试宿主无关）
+    fn cross_arch_elf_header() -> [u8; 20] {
+        let cross_machine: u16 = if super::super::backend::host_arch_fragment() == Some("arm64") {
+            0x3e
+        } else {
+            0xb7
+        };
+        let mut h = [0u8; 20];
+        h[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        h[4] = 2;
+        h[5] = 1;
+        h[18..20].copy_from_slice(&cross_machine.to_le_bytes());
+        h
+    }
+
+    /// M99（迭代31，Q3 校验 2）：ensure 命中锁定链缓存时 ELF 架构校验——
+    /// 交叉架构假 llama-server 必须报 ArchMismatch（原实现放行到 spawn
+    /// 阶段才裸报 os error 2），且报错即返回不触发下载。
+    /// allow：锁须跨 await 持有——ROXID_HOME 全局环境隔离的完整语义
+    ///（与 registry.rs 存量测试同模式，清偿标准：不新增即挂账容忍）
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_rejects_cached_arch_mismatch() {
+        let _guard = crate::config::ROXID_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("roxid-arch-ensure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("ROXID_HOME", &dir);
+        std::env::remove_var(ENV_LLAMA_SERVER_OVERRIDE);
+        let variant = variant_cache_dir("ubuntu-x64", LOCKED_LLAMA_CPP_TAG);
+        std::fs::create_dir_all(&variant).unwrap();
+        std::fs::write(variant.join("llama-server"), cross_arch_elf_header()).unwrap();
+
+        let err = ensure_llama_server("ubuntu-x64")
+            .await
+            .expect_err("交叉架构缓存必须报错而非放行");
+        assert!(
+            matches!(err, RoxidError::ArchMismatch(_)),
+            "必须为 ArchMismatch 诊断错误：{err}"
+        );
+        assert!(
+            err.to_string().contains("不匹配"),
+            "文案必须含架构诊断结论：{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("ROXID_HOME");
+    }
+
+    /// M99（迭代31）：resolve 双链同步——命中但交叉架构视为不可得（None），
+    /// 调用方保守放行、诊断由 ensure 承担（既有分工维持）；
+    /// 非 ELF 假二进制宽容面照常命中（不误伤自备非常规产物）。
+    #[test]
+    fn resolve_treats_arch_mismatch_as_unavailable() {
+        let _guard = crate::config::ROXID_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("roxid-arch-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("ROXID_HOME", &dir);
+        std::env::remove_var(ENV_LLAMA_SERVER_OVERRIDE);
+        let variant = variant_cache_dir("ubuntu-x64", LOCKED_LLAMA_CPP_TAG);
+        std::fs::create_dir_all(&variant).unwrap();
+
+        std::fs::write(variant.join("llama-server"), cross_arch_elf_header()).unwrap();
+        assert_eq!(
+            resolve_llama_server_path("ubuntu-x64"),
+            None,
+            "交叉架构命中必须视为不可得"
+        );
+
+        std::fs::write(variant.join("llama-server"), b"#!/bin/sh\necho fake\n").unwrap();
+        assert!(
+            resolve_llama_server_path("ubuntu-x64").is_some(),
+            "非 ELF 宽容面必须照常命中"
+        );
+        std::fs::remove_dir_all(&dir).ok();
         std::env::remove_var("ROXID_HOME");
     }
 }

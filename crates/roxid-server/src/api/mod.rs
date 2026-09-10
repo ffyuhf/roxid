@@ -274,14 +274,43 @@ where
                 // 落服务端日志供调试，客户端仅收通用文案——原「解析 JSON
                 // 失败：expected value at line 1 column 78」向客户端暴露
                 // 内部解析位置（BUG 清单 v1.2.0 L42）
+                // M103（迭代32 碴4，2026-09-10 21-33）：按错误类别分流——
+                // Syntax/Eof 维持通用文案（M45 裁决锚定不变）；Data（字段
+                // 校验失败：缺字段/类型不符）转译指名道姓中文文案——原统一
+                // 「请求体不是合法 JSON」使 /api/chat 缺 messages 被误报为
+                // 语法错误，误导排查方向（用户实测报告）
                 tracing::warn!("请求体 JSON 解析失败：{e}");
+                let msg = match e.classify() {
+                    serde_json::error::Category::Data => {
+                        format!("请求体字段校验失败：{}", field_error_brief(&e.to_string()))
+                    }
+                    _ => "请求体不是合法 JSON".to_string(),
+                };
                 (
                     axum::http::StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "请求体不是合法 JSON"})),
+                    Json(serde_json::json!({"error": msg})),
                 )
                     .into_response()
             })
     }
+}
+
+/// serde Data 类错误消息 → 中文摘要（M103，迭代32 碴4）。
+/// 剥「 at line L column C」行列号细节（M45 裁决——解析位置不泄漏客户端）；
+/// `missing field 'x'` 转写「缺少字段：x」指名道姓；其余 Data 类
+///（invalid type 等）保留消息主体（技术语义主体不猜测翻译）。
+///
+/// - 参数 raw：serde 错误 Display 全文
+/// - 返回：客户端可读中文摘要
+fn field_error_brief(raw: &str) -> String {
+    let body = raw.split(" at line ").next().unwrap_or(raw);
+    if let Some(field) = body
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+    {
+        return format!("缺少字段：{field}");
+    }
+    body.to_string()
 }
 
 /// 构造完整路由（Ollama API + 通用端点；M10/M11 扩展 /v1/*）
@@ -344,6 +373,10 @@ pub async fn serve_main(bind: SocketAddr) -> RoxidResult<()> {
     // 迭代11 F1：存量旧布局迁移（路由挂载前单次执行，fail-fast——
     // 半迁移状态中止启动，重试幂等恢复；用户确认 2026-09-06 22:33/22:38）
     crate::repo::migrate::migrate_legacy_layout(&models_root())?;
+    // M99（迭代31，Q4 第一项，用户裁决 2026-09-10 18:21）：启动扫描已装
+    // 运行时架构健康度——不匹配打 warn 提前暴露（原静默，用户要到首次推理
+    // ENOENT 才发现）；不阻断启动、不自动删除（Q3：存量误装目录保留）
+    crate::runtime::warn_installed_arch_mismatch();
     let state = Arc::new(AppState {
         scheduler: Arc::new(RunnerRegistry::new(models_root())),
         models_root: models_root(),
@@ -421,6 +454,73 @@ mod tests {
         assert!(LenientJson::<serde_json::Value>::from_request(req3, &())
             .await
             .is_err());
+    }
+
+    /// M103（迭代32 碴4）：错误类别分流——Data 类（缺字段/类型不符）报
+    /// 指名道姓中文文案；Syntax/Eof 维持「请求体不是合法 JSON」；行列号
+    /// 细节均不泄漏客户端（M45 裁决锚定）
+    #[tokio::test]
+    async fn lenient_json_error_category_split() {
+        use axum::extract::FromRequest as _;
+        // 结构体缺字段 → Data 类：报缺失字段名（原误报「不是合法 JSON」）
+        #[derive(serde::Deserialize)]
+        struct ChatLike {
+            #[allow(dead_code)]
+            messages: Vec<String>,
+        }
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .body(axum::body::Body::from(r#"{"model":"x"}"#))
+            .unwrap();
+        // unwrap_err 需要 Ok 侧 Debug——LenientJson 未派生，改 match 提取
+        let err = match LenientJson::<ChatLike>::from_request(req, &()).await {
+            Ok(_) => panic!("缺字段请求应被 400 拒绝"),
+            Err(resp) => resp,
+        };
+        let body = axum::body::to_bytes(err.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            text.contains("请求体字段校验失败：缺少字段：messages"),
+            "缺字段应指名字段名：{text}"
+        );
+        assert!(!text.contains("line"), "行列号不得泄漏客户端：{text}");
+
+        // 语法错误 → Syntax 类：维持通用文案（M45 裁决不变）
+        let req2 = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .body(axum::body::Body::from(r#"{"model":"bad"#))
+            .unwrap();
+        let err2 = match LenientJson::<ChatLike>::from_request(req2, &()).await {
+            Ok(_) => panic!("语法错误请求应被 400 拒绝"),
+            Err(resp) => resp,
+        };
+        let body2 = axum::body::to_bytes(err2.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body2).contains("请求体不是合法 JSON"),
+            "语法错误维持通用文案"
+        );
+    }
+
+    /// M103：field_error_brief 纯函数——missing field 转写 / 行列号剥除 /
+    /// 其余 Data 类消息主体保留
+    #[test]
+    fn field_error_brief_forms() {
+        assert_eq!(
+            field_error_brief("missing field `messages` at line 1 column 20"),
+            "缺少字段：messages"
+        );
+        assert_eq!(
+            field_error_brief("missing field `model`"),
+            "缺少字段：model"
+        );
+        let invalid = field_error_brief(
+            "invalid type: string \"abc\", expected a sequence at line 1 column 5",
+        );
+        assert_eq!(invalid, "invalid type: string \"abc\", expected a sequence");
     }
 
     /// M21 D4d：origins 解析（变量逗号分隔覆盖；缺省默认 localhost 系）

@@ -13,6 +13,7 @@ English | [中文](zh/installation.md)
 | Installer dependencies | POSIX sh + coreutils (`install`, `mkdir`); remote downloads additionally need `curl` and `tar` (`zstd` for `.tar.zst` assets) |
 | Build from source | Rust stable toolchain (`cargo build --release`) |
 | GPU drivers | roxid does not install drivers — GPU dispatch relies on llama.cpp `--fit`; drivers are the user's responsibility. Official prebuilt Linux backends use Vulkan; for native CUDA set `ROXID_LLAMA_SERVER` to your own build |
+| CPU architecture | x86_64 and aarch64 (arm64). The llama.cpp backend variant is matched to the host CPU automatically (`ubuntu[-vulkan]-{x64\|arm64}`, GPU → vulkan); other architectures fall back to `setup --llama-url` manual install. Mismatched installed variants are flagged in `runtime list` and warned at serve startup |
 
 > The installer's interactive prompts are written in Chinese.
 

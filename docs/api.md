@@ -173,7 +173,7 @@ Embeddings (current endpoint, batch-capable input).
 
 Response: `{model, embeddings: [[...]], total_duration, load_duration, prompt_eval_count}`.
 
-> Asking a generation model for embeddings returns the official-style message: `This server does not support embeddings. Please use an embedding model`.
+> Asking a generation model for embeddings returns: `此模型不支持向量化，请使用 embedding 模型` (upstream English messages pass through verbatim).
 
 ### POST /api/embeddings
 
@@ -245,7 +245,7 @@ All passed through to the llama-server instance (request bodies must carry a `mo
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/v1/models` | GET | local repository model list (OpenAI shape) |
+| `/v1/models` | GET | local repository model list (OpenAI shape; `created` = model creation time in Unix seconds) |
 | `/v1/chat/completions` | POST | Chat Completions (`stream` optional; native fields such as `reasoning_content` pass through) |
 | `/v1/completions` | POST | text completions |
 | `/v1/embeddings` | POST | embeddings |

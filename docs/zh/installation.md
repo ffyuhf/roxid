@@ -13,6 +13,7 @@
 | 安装脚本依赖 | POSIX sh + coreutils（`install`、`mkdir`）；远程下载另需 `curl`、`tar`（`.tar.zst` 资产另需 `zstd`） |
 | 源码构建 | Rust stable 工具链（`cargo build --release`） |
 | GPU 驱动 | roxid 不安装驱动——GPU 分载依赖 llama.cpp `--fit`，驱动由用户自理；Linux 官方预编译后端经 Vulkan 加速，需原生 CUDA 时可设 `ROXID_LLAMA_SERVER` 指向自编译产物 |
+| CPU 架构 | x86_64 与 aarch64（arm64）。llama.cpp 后端变体按宿主 CPU 自动匹配（`ubuntu[-vulkan]-{x64\|arm64}`，有 GPU 取 vulkan）；其他架构经 `setup --llama-url` 手动安装。已装变体与宿主不匹配时 `runtime list` 会标注、serve 启动会告警 |
 
 > 安装脚本的交互提示文案为中文。
 

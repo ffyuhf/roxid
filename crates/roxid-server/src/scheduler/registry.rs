@@ -30,6 +30,10 @@
 //! 应然后端路径与实例记录不一致（runtime use 切换默认版本/env 改指向）
 //! 时触发重建；原仅 ctx/RUNTIME 双键，后端版本切换后运行实例无感知
 //! 2026-09-09 20-32
+//! M99（迭代31）：acquire 变体名拼接宿主架构（arm64 宿主不再误下
+//! ubuntu-x64 包）；spawn_with_port_retry 对 ArchMismatch 确定性失败
+//! 直接透出不换端口重试（原盲目重试 3 次刷误导日志；用户裁决 Q4
+//! 2026-09-10 18:21）2026-09-10 18-30
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -180,7 +184,10 @@ impl RunnerRegistry {
         //    与 /api/ps、stop 的注册表访问）
         let r = ModelRef::parse(name)?;
         let meta = repo::find_model(&self.models_root, &full)?;
-        let bin = ensure_llama_server(detect_backend().asset_variant()).await?;
+        // M99（迭代31）：变体名含宿主架构片段——未知架构在此报 5xx
+        //（文案引导手动链逃生口），arm64 宿主不再误下 ubuntu-x64 包
+        let variant = detect_backend().asset_variant()?;
+        let bin = ensure_llama_server(&variant).await?;
         let mut spec = spawn_spec_from_meta(&bin, &self.models_root, &r, &meta);
         if let Some(w) = want_ctx {
             spec.ctx_size = w; // D4c：请求级窗口覆盖元数据默认
@@ -350,8 +357,12 @@ fn runtime_matches(want: Option<&str>, effective: Option<&str>) -> bool {
 /// - 参数 instance_bin：实例记录的二进制路径（Runner::llama_server_bin）
 /// - 返回：true 表示可复用（一致或不可比对）
 fn llama_bin_matches(instance_bin: &std::path::Path) -> bool {
-    let Some(expected) =
-        crate::runtime::resolve_llama_server_path(detect_backend().asset_variant())
+    // M99（迭代31）：asset_variant 未知架构 → resolve 不可得同样保守放行
+    //（加载路径 ensure 完整链承担显式报错）
+    let Some(expected) = detect_backend()
+        .asset_variant()
+        .ok()
+        .and_then(|v| crate::runtime::resolve_llama_server_path(&v))
     else {
         return true; // resolve 不可得：保守放行
     };
@@ -404,6 +415,9 @@ fn spawn_spec_from_meta(
 
 /// 拉起并按需换端口重试（M28 碴13）：每次尝试重取端口（alloc_port 顺序游标
 /// 自然推进），失败重试上限 3 次后透出最后错误。泛型 spawn_fn 便于单测注入。
+/// M99（迭代31，Q4）：ArchMismatch 类确定性失败与端口无关——换端口重试
+/// 徒增 3 次噪音日志与等待，直接透出（原实现盲目重试 3 次并刷误导性
+///「重取端口重试」日志，用户裁决 2026-09-10 18:21）。
 ///
 /// - 参数 model_full：完整模型名（日志与兜底错误信息用）
 /// - 参数 spawn_fn：端口 → 拉起 Future（生产为 Runner::spawn_llama_server）
@@ -419,6 +433,14 @@ where
         match spawn_fn(port).await {
             Ok(r) => return Ok(r),
             Err(e) => {
+                // M99：确定性失败（架构不匹配）不换端口重试直接透出——
+                // 重试必然同果，且「重取端口重试」文案误导排查方向
+                if matches!(e, RoxidError::ArchMismatch(_)) {
+                    tracing::error!(
+                        "llama-server 拉起失败（确定性错误，不重试）model={model_full}：{e}"
+                    );
+                    return Err(e);
+                }
                 tracing::warn!("llama-server 拉起失败（重取端口重试）model={model_full}：{e}");
                 last_err = Some(e);
             }
@@ -735,6 +757,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&bin_a);
         let _ = std::fs::remove_file(&bin_b);
+    }
+
+    /// M99（迭代31，Q4）：ArchMismatch 确定性失败不换端口重试——
+    /// 单次尝试即透出（换端口对架构问题无意义，重试必然同果）
+    #[tokio::test]
+    async fn port_retry_skips_arch_mismatch() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let a = attempts.clone();
+        let err = match spawn_with_port_retry("t:arch", move |_port| {
+            a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(RoxidError::ArchMismatch("注入架构不匹配".into())) }
+        })
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("注入失败闭包不应成功"),
+        };
+        assert!(
+            matches!(err, RoxidError::ArchMismatch(_)),
+            "必须原样透出 ArchMismatch：{err:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "确定性失败仅尝试 1 次（不换端口重试）"
+        );
     }
 
     /// M28 碴13：换端口重试编排——两次注入失败后第三次成功（重试次数与

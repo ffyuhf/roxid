@@ -92,7 +92,7 @@ curl http://127.0.0.1:11434/api/generate -d '{"model": "llama3.2:3b", "prompt": 
 ### 版本与维护状态
 
 - 当前版本：**0.1.0**（仓库基线）；Release 产物版本跟随发布 tag（发布工作流自动注入）
-- 维护状态：**活跃开发中**（迭代 1–24 持续演进；已知边界与挂账项见各文档标注）
+- 维护状态：**活跃开发中**（已知边界与挂账项见各文档标注）
 
 ---
 
@@ -174,4 +174,4 @@ Full walkthrough (setup wizard → pull → interactive chat → API calls): [qu
 ### Version and maintenance status
 
 - Current version: **0.1.0** (repository baseline); release artifacts carry the published tag version (injected by the release workflow)
-- Maintenance: **actively developed** (iterations 1–24 and counting; known boundaries and deferred items are annotated in each document)
+- Maintenance: **actively developed** (known boundaries and deferred items are annotated in each document)

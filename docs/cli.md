@@ -20,6 +20,10 @@ Global flags:
   -v, --version  show version information
 ```
 
+The global flags `--nowordwrap` / `--verbose` are clap `global` flags — they may appear before or after the subcommand (`roxid --verbose run m` equals `roxid run --verbose m`).
+
+**Colors & width adaptation**: on a TTY, error lines render red, success echoes green, table headers bold, and the REPL banner/prompt colored. All ANSI output is disabled when `NO_COLOR` is set to a non-empty value, when `TERM=dumb`, or when the stream is redirected (stdout and stderr are judged independently, keeping pipe parsers clean). Progress frames and the `list` / `ps` tables converge to the real terminal width (the `COLUMNS` env var takes precedence), with CJK-aware truncation of over-wide content.
+
 ## Command tree
 
 | Command | Purpose | Origin |
@@ -87,7 +91,7 @@ Supported Modelfile instructions: `FROM` / `SYSTEM` / `TEMPLATE` / `PARAMETER` /
 
 ## show
 
-Show model information (three sections: parameter key-values / Capabilities / RUNTIME lines; empty sections are omitted).
+Show model information (four sections: Model key-values (architecture / parameters / quantization / system) / Parameters entries / Capabilities / RUNTIME lines; empty sections are omitted; the parameter count is folded into the Model section keys instead of colliding with the Parameters entries title, aligned with upstream).
 
 ```text
 roxid show <model>
@@ -114,6 +118,8 @@ roxid run <model> [prompt...] [--hf] [--runtime <flags>]
 
 Built-in REPL commands: `/bye` (or `/exit` / `/quit`) to exit, `/clear` to reset the conversation; thinking increments render dimmed and are not fed back into context. If the model is missing, a 404 triggers one automatic pull and the request is retried.
 
+REPL presentation: the banner prints once in color on session start; the prompt is a cyan `{model}> `; each reply is followed by a blank separator line; the `--verbose` timing line reads `(input N tok / output N tok / total N.NN s / output N.N tok/s)` in the Chinese locale build (missing fields are omitted).
+
 ```sh
 roxid run llama3.2:3b
 roxid run llama3.2:3b "explain quantum computing in one sentence"
@@ -123,7 +129,7 @@ roxid run my-model --runtime "--threads 3 -ngl 30"
 
 ## stop
 
-Stop (unload) a running model instance.
+Stop (unload) a running model instance. Prints `已停止 {model}` on success (green).
 
 ```text
 roxid stop <model>
@@ -131,7 +137,12 @@ roxid stop <model>
 
 ## pull
 
-Pull a model from a registry. Supports both the Ollama registry and direct HuggingFace references; resumable downloads, NDJSON progress (TTY spinner / non-TTY periodic text lines), and digest-level skipping of layers already present locally.
+Pull a model from a registry. Supports both the Ollama registry and direct HuggingFace references; resumable downloads, NDJSON progress, and digest-level skipping of layers already present locally.
+
+Progress presentation:
+
+- **TTY**: single-line spinner overlay; messages are CJK-aware truncated to the terminal width (no more wrapped-line residue on narrow terminals); phase distinction — the verifying / writing-manifest / retrying phases switch the spinner to yellow, a completed layer shows a green ✓, and status texts render in Chinese (protocol fields keep the official English originals);
+- **non-TTY** (pipe / redirect / CI): one line per phase, aligned with upstream — `拉取清单` / a per-layer summary line (`拉取 {digest}: 100% 2.00 GB（平均 5.3 MB/s）`) / `校验 sha256 摘要` / `写入清单`; automatic retries (up to 3) print `下载中断，正在重试（第 N/3 次）`.
 
 ```text
 roxid pull <model> [--hf]
@@ -168,6 +179,8 @@ roxid signout
 
 List local models in a table: columns `NAME` / `SIZE` / `MODIFIED`. `MODIFIED` is rendered in a human-readable hybrid form — absolute time plus a Chinese relative phrase, e.g. `2026-06-04 03:04 (3 个月前)` (tiers: 秒 / 分钟 / 小时 / 天 / 周 / 个月 / 年 前; ≤0 delta shows `刚刚`; unparseable timestamps are printed verbatim).
 
+Width adaptation: `NAME` truncates to the terminal width with a trailing `…` (CJK-aware); `SIZE` adapts its unit (KB/MB/GB, two decimals); on narrow terminals (<60 columns) `MODIFIED` keeps only the relative phrase so all three columns converge within the terminal width (no overflow at 40 columns).
+
 ```text
 roxid list    # alias: roxid ls
 ```
@@ -182,7 +195,7 @@ roxid ps
 
 ## cp
 
-Copy a model (the destination is a derived model; large files are hard-linked to the base model, costing no extra disk space).
+Copy a model (the destination is a derived model; large files are hard-linked to the base model, costing no extra disk space). Prints `已复制 {source} → {destination}` on success (green; diverges from the silent upstream ollama behavior).
 
 ```text
 roxid cp <source> <destination>
@@ -194,7 +207,7 @@ roxid cp llama3.2:3b llama3.2:3b-copy
 
 ## rm
 
-Remove a local model.
+Remove a local model. Prints `已删除 {model}` on success (green).
 
 ```text
 roxid rm <model>
@@ -236,7 +249,7 @@ roxid runtime rm <tag>
 | Subcommand | Arguments | Description |
 |---|---|---|
 | `list` | — | List installed versions (default marked `[默认]`) plus manual; includes the resolution order |
-| `install` | `<tag>` (form `b\d+`, e.g. `b10700`) or `--url <url>` (mutually exclusive) | Download by official tag (variant auto-detected: GPU → vulkan / otherwise cpu); `--url` installs as the manual version |
+| `install` | `<tag>` (form `b\d+`, e.g. `b10700`) or `--url <url>` (mutually exclusive) | Download by official tag (variant auto-detected per host CPU arch `x64`/`arm64` + GPU → vulkan / otherwise cpu); `--url` installs as the manual version |
 | `use` | `<tag>` or `manual` | Set and persist the default version; the first request after switching tears down the old instance and starts the new version |
 | `rm` | `<tag>` | Remove an installed version; the current default must be switched away first |
 
@@ -289,8 +302,10 @@ Server-side variables (proxies / backend / parallelism) are covered in [Configur
 When the server is unreachable (connection failure), a unified hint is printed and the process exits 1:
 
 ```text
-无法连接 roxid 服务（http://127.0.0.1:11434）：...
+错误： 无法连接 roxid 服务（http://127.0.0.1:11434）：...
 请先运行：roxid serve
 ```
+
+Unified error output: server error bodies `{"error":"..."}` are parsed by the CLI and shown as plain text (the raw JSON envelope no longer leaks), with a uniform red `错误：` prefix on stderr.
 
 > If `ROXID_HOST` / `OLLAMA_HOST` points at an official Ollama instance, the CLI detects it and warns on stderr that the connected instance is not roxid; commands still operate on that instance (stdout stays ollama-aligned, keeping pipe parsing clean).

@@ -26,7 +26,7 @@ HuggingFace 镜像基址（整体替换官方域名）[回车=https://hf-mirror.
 ```
 
 - The proxy questions are skipped automatically outside mainland-China network environments; re-open the wizard anytime with `roxid setup`;
-- After the wizard, serve auto-downloads the llama.cpp backend (locked tag by default; vulkan variant on GPU, cpu otherwise) and starts listening:
+- After the wizard, serve auto-downloads the llama.cpp backend (locked tag by default; variant matched to the host CPU architecture, vulkan on GPU / cpu otherwise) and starts listening:
 
 ```text
 roxid API 服务已启动: http://127.0.0.1:11434

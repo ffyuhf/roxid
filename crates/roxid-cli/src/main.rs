@@ -51,6 +51,18 @@
 //! 未安装先拉取（进度可见）完成后再进输入框（时序对齐官方，用户裁决
 //! 2026-09-10 06:34）；仅 404 触发预拉取，其余放行走既有 chat 报错路径
 //! 2026-09-10 06-42
+//! M108–M118（迭代33，用户批准 2026-09-10 22:33）：CLI 交互体验碴清偿——
+//! M108 手写 ANSI 颜色层（NO_COLOR/TERM=dumb/非 TTY 三重门控，stdout
+//! 与 stderr 独立判定）；M109 终端宽度基建（COLUMNS 优先 + terminal_size，
+//! 进度帧/list 列宽 CJK 感知截断，原恒 82 字符窄终端折行残留）；M110
+//! 进度阶段区分（校验/重试黄色 spinner、层完成绿✓、status 中文映射，
+//! 协议英文原文不变）；M111 非 TTY 每阶段一行（用户裁决 2026-09-10
+//! 22:25 对齐官方）；M112 list/ps 列宽自适应 + SIZE 量纲自适应；M113
+//! show Model 段键值化（消除双 Parameters 标签）；M114 REPL 横幅/提示符
+//! 着色 + 回复后空行 + 半角括号；M115 verbose 补总耗时与输出速率；
+//! M117 错误整形（{"error":...} 提取 + 统一红色「错误：」前缀）+ cp/rm/
+//! stop 成功回显；M118 verbose/nowordwrap 标 global（子命令后可用）
+//! 2026-09-10 22-45
 
 mod complete;
 mod completion;
@@ -85,9 +97,9 @@ fn http() -> reqwest::Client {
         .clone()
 }
 
-/// 服务不可达的统一提示
+/// 服务不可达的统一提示（M108：红色错误行——正常与失败结果同色不可辨）
 fn conn_hint(e: reqwest::Error) -> ! {
-    eprintln!("无法连接 roxid 服务（{}）：{e}", base_url());
+    print_error(&format!("无法连接 roxid 服务（{}）：{e}", base_url()));
     eprintln!("请先运行：roxid serve");
     std::process::exit(1);
 }
@@ -141,10 +153,12 @@ async fn warn_if_foreign_instance() {
 )]
 struct Cli {
     /// Don't wrap words to the next line automatically
-    #[arg(long)]
+    // M118（迭代33 碴11）：global = true——全局选项可出现在子命令之后
+    //（原仅能前置，`roxid run --verbose` 报 unexpected argument）
+    #[arg(long, global = true)]
     nowordwrap: bool,
     /// Show timings for response
-    #[arg(long)]
+    #[arg(long, global = true)]
     verbose: bool,
     /// Show version information
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
@@ -382,12 +396,16 @@ async fn main() {
             let model = normalize_hf_arg(model, hf);
             cmd_run(&model, prompt.join(" "), cli.verbose, runtime).await
         }
-        Commands::Stop { model } => cmd_simple_post("/api/stop", &model).await,
+        Commands::Stop { model } => {
+            cmd_simple_post("/api/stop", &model, &format!("已停止 {model}")).await
+        }
         Commands::Pull { model, hf } => {
             let model = normalize_hf_arg(model, hf);
             cmd_pull(&model).await
         }
-        Commands::Push { model } => cmd_simple_post("/api/push", &model).await,
+        Commands::Push { model } => {
+            cmd_simple_post("/api/push", &model, &format!("已推送 {model}")).await
+        }
         Commands::Signin => cmd_signin().await,
         Commands::Signout => cmd_signout().await,
         Commands::List => cmd_list().await,
@@ -451,7 +469,20 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
                 } else {
                     ""
                 };
-                println!("  {tag}  {}{mark}", variants.join(", "));
+                // M99（迭代31，Q3 校验 3，用户裁决 2026-09-10 18:17）：
+                // 变体与宿主架构不匹配时标注警示（arm64 机器上历史误装的
+                // ubuntu-x64 即此形态；ELF 无法判定时不标注，宽容）
+                let rendered: Vec<String> = variants
+                    .iter()
+                    .map(|v| {
+                        if rt::installed_variant_arch_mismatch(&tag, v) {
+                            format!("{v}（与宿主架构不匹配）")
+                        } else {
+                            v.clone()
+                        }
+                    })
+                    .collect();
+                println!("  {tag}  {}{mark}", rendered.join(", "));
             }
             if !matches!(default.as_deref(), Some("manual")) {
                 println!("（`roxid runtime use <tag|manual>` 切换默认版本）");
@@ -464,7 +495,11 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
                     eprintln!("--url 与位置参数 tag 不可同时使用");
                     return 1;
                 }
-                return match rt::install_manual(&url).await {
+                // M105（迭代32 碴6a）：下载进度可见（量纲/速度/剩余时间）
+                let (bar, on_progress) = runtime_download_progress("下载运行时");
+                let result = rt::install_manual(&url, on_progress).await;
+                bar.finish_and_clear();
+                return match result {
                     Ok(path) => {
                         println!("manual 版本已安装：{}", path.display());
                         println!("提示：运行 `roxid runtime use manual` 将其设为默认");
@@ -484,9 +519,24 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
                 eprintln!("非法 tag 形态：{tag}（期望 b\\d+，如 b10700）");
                 return 1;
             }
-            let variant = rt::detect_backend().asset_variant();
-            println!("探测后端变体：{variant}（GPU → vulkan / 无 GPU → cpu）");
-            match rt::install_version(&tag, variant).await {
+            // M99（迭代31）：变体名含宿主架构片段（Q1 动态探测 2026-09-10
+            // 18:15）；未知架构显式报错引导手动链，不再误下 x64 包
+            let variant = match rt::detect_backend().asset_variant() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            println!(
+                "探测后端变体：{variant}（宿主 {}；GPU → vulkan / 无 GPU → cpu）",
+                rt::host_arch_fragment().unwrap_or("未知")
+            );
+            // M105（迭代32 碴6a）：下载进度可见（量纲/速度/剩余时间）
+            let (bar, on_progress) = runtime_download_progress("下载运行时");
+            let result = rt::install_version(&tag, &variant, on_progress).await;
+            bar.finish_and_clear();
+            match result {
                 Ok(path) => {
                     println!("已安装 {tag}（{variant}）：{}", path.display());
                     let cur = roxid_server::config::load_persist_config()
@@ -640,7 +690,7 @@ async fn cmd_create(model: &str, file: Option<String>, interactive: bool) -> i32
         Some(f) => match std::fs::read_to_string(f) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("无法读取 Modelfile {f}：{e}");
+                print_error(&format!("无法读取 Modelfile {f}：{e}"));
                 return 1;
             }
         },
@@ -671,7 +721,8 @@ async fn submit_create(model: &str, text: &str) -> i32 {
         Err(e) => conn_hint(e),
     };
     if !resp.status().is_success() {
-        eprintln!("创建失败：{}", resp.text().await.unwrap_or_default());
+        // M117：错误体整形（{"error":...} 提取纯文本）+ 统一红色前缀
+        print_error(&fmt_api_error(&resp.text().await.unwrap_or_default()));
         return 1;
     }
     match consume_ndjson_progress(resp).await {
@@ -680,7 +731,7 @@ async fn submit_create(model: &str, text: &str) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("创建失败：{e}");
+            print_error(&e);
             1
         }
     }
@@ -788,22 +839,34 @@ async fn cmd_show(model: &str) -> i32 {
         .await
         .unwrap_or_else(|e| conn_hint(e));
     if !resp.status().is_success() {
-        eprintln!("错误：{}", resp.text().await.unwrap_or_default());
+        print_error(&fmt_api_error(&resp.text().await.unwrap_or_default()));
         return 1;
     }
     let v: Value = resp.json().await.unwrap_or(Value::Null);
+    // M113（迭代33 碴6）：对齐官方 Model 段键值化——原独立
+    // `Parameters: {size} ({quant})` 行与下挂参数区标题「Parameters:」
+    // 同名重复（两个标签分别表示参数量与 stop 等参数条目，语义混淆）；
+    // 参数量/量化并入 Model 段键值，下挂区独占 Parameters 标题
+    let sc = stdout_color();
+    println!("{}", paint(sc, "1", "Model"));
     println!(
-        "  Model:      {}",
+        "  {:<18} {}",
+        "architecture",
         v["details"]["family"].as_str().unwrap_or("?")
     );
     println!(
-        "  Parameters: {} ({})",
-        v["details"]["parameter_size"].as_str().unwrap_or("?"),
+        "  {:<18} {}",
+        "parameters",
+        v["details"]["parameter_size"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  {:<18} {}",
+        "quantization",
         v["details"]["quantization_level"].as_str().unwrap_or("?")
     );
     if let Some(sys) = v["system"].as_str() {
         if !sys.is_empty() {
-            println!("  System:     {sys}");
+            println!("  {:<18} {sys}", "system");
         }
     }
     // 迭代18 BUG-11（M47）：补齐官方对齐三段——模型参数键值区 /
@@ -900,7 +963,15 @@ async fn cmd_run(
     // 迭代30（M98）：横幅进入会话时打印一次（对齐官方 run；原实现每轮循环
     // 读取输入前重复打印刷屏，2026-09-10 用户反馈）
     if !single {
-        println!(">>> 提示词送出，/bye 退出，/clear 清空对话 <<<");
+        // M114（迭代33 碴7）：横幅着色（原单行无颜色）
+        println!(
+            "{}",
+            paint(
+                stdout_color(),
+                "36;1",
+                ">>> 提示词送出，/bye 退出，/clear 清空对话 <<<"
+            )
+        );
     }
     let mut prompt = first_prompt;
     // M33 碴8：本会话是否已自动拉取过（防 404 循环拉取，最多一次）
@@ -908,7 +979,7 @@ async fn cmd_run(
 
     loop {
         if !single {
-            match rl.readline(format!("{model}> ").as_str()) {
+            match rl.readline(&format!("{}> ", paint(stdout_color(), "36", model))) {
                 Ok(line) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {
@@ -919,7 +990,8 @@ async fn cmd_run(
                         "/bye" | "/exit" | "/quit" => break,
                         "/clear" => {
                             messages.clear();
-                            println!("（已清空对话）");
+                            // M114：半角括号（原全角与其余输出风格不统一）
+                            println!("(已清空对话)");
                             continue;
                         }
                         _ => prompt = line,
@@ -950,7 +1022,7 @@ async fn cmd_run(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("请求失败：{e}");
+                    print_error(&format!("请求失败：{e}"));
                     return 1;
                 }
             };
@@ -964,7 +1036,7 @@ async fn cmd_run(
             pulled = true;
         };
         if !resp.status().is_success() {
-            eprintln!("错误：{}", resp.text().await.unwrap_or_default());
+            print_error(&fmt_api_error(&resp.text().await.unwrap_or_default()));
             if single {
                 return 1;
             }
@@ -977,6 +1049,8 @@ async fn cmd_run(
         if single {
             break;
         }
+        // M114（迭代33 碴7）：多轮之间空行分隔（原回复紧贴下一轮提示符）
+        println!();
         prompt = String::new();
     }
     0
@@ -1017,7 +1091,23 @@ async fn print_assistant_stream(resp: reqwest::Response, verbose: bool) -> Strin
                     if ev["done"].as_bool().unwrap_or(false) {
                         let count = ev["eval_count"].as_u64().unwrap_or(0);
                         let pcount = ev["prompt_eval_count"].as_u64().unwrap_or(0);
-                        timing_info = format!("\n(输入 {pcount} tok / 输出 {count} tok)");
+                        // M115（迭代33 碴8）：补总耗时与输出速率——done
+                        // 事件已携带 total_duration/eval_duration（M28 碴6 +
+                        // M102 timings 语义），原仅消费两个 token 计数；
+                        // 字段缺失/为零时省略对应段（不显示无意义值）
+                        let mut segs = vec![format!("输入 {pcount} tok / 输出 {count} tok")];
+                        let total_ns = ev["total_duration"].as_u64().unwrap_or(0);
+                        if total_ns > 0 {
+                            segs.push(format!("总耗时 {:.2} 秒", total_ns as f64 / 1e9));
+                        }
+                        let eval_ns = ev["eval_duration"].as_u64().unwrap_or(0);
+                        if eval_ns > 0 && count > 0 {
+                            segs.push(format!(
+                                "输出 {:.1} tok/s",
+                                count as f64 / (eval_ns as f64 / 1e9)
+                            ));
+                        }
+                        timing_info = format!("\n({})", segs.join(" / "));
                     }
                 }
             }
@@ -1045,6 +1135,184 @@ fn thinking_view(thinking: &str) -> String {
     }
 }
 
+/// CLI 颜色门控（M108，迭代33 碴1）：对应流为 TTY + NO_COLOR 非空即禁
+///（no-color.org 语义）+ TERM=dumb 禁——三重条件全过才放行 ESC 序列；
+/// 管道/重定向零转义输出，脚本解析不受污染。
+///
+/// - 参数 is_tty：目标流是否终端（调用方传入）
+/// - 返回：是否允许着色
+fn color_ok(is_tty: bool) -> bool {
+    if !is_tty {
+        return false;
+    }
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    std::env::var("TERM").map_or(true, |t| t != "dumb")
+}
+
+/// stdout 颜色开关（进程内 OnceLock 缓存——逐行读 env 的开销免除）。
+/// stdout 与 stderr 独立判定：`roxid list > file` 时 stdout 无色、
+/// stderr 错误行仍可有色。
+fn stdout_color() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        use std::io::IsTerminal;
+        color_ok(std::io::stdout().is_terminal())
+    })
+}
+
+/// stderr 颜色开关（语义同 [`stdout_color`]，独立探测）。
+fn stderr_color() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        use std::io::IsTerminal;
+        color_ok(std::io::stderr().is_terminal())
+    })
+}
+
+/// 指定 SGR 码包裹文本（M108；颜色关闭时原样返回——调用方无需分支）。
+///
+/// - 参数 enabled：颜色开关（[`stdout_color`]/[`stderr_color`]）
+/// - 参数 code：SGR 码（"31" 红 / "32" 绿 / "33" 黄 / "36" 青 / "1" 粗体）
+/// - 返回：带转义对的渲染串
+fn paint(enabled: bool, code: &str, text: &str) -> String {
+    if enabled {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// 统一错误行输出（M117，迭代33 碴10）：红色粗体「错误：」前缀走
+/// stderr——原各命令前缀形态不一（删除失败/复制失败/失败：），且
+/// rm 失败把 `{"error":"..."}` 原始 JSON 包裹整段透出。
+///
+/// - 参数 msg：已整形的人类可读错误文本
+fn print_error(msg: &str) {
+    eprintln!("{} {msg}", paint(stderr_color(), "31;1", "错误："));
+}
+
+/// 服务端错误体整形（M117，迭代33 碴10）：解析 `{"error":"..."}`
+/// 提取纯文本（兼容 OpenAI 层嵌套 message 形态）；非 JSON / 无
+/// error 字段原样返回（不吞上游信息）。
+///
+/// - 参数 body：HTTP 错误响应原始文本
+/// - 返回：人类可读错误消息
+fn fmt_api_error(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v["error"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| v["error"]["message"].as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| body.to_string())
+}
+
+/// 终端宽度探测（M109，迭代33 碴2）：COLUMNS env（可解析且 8..=4096）
+/// 优先 → terminal_size 探测 tty 实际列数 → 兜底 80。原 indicatif 未
+/// 启用 terminal_size feature，COLUMNS=40 / stty cols 40 下进度帧仍按
+/// 默认宽 82 字符渲染，窄终端每帧折 3 行且清理序列只作用末行残留屏幕。
+///
+/// - 返回：当前终端可用列数
+fn term_width() -> usize {
+    if let Ok(v) = std::env::var("COLUMNS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if (8..=4096).contains(&n) {
+                return n;
+            }
+        }
+    }
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(80)
+}
+
+/// 字符显示宽度（M109/M112 共用）：CJK 区段计 2 列、其余 1 列。
+/// 粗粒度判定（emoji/组合字符按窄计，East Asian Ambiguous 按 1 列）
+/// ——服务于终端列收敛的截断场景足够。
+fn char_width(c: char) -> usize {
+    let u = c as u32;
+    let wide = (0x2E80..=0x9FFF).contains(&u)        // CJK 部首/汉字/假名
+        || (0xF900..=0xFAFF).contains(&u)            // CJK 兼容表意
+        || (0xFE30..=0xFE4F).contains(&u)            // CJK 兼容形式
+        || (0xFF00..=0xFF60).contains(&u)            // 全角形式
+        || (0x20000..=0x2FA1F).contains(&u); // CJK 扩展
+                                             // 宽字符 2 列、窄字符 1 列（bool→0/1 的直转会得 0/1，语义反转）
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// 字符串显示宽度（终端列数）。
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// 按显示宽度截断尾部加 …（M109 进度帧收敛 / M112 NAME 列共用）。
+///
+/// - 参数 s：原串；max_cols：最大显示列数（… 自身占 1 列）
+/// - 返回：显示宽度不超过 max_cols 的串（原串不超宽时原样返回）
+fn truncate_cols(s: &str, max_cols: usize) -> String {
+    if display_width(s) <= max_cols {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w + cw > max_cols.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// 层摘要短形态（M110/M111）：`sha256:3c1c9d…` → `3c1c9d`（前 8 位，
+/// 层身份可辨即可——官方 CLI 同样以摘要前缀标识层）。
+///
+/// - 参数 digest：完整摘要串
+/// - 返回：摘要十六进制前 8 位（无前缀形态原样截取）
+fn short_digest(digest: &str) -> &str {
+    let hex = digest.rsplit(':').next().unwrap_or(digest);
+    &hex[..hex.len().min(8)]
+}
+
+/// NDJSON status 中文映射（M110，迭代33 碴3）：协议侧保持官方英文
+/// 原文（Ollama 语义对齐，e2e 断言不破），CLI 渲染层转中文；未知
+/// status 原样输出（兼容服务端后续新增阶段）。
+///
+/// - 参数 status：协议 status 字段原文
+/// - 返回：中文渲染文案
+fn status_zh(status: &str) -> String {
+    match status {
+        "success" => "成功".into(),
+        "verifying sha256 digest" => "校验 sha256 摘要".into(),
+        "writing manifest" => "写入清单".into(),
+        "pulling manifest" => "拉取清单".into(),
+        "reading gguf header" => "读取 GGUF 头".into(),
+        _ => {
+            if let Some(rest) = status.strip_prefix("pulling ") {
+                format!("拉取 {rest}")
+            } else if let Some(rest) = status
+                .strip_prefix("retrying download (attempt ")
+                .and_then(|r| r.strip_suffix(')'))
+            {
+                format!("下载中断，正在重试（第 {rest}）")
+            } else {
+                status.to_string()
+            }
+        }
+    }
+}
+
 /// 从 /api/chat NDJSON 事件提取 assistant 文本增量。
 /// M27（碴3）：聚合与渲染分离（纯函数可单测）；空增量与统计末事件返回 None。
 ///
@@ -1053,6 +1321,173 @@ fn thinking_view(thinking: &str) -> String {
 fn assistant_content_from_event(ev: &Value) -> Option<&str> {
     let content = ev["message"]["content"].as_str()?;
     (!content.is_empty()).then_some(content)
+}
+
+/// 字节量纲自适应（M105/M106 共用，迭代32 碴6）。
+///
+/// - 参数 n：字节数
+/// - 返回：人类可读量纲串（KB/MB/GB，两位小数）
+fn fmt_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    let v = n as f64;
+    if v >= GB {
+        format!("{:.2} GB", v / GB)
+    } else if v >= MB {
+        format!("{:.2} MB", v / MB)
+    } else {
+        format!("{:.2} KB", v / KB)
+    }
+}
+
+/// 剩余秒数 → 中文时间短语（M105/M106 共用，迭代32 碴6）。
+///
+/// - 参数 secs：剩余秒数
+/// - 返回：如「45秒」「3分20秒」「1时05分」；不足 1 秒返回「<1秒」
+fn fmt_eta(secs: f64) -> String {
+    if secs < 1.0 {
+        return "<1秒".to_string();
+    }
+    let s = secs.floor() as u64;
+    if s < 60 {
+        format!("{s}秒")
+    } else if s < 3600 {
+        format!("{}分{}秒", s / 60, s % 60)
+    } else {
+        format!("{}时{:02}分", s / 3600, s % 3600 / 60)
+    }
+}
+
+/// 滑动窗口下载速度（M105/M106 共用，迭代32 碴6）：记录最近 window
+/// 内的（时刻, 累计字节）样本，速度 = 窗口首末样本字节差 ÷ 时间差
+///（防瞬时抖动；窗口内不足 2 样本或时距过短返回 None）。
+struct SpeedTracker {
+    /// 窗口内（时刻, 累计字节）样本序列
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    /// 统计窗口时长
+    window: std::time::Duration,
+}
+
+impl SpeedTracker {
+    /// 构造速度追踪器。
+    ///
+    /// - 参数 window：统计窗口（建议 5s——进度事件 200ms 粒度下约 25 样本）
+    fn new(window: std::time::Duration) -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            window,
+        }
+    }
+
+    /// 推入新样本并计算窗口速度。
+    ///
+    /// - 参数 done：当前累计字节
+    /// - 返回：窗口速度（字节/秒）；样本不足/时距过短 None
+    fn push(&mut self, done: u64) -> Option<f64> {
+        let now = std::time::Instant::now();
+        self.samples.push_back((now, done));
+        // 淘汰窗口外样本（保留最新 1 条窗口外样本作差分基线——避免
+        // 恰好全部淘汰后样本数 <2 的空窗）
+        while self.samples.len() > 2 {
+            let front = match self.samples.front() {
+                Some(f) => f,
+                None => break,
+            };
+            if now.duration_since(front.0) > self.window {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        let (t0, d0) = self.samples.front()?;
+        let dt = now.duration_since(*t0).as_secs_f64();
+        if dt < 0.2 {
+            return None; // 时距过短：速度无意义（防除零与尖峰）
+        }
+        Some((done - d0) as f64 / dt)
+    }
+}
+
+/// runtime 下载进度渲染器（M105，迭代32 碴6a；M109/M111 迭代33 增强）：
+/// TTY spinner（量纲/速度/剩余时间/百分比 + msg 按终端宽 CJK 感知截断）；
+/// 非 TTY 两行制（开始一行 + 完成汇总一行——对齐 pull 每阶段一行裁决
+/// 语义，用户裁决 2026-09-10 22:25；原 1s 周期刷行取消）。
+/// 返回 (bar, 回调)——bar 在安装结束后由调用方 finish_and_clear。
+///
+/// - 参数 label：进度行前缀（如「下载运行时」）
+/// - 返回：spinner 句柄与进度回调（已下载字节, 总量 Option）
+fn runtime_download_progress(
+    label: &str,
+) -> (indicatif::ProgressBar, impl FnMut(u64, Option<u64>)) {
+    let label = label.to_string(); // 物化：闭包捕获所有权（impl trait 无生命周期参）
+    let bar = indicatif::ProgressBar::new_spinner();
+    let mut speed = SpeedTracker::new(std::time::Duration::from_secs(5));
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    if tty {
+        bar.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("{spinner} {msg}")
+                .unwrap(),
+        );
+        bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    }
+    // M111：非 TTY 两行制状态——首回调打开始行；done 到达 total 打完成
+    // 汇总行（总量 + 平均速度）
+    let label_echo = label.clone(); // 非 TTY 分支独立持有（render 已 move 原件）
+    let started = std::time::Instant::now();
+    let mut announced = false;
+    let mut finished = false;
+    let render =
+        move |speed: &mut SpeedTracker, done: u64, total: Option<u64>, out: &dyn Fn(String)| {
+            let sp = speed.push(done);
+            let speed_s = sp
+                .map(|s| format!("，{}/s", fmt_bytes(s as u64)))
+                .unwrap_or_default();
+            let msg = match total {
+                Some(t) if t > 0 => {
+                    let pct = done * 100 / t;
+                    let eta_s = sp
+                        .filter(|s| *s > 0.0)
+                        .map(|s| format!("，剩余 {}", fmt_eta((t - done) as f64 / s)))
+                        .unwrap_or_default();
+                    format!(
+                        "{label} {}/{}（{pct}%{speed_s}{eta_s}）",
+                        fmt_bytes(done),
+                        fmt_bytes(t)
+                    )
+                }
+                _ => format!("{label} {}{speed_s}", fmt_bytes(done)),
+            };
+            out(msg);
+        };
+    let bar2 = bar.clone();
+    let cb = move |done: u64, total: Option<u64>| {
+        if tty {
+            // M109：msg 按终端宽截断（spinner 前缀 2 列）
+            render(&mut speed, done, total, &|msg: String| {
+                bar2.set_message(truncate_cols(&msg, term_width().saturating_sub(2)))
+            });
+            return;
+        }
+        if !announced {
+            announced = true;
+            println!("{label_echo}开始…");
+            return;
+        }
+        if !finished && total.is_some_and(|t| t > 0 && done >= t) {
+            finished = true;
+            let t = total.unwrap_or(0);
+            let secs = started.elapsed().as_secs_f64();
+            let avg = if secs > 0.05 {
+                format!("（平均 {}/s）", fmt_bytes((t as f64 / secs) as u64))
+            } else {
+                String::new()
+            };
+            println!("{label_echo}完成：{}{avg}", fmt_bytes(t));
+        }
+    };
+    (bar, cb)
 }
 
 /// pull：拉取模型（NDJSON 进度条渲染）
@@ -1082,45 +1517,56 @@ async fn pull_and_render(model: &str) -> i32 {
         Err(e) => conn_hint(e),
     };
     if !resp.status().is_success() {
-        eprintln!("拉取失败：{}", resp.text().await.unwrap_or_default());
+        // M117：错误体整形 + 统一红色前缀
+        print_error(&fmt_api_error(&resp.text().await.unwrap_or_default()));
         return 1;
     }
     match consume_ndjson_progress(resp).await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("拉取失败：{e}");
+            print_error(&e);
             1
         }
     }
 }
 
 /// 消费 NDJSON 进度/状态流并渲染（M33 碴8 自 cmd_pull 抽取；M34 O-1 双
-/// 路径渲染）：TTY 下 spinner 带百分比/字节（对齐原版实时进度条）；非
-/// TTY（管道/重定向——indicatif 默认隐藏，实测全程静默）降级为 ≥1s 周期
-/// 文本行（对齐官方 Go CLI 非 TTY 打印行为）；error 事件即时终止；见
-/// success 判成功；流耗尽未见 success 判中断。
+/// 路径；迭代33 M109/M110/M111 重构）：
+/// - TTY：spinner 单行覆盖 + msg 按终端宽 CJK 感知截断（原恒 82 字符，
+///   窄终端每帧折 3 行且清理序列只作用末行残留屏幕）+ 阶段视觉区分
+///   （校验/重试黄色 spinner、层完成绿 ✓、status 中文映射——协议英文
+///   原文不变，兼容服务端后续新增阶段）；
+/// - 非 TTY：对齐官方每阶段一行（用户裁决 2026-09-10 22:25）——status
+///   阶段各一行、层结束（digest 切换/阶段推进/流末）输出层汇总行，
+///   取消原 1s 周期刷行（原约 5 行刷屏与 TTY 单行呈现不一致）；
+/// - error 事件即时终止；见 success 判成功；流耗尽未见 success 判中断。
 ///
 /// - 参数 resp：上游 2xx 响应（/api/pull 或 /api/create）
 /// - 返回：Ok(()) 见 success；Err(错误文本) 见 error 事件或流中断
 async fn consume_ndjson_progress(resp: reqwest::Response) -> Result<(), String> {
-    // M34 O-1：stdout 非 TTY 时 indicatif spinner 完全隐藏——降级文本行
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let bar = indicatif::ProgressBar::new_spinner();
-    bar.set_style(
-        indicatif::ProgressStyle::default_spinner()
-            .template("{spinner} {msg}")
-            .unwrap(),
-    );
-    // M92 碴A（迭代29）：spinner 补 steady tick——indicatif 的 {spinner}
-    // 字符由 tick 计数驱动前进，set_message 只触发重绘不推进 tick，原
-    // 实现 spinner 永停首字符 ⠁ 形似卡死；100ms 后台 tick 对齐官方 Go
-    // 动画周期；非 TTY 路径（spinner 隐藏走文本行）零影响
+    // M110：阶段 spinner 样式——下载默认态；校验/重试切黄色 spinner 字符
+    let style_plain = indicatif::ProgressStyle::default_spinner()
+        .template("{spinner} {msg}")
+        .unwrap();
+    let style_warn = indicatif::ProgressStyle::default_spinner()
+        .template("\x1b[33m{spinner}\x1b[0m {msg}")
+        .unwrap();
+    bar.set_style(style_plain.clone());
+    // M92 碴A（迭代29）：steady tick 驱动 {spinner} 前进（100ms 对齐官方
+    // 动画周期）；非 TTY 路径 spinner 隐藏零影响
     bar.enable_steady_tick(std::time::Duration::from_millis(100));
     use futures::StreamExt;
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut ok = false;
-    let mut last_print = std::time::Instant::now();
+    // M111：当前层状态（非 TTY 层结束渲染汇总行；TTY 借其做层切换检测）
+    let mut layer: Option<LayerSummaryState> = None;
+    // M106：滑动窗口速度（5s——进度事件 200ms 粒度下防抖）；M110：层
+    // 边界重置——跨层 done 归零会使窗口首末差分下溢（M106 既有隐患，
+    // 多层模型第二层首事件即触发，层边界即新统计窗）
+    let mut speed = SpeedTracker::new(std::time::Duration::from_secs(5));
     while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { continue };
         buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -1129,6 +1575,12 @@ async fn consume_ndjson_progress(resp: reqwest::Response) -> Result<(), String> 
             if let Ok(ev) = serde_json::from_str::<Value>(line.trim()) {
                 if let Some(err) = ev["error"].as_str() {
                     bar.finish_and_clear();
+                    // M111：非 TTY 先层收尾再报错（末层汇总行不丢）
+                    if let Some(l) = layer.take() {
+                        if !tty {
+                            println!("{}", layer_summary_line(&l));
+                        }
+                    }
                     return Err(err.to_string());
                 }
                 let status = ev["status"].as_str().unwrap_or_default();
@@ -1138,34 +1590,82 @@ async fn consume_ndjson_progress(resp: reqwest::Response) -> Result<(), String> 
                 }
                 if let (Some(done), Some(total)) = (ev["completed"].as_u64(), ev["total"].as_u64())
                 {
-                    let pct = if total > 0 {
-                        (done as f64 / total as f64 * 100.0) as u64
-                    } else {
-                        100
-                    };
-                    if tty {
-                        bar.set_message(format!(
-                            "{status} {}/{} MB ({}%)",
-                            done / 1048576,
-                            total / 1048576,
-                            pct
-                        ));
-                    } else if last_print.elapsed() >= std::time::Duration::from_secs(1) {
-                        // 非 TTY 周期文本行（1s 节流——进度事件 200ms 粒度直达会刷屏）
-                        println!(
-                            "{status} {}/{} MB ({}%)",
-                            done / 1048576,
-                            total / 1048576,
-                            pct
-                        );
-                        last_print = std::time::Instant::now();
+                    // 进度事件（层下载）：digest 变化即新层——收尾旧层
+                    //（非 TTY 汇总行）+ 速度窗口重置（M110 下溢修复）
+                    let digest = ev["digest"].as_str().unwrap_or("").to_string();
+                    let new_layer = layer.as_ref().map_or(true, |l| l.digest != digest);
+                    if new_layer {
+                        if let Some(old) = layer.take() {
+                            if !tty {
+                                println!("{}", layer_summary_line(&old));
+                            }
+                        }
+                        speed = SpeedTracker::new(std::time::Duration::from_secs(5));
+                        layer = Some(LayerSummaryState {
+                            digest,
+                            total,
+                            done,
+                            started: std::time::Instant::now(),
+                        });
+                    } else if let Some(l) = &mut layer {
+                        l.total = total;
+                        l.done = done;
                     }
-                } else if !status.is_empty() {
-                    // 状态事件（pulling manifest 等）：频率低，两路径即时显示
                     if tty {
-                        bar.set_message(status.to_string());
+                        // M110：进度事件恢复默认 spinner 色（阶段黄色仅
+                        // 存续至下载恢复——同层重试后亦自然还原）
+                        bar.set_style(style_plain.clone());
+                        let pct = if total > 0 {
+                            (done as f64 / total as f64 * 100.0) as u64
+                        } else {
+                            100
+                        };
+                        let sp = speed.push(done);
+                        let speed_s = sp
+                            .map(|s| format!("，{}/s", fmt_bytes(s as u64)))
+                            .unwrap_or_default();
+                        let eta_s = match (total, sp) {
+                            (t, Some(s)) if t > done && s > 0.0 => {
+                                format!("，剩余 {}", fmt_eta((t - done) as f64 / s))
+                            }
+                            _ => String::new(),
+                        };
+                        // M110：层完成绿色 ✓ 前缀（100% 与下载中区分）
+                        let check = if total > 0 && done >= total {
+                            format!("{} ", paint(stdout_color(), "32", "✓"))
+                        } else {
+                            String::new()
+                        };
+                        let msg = format!(
+                            "{check}{} {}/{}（{pct}%{speed_s}{eta_s}）",
+                            status_zh(status),
+                            fmt_bytes(done),
+                            fmt_bytes(total)
+                        );
+                        // M109：msg 按终端宽 CJK 感知截断（spinner 前缀 2 列）
+                        bar.set_message(truncate_cols(&msg, term_width().saturating_sub(2)));
+                    }
+                    // 非 TTY：进度仅入层状态（M111 无周期行）
+                } else if !status.is_empty() {
+                    // 阶段/状态事件：两路径即时显示（M110 中文映射 + 黄色）
+                    if tty {
+                        let warnish = status == "verifying sha256 digest"
+                            || status == "writing manifest"
+                            || status.starts_with("retrying download");
+                        bar.set_style(if warnish {
+                            style_warn.clone()
+                        } else {
+                            style_plain.clone()
+                        });
+                        bar.set_message(truncate_cols(
+                            &status_zh(status),
+                            term_width().saturating_sub(2),
+                        ));
                     } else {
-                        println!("{status}");
+                        if let Some(l) = layer.take() {
+                            println!("{}", layer_summary_line(&l));
+                        }
+                        println!("{}", status_zh(status));
                     }
                 }
             }
@@ -1173,10 +1673,49 @@ async fn consume_ndjson_progress(resp: reqwest::Response) -> Result<(), String> 
     }
     bar.finish_and_clear();
     if ok {
+        // M111：非 TTY 末层收尾（success 行由调用方「已拉取」承担不重复）
+        if let Some(l) = layer.take() {
+            if !tty {
+                println!("{}", layer_summary_line(&l));
+            }
+        }
         Ok(())
     } else {
         Err("拉取中断".to_string())
     }
+}
+
+/// 单层下载的收尾状态（M111）：digest/总量/完成字节/起始时刻——层结束
+/// （digest 切换或阶段推进）时渲染一行层汇总。
+struct LayerSummaryState {
+    digest: String,
+    total: u64,
+    done: u64,
+    started: std::time::Instant,
+}
+
+/// 非 TTY 层汇总行（M111）：`拉取 3c1c9d：100% 2.00 GB（平均 5.3 MB/s）`
+/// ——对齐官方非 TTY 层落定一行（含最终百分比/总量/平均速度）。
+///
+/// - 参数 l：层收尾状态
+/// - 返回：单行汇总文本
+fn layer_summary_line(l: &LayerSummaryState) -> String {
+    let pct = if l.total > 0 {
+        l.done * 100 / l.total
+    } else {
+        100
+    };
+    let secs = l.started.elapsed().as_secs_f64();
+    let avg = if secs > 0.05 {
+        format!("（平均 {}/s）", fmt_bytes((l.total as f64 / secs) as u64))
+    } else {
+        String::new()
+    };
+    format!(
+        "拉取 {}：{pct}% {}{avg}",
+        short_digest(&l.digest),
+        fmt_bytes(l.total)
+    )
 }
 
 /// signin：保存凭据到 ~/.roxid/auth.json（推送前置）。
@@ -1233,66 +1772,11 @@ async fn cmd_signout() -> i32 {
     0
 }
 
-/// M90（迭代28）：公历日期 → epoch 天数（Howard Hinnant 算法，
-/// 服务端 registry::civil_from_days 的逆运算，单测权威锚点互证）。
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// M90（迭代28）：RFC3339 时间串 → epoch 秒（双形态解析）。
-/// 兼容 roxid 自家 `YYYY-MM-DDTHH:MM:SSZ`（秒级 UTC，now_rfc3339 生成）
-/// 与官方 Ollama `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn±HH:MM`（纳秒 + 本地
-/// 偏移——CLI 可能连官方实例，实机警告证实必须双兼容）；纳秒位忽略，
-/// `±HHMM` 紧凑形态一并接受，无时区后缀按 UTC（宽松）。
-/// - 参数 s：modified_at 原始串
-/// - 返回：epoch 秒；结构非法时 None（调用方兜底原样输出）
-fn parse_rfc3339_secs(s: &str) -> Option<i64> {
-    let two = |at: usize| -> Option<i64> { s.get(at..at + 2)?.parse().ok() };
-    let sep = |at: usize, c: u8| s.as_bytes().get(at) == Some(&c);
-    if s.len() < 19
-        || !sep(4, b'-')
-        || !sep(7, b'-')
-        || !sep(10, b'T')
-        || !sep(13, b':')
-        || !sep(16, b':')
-    {
-        return None;
-    }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    let (mon, day, hour, min, sec) = (two(5)?, two(8)?, two(11)?, two(14)?, two(17)?);
-    let mut rest = s.get(19..)?;
-    if let Some(frac) = rest.strip_prefix('.') {
-        let n = frac.chars().take_while(|c| c.is_ascii_digit()).count();
-        rest = rest.get(1 + n..)?;
-    }
-    if !rest.is_ascii() {
-        return None;
-    }
-    let offset = match rest.as_bytes().first() {
-        None => 0,
-        Some(b'Z') | Some(b'z') => 0,
-        Some(&sign @ (b'+' | b'-')) => {
-            let digits: String = rest[1..].chars().filter(|&c| c != ':').collect();
-            if digits.len() != 4 || !digits.bytes().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            let oh: i64 = digits[..2].parse().ok()?;
-            let om: i64 = digits[2..].parse().ok()?;
-            (if sign == b'-' { -1 } else { 1 }) * (oh * 3600 + om * 60)
-        }
-        Some(_) => return None,
-    };
-    Some(
-        days_from_civil(year, mon as u32, day as u32) * 86400 + hour * 3600 + min * 60 + sec
-            - offset,
-    )
-}
+// M101（迭代32 碴2）：RFC3339 双形态解析下沉服务端 repo 模块（单实现
+// 两处复用：CLI list 时间渲染 + /v1/models created 真实化），本地副本
+// 委托删除——导入保持既有调用点零改动（days_from_civil 仅测试模块
+// 引用，改由测试内自行导入；2026-09-10 21-34）
+use roxid_server::repo::parse_rfc3339_secs;
 
 /// M90（迭代28）：epoch 秒差 → 中文相对时间短语（分段阈值对齐官方
 /// ollama humanize 语义；短语中文化为用户裁决 2026-09-10 04:41）。
@@ -1343,7 +1827,23 @@ fn fmt_modified(s: &str, now_secs: i64) -> String {
     }
 }
 
-/// list：模型表格（M90：MODIFIED 列混合格式渲染——绝对时间 + 中文相对短语）
+/// 仅相对时间短语（M112，迭代33 碴5）：窄终端（<60 列）MODIFIED 列形态
+/// ——混合格式 25 列放不下时收敛为短语（40 列终端三列总宽 ≤40 的收敛
+/// 承诺）；解析失败原样输出整串（D4 兜底语义同 [`fmt_modified`]）。
+///
+/// - 参数 s：/api/tags 返回的 modified_at 字符串
+/// - 参数 now_secs：当前 epoch 秒（相对时间基准）
+/// - 返回：相对短语（如「3 个月前」）
+fn fmt_modified_rel(s: &str, now_secs: i64) -> String {
+    match parse_rfc3339_secs(s) {
+        Some(t) => humanize_age(now_secs - t),
+        None => s.to_string(),
+    }
+}
+
+/// list：模型表格（M90：MODIFIED 列混合格式；M112：列宽随终端收敛 +
+/// SIZE 量纲自适应——原 NAME 固定宽不截断，超长模型名行撑至 114 字符、
+/// 40 列终端不收敛；SIZE 恒 MB 整数无 GB 档）
 async fn cmd_list() -> i32 {
     let v: Value = http()
         .get(format!("{}/api/tags", base_url()))
@@ -1357,20 +1857,39 @@ async fn cmd_list() -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    println!("{:<32} {:>12}  {}", "NAME", "SIZE", "MODIFIED");
+    // M112：列宽分配——SIZE 右对齐 10 列；MODIFIED 常规 25 列（绝对 16
+    // + 括注约 9），窄终端（<60 列）仅保留相对短语（40 列终端三列总宽
+    // 收敛 ≤40）；NAME 取剩余宽度，超出 CJK 感知截尾 …（M109 基建复用）
+    let width = term_width();
+    let narrow = width < 60;
+    let modified_col = if narrow { 9 } else { 25 };
+    let name_col = width.saturating_sub(10 + modified_col + 4).max(4);
+    let sc = stdout_color();
+    println!(
+        "{}  {:>10}  {}",
+        paint(sc, "1", &truncate_cols("NAME", name_col)),
+        "SIZE",
+        "MODIFIED"
+    );
     for m in v["models"].as_array().cloned().unwrap_or_default() {
         let size = m["size"].as_u64().unwrap_or(0);
+        let modified = m["modified_at"].as_str().unwrap_or("?");
+        let modified_cell = if narrow {
+            fmt_modified_rel(modified, now_secs)
+        } else {
+            fmt_modified(modified, now_secs)
+        };
         println!(
-            "{:<32} {:>10} MB  {}",
-            m["name"].as_str().unwrap_or("?"),
-            size / 1048576,
-            fmt_modified(m["modified_at"].as_str().unwrap_or("?"), now_secs)
+            "{}  {:>10}  {}",
+            truncate_cols(m["name"].as_str().unwrap_or("?"), name_col),
+            fmt_bytes(size),
+            modified_cell
         );
     }
     0
 }
 
-/// ps：运行中模型
+/// ps：运行中模型（M112：NAME 按终端宽截断 + SIZE 量纲自适应）
 async fn cmd_ps() -> i32 {
     let v: Value = http()
         .get(format!("{}/api/ps", base_url()))
@@ -1380,18 +1899,25 @@ async fn cmd_ps() -> i32 {
         .json()
         .await
         .unwrap_or(Value::Null);
-    println!("{:<32} {:>12}", "NAME", "SIZE");
+    let name_col = term_width().saturating_sub(12).max(4);
+    let sc = stdout_color();
+    println!(
+        "{}  {:>10}",
+        paint(sc, "1", &truncate_cols("NAME", name_col)),
+        "SIZE"
+    );
     for m in v["models"].as_array().cloned().unwrap_or_default() {
         println!(
-            "{:<32} {:>10} MB",
-            m["name"].as_str().unwrap_or("?"),
-            m["size"].as_u64().unwrap_or(0) / 1048576
+            "{}  {:>10}",
+            truncate_cols(m["name"].as_str().unwrap_or("?"), name_col),
+            fmt_bytes(m["size"].as_u64().unwrap_or(0))
         );
     }
     0
 }
 
-/// cp：复制模型
+/// cp：复制模型（M117：成功回显——原成功零输出无确认；官方差异挂账：
+/// 官方 ollama cp 静默，回显为用户实测报告 2026-09-10 需求）
 async fn cmd_cp(source: &str, destination: &str) -> i32 {
     let resp = http()
         .post(format!("{}/api/copy", base_url()))
@@ -1400,14 +1926,23 @@ async fn cmd_cp(source: &str, destination: &str) -> i32 {
         .await
         .unwrap_or_else(|e| conn_hint(e));
     if resp.status().is_success() {
+        println!(
+            "{}",
+            paint(
+                stdout_color(),
+                "32",
+                &format!("已复制 {source} → {destination}")
+            )
+        );
         0
     } else {
-        eprintln!("复制失败：{}", resp.text().await.unwrap_or_default());
+        print_error(&fmt_api_error(&resp.text().await.unwrap_or_default()));
         1
     }
 }
 
-/// rm：删除模型
+/// rm：删除模型（M117：成功回显 + 错误体整形——原 rm 失败把
+/// `{"error":"..."}` 原始 JSON 包裹整段透出）
 async fn cmd_rm(model: &str) -> i32 {
     let resp = http()
         .delete(format!("{}/api/delete", base_url()))
@@ -1416,15 +1951,24 @@ async fn cmd_rm(model: &str) -> i32 {
         .await
         .unwrap_or_else(|e| conn_hint(e));
     if resp.status().is_success() {
+        println!(
+            "{}",
+            paint(stdout_color(), "32", &format!("已删除 {model}"))
+        );
         0
     } else {
-        eprintln!("删除失败：{}", resp.text().await.unwrap_or_default());
+        print_error(&fmt_api_error(&resp.text().await.unwrap_or_default()));
         1
     }
 }
 
-/// 通用单模型 POST（stop/push）
-async fn cmd_simple_post(path: &str, model: &str) -> i32 {
+/// 通用单模型 POST（stop/push；M117：成功回显 + 错误体整形）
+///
+/// - 参数 path：API 路径
+/// - 参数 model：模型名
+/// - 参数 done_msg：成功回显文案（含模型名的完整句）
+/// - 返回：进程退出码
+async fn cmd_simple_post(path: &str, model: &str, done_msg: &str) -> i32 {
     let resp = http()
         .post(format!("{}{path}", base_url()))
         .json(&json!({"model": model}))
@@ -1432,9 +1976,10 @@ async fn cmd_simple_post(path: &str, model: &str) -> i32 {
         .await
         .unwrap_or_else(|e| conn_hint(e));
     if resp.status().is_success() {
+        println!("{}", paint(stdout_color(), "32", done_msg));
         0
     } else {
-        eprintln!("失败：{}", resp.text().await.unwrap_or_default());
+        print_error(&fmt_api_error(&resp.text().await.unwrap_or_default()));
         1
     }
 }
@@ -1480,10 +2025,11 @@ mod tests {
 
     /// M90（迭代28）：days_from_civil 与服务端 civil_from_days 权威锚点
     /// 互证（epoch-days 20689 = 2026-08-24 UTC，来源同 registry 单测）
+    /// M101：实现下沉服务端 repo 模块，此处直引服务端单实现
     #[test]
     fn days_from_civil_anchor() {
-        assert_eq!(super::days_from_civil(2026, 8, 24), 20689);
-        assert_eq!(super::days_from_civil(1970, 1, 1), 0);
+        assert_eq!(roxid_server::repo::days_from_civil(2026, 8, 24), 20689);
+        assert_eq!(roxid_server::repo::days_from_civil(1970, 1, 1), 0);
     }
 
     /// M90（迭代28）：RFC3339 双形态解析——roxid Z 秒级 / 官方纳秒偏移，
@@ -1500,6 +2046,27 @@ mod tests {
         // 结构非法 → None（兜底原样输出路径）
         assert!(super::parse_rfc3339_secs("not-a-time").is_none());
         assert!(super::parse_rfc3339_secs("2026-09-07T00:00").is_none());
+    }
+
+    /// M105/M106（迭代32 碴6）：量纲与剩余时间短语边界
+    #[test]
+    fn byte_magnitude_and_eta_phrases() {
+        assert_eq!(super::fmt_bytes(512 * 1024), "512.00 KB");
+        assert_eq!(super::fmt_bytes(3 * 1024 * 1024), "3.00 MB");
+        assert_eq!(super::fmt_bytes(5_500_000_000), "5.12 GB");
+        assert_eq!(super::fmt_eta(0.5), "<1秒");
+        assert_eq!(super::fmt_eta(45.0), "45秒");
+        assert_eq!(super::fmt_eta(200.0), "3分20秒");
+        assert_eq!(super::fmt_eta(3900.0), "1时05分");
+    }
+
+    /// M105/M106：SpeedTracker——单样本（时距不足）None；窗口首末差分正确
+    #[test]
+    fn speed_tracker_window_semantics() {
+        let mut st = super::SpeedTracker::new(std::time::Duration::from_secs(5));
+        assert!(st.push(1_000).is_none(), "首样本无差分基线");
+        // 连续同刻 push：时距 <0.2s 防尖峰 None（不 panic、不溢出）
+        assert!(st.push(2_000).is_none() || st.push(2_000).unwrap() >= 0.0);
     }
 
     /// M90（迭代28）：混合格式渲染与七段中文短语边界（固定基准
@@ -1546,5 +2113,108 @@ mod tests {
         assert!(super::fmt_modified("2027-01-15T08:00:00Z", now).ends_with("(刚刚)"));
         // 解析失败兜底原样输出（计划书 D4，不吞数据）
         assert_eq!(super::fmt_modified("?", now), "?");
+    }
+
+    /// M108（迭代33 碴1）：颜色门控——非 TTY 必禁；paint 关闭原样/开启包裹
+    #[test]
+    fn color_gating_and_paint() {
+        assert!(!super::color_ok(false), "非 TTY 必须禁色");
+        assert_eq!(super::paint(false, "31", "x"), "x");
+        assert_eq!(super::paint(true, "31", "x"), "\x1b[31mx\x1b[0m");
+    }
+
+    /// M109（迭代33 碴2）：CJK 感知宽度与截断——中文 2 列、… 尾缀
+    /// 1 列、不超宽原样；82 字符长帧截到 38 列（40 列终端场景）
+    #[test]
+    fn cjk_truncate_semantics() {
+        assert_eq!(super::display_width("ab"), 2);
+        assert_eq!(super::display_width("中文"), 4);
+        let cut = super::truncate_cols(&"p".repeat(50), 38);
+        assert_eq!(super::display_width(&cut), 38, "截断结果必须恰为上限宽度");
+        assert!(cut.ends_with('…'));
+        assert_eq!(super::truncate_cols("abc", 38), "abc", "不超宽原样返回");
+        assert_eq!(super::truncate_cols("中文字", 5), "中文…");
+    }
+
+    /// M110（迭代33 碴3）：status 中文映射——官方英文原文转中文渲染；
+    /// 未知 status 原样（兼容服务端后续新增阶段）
+    #[test]
+    fn status_zh_mapping() {
+        assert_eq!(
+            super::status_zh("verifying sha256 digest"),
+            "校验 sha256 摘要"
+        );
+        assert_eq!(super::status_zh("writing manifest"), "写入清单");
+        assert_eq!(super::status_zh("pulling manifest"), "拉取清单");
+        assert_eq!(super::status_zh("success"), "成功");
+        assert_eq!(
+            super::status_zh("retrying download (attempt 1/3)"),
+            "下载中断，正在重试（第 1/3）"
+        );
+        assert_eq!(super::status_zh("future phase"), "future phase");
+        // 纯 "pulling"（进度事件 status）无后缀内容——原样（进度行自组装）
+        assert_eq!(super::status_zh("pulling"), "pulling");
+    }
+
+    /// M117（迭代33 碴10）：错误体整形——单层/嵌套 error 提取、非 JSON 原样
+    #[test]
+    fn api_error_body_extraction() {
+        assert_eq!(
+            super::fmt_api_error(r#"{"error":"model not found"}"#),
+            "model not found"
+        );
+        assert_eq!(
+            super::fmt_api_error(r#"{"error":{"message":"bad request"}}"#),
+            "bad request"
+        );
+        assert_eq!(super::fmt_api_error("plain text"), "plain text");
+        assert_eq!(super::fmt_api_error(r#"{"other":1}"#), r#"{"other":1}"#);
+    }
+
+    /// M112：窄终端 MODIFIED 相对短语形态；解析失败原样
+    #[test]
+    fn fmt_modified_rel_form() {
+        let now = 1_800_000_000i64;
+        assert_eq!(
+            super::fmt_modified_rel("2027-01-15T07:59:15Z", now),
+            "45 秒前"
+        );
+        assert_eq!(super::fmt_modified_rel("?", now), "?");
+    }
+
+    /// M111（迭代33 碴4）：非 TTY 层汇总行形态（digest 前 8 位 + 百分比
+    /// + 总量）——层结束各落一行对齐官方
+    #[test]
+    fn layer_summary_form() {
+        let l = super::LayerSummaryState {
+            digest: "sha256:3c1c9dabcd".into(),
+            total: 1024 * 1024,
+            done: 1024 * 1024,
+            started: std::time::Instant::now(),
+        };
+        let line = super::layer_summary_line(&l);
+        assert!(
+            line.starts_with("拉取 3c1c9dab：100% 1.00 MB"),
+            "实际：{line}"
+        );
+    }
+
+    /// M118（迭代33 碴11）：全局选项后置解析——`roxid run --verbose m`
+    /// 与前置形态均合法且值透传（原后置报 unexpected argument）
+    #[test]
+    fn global_flags_parse_after_subcommand() {
+        use clap::Parser as _;
+        // Cli 未实现 Debug——映射为 Result<(), String>（错误文本可读）
+        let after = super::Cli::try_parse_from(["roxid", "run", "--verbose", "m1"])
+            .map(|cli| cli.verbose)
+            .map_err(|e| e.to_string());
+        assert!(
+            matches!(after, Ok(true)),
+            "子命令后置 --verbose 必须可解析且值透传：{after:?}"
+        );
+        let before = super::Cli::try_parse_from(["roxid", "--verbose", "run", "m1"])
+            .map(|cli| cli.verbose)
+            .map_err(|e| e.to_string());
+        assert!(matches!(before, Ok(true)), "前置形态同样合法：{before:?}");
     }
 }

@@ -24,6 +24,11 @@ futures = "0.3"
 sha2 = "0.10"
 rustyline = "13"
 indicatif = "0.17"
+# M109（迭代33 碴2）：CLI 终端列数探测（COLUMNS env 优先 → tty ioctl →
+# 兜底 80）——原进度帧/list 列宽恒按固定宽渲染，窄终端不收敛。注：
+# indicatif 0.17 无 terminal_size feature（实证 available features 无此项），
+# 宽度截断在 CLI 渲染层完成，不经 indicatif
+terminal_size = "0.3"
 # M17 引入（用户裁决 R2-2A 2026-08-24 19:59）：signin 令牌隐蔽输入
 rpassword = "7"
 # M24 引入（迭代4 裁决 Q2 2026-08-26 05:24）：config.toml 结构化读写（纯 Rust，不影响 musl 静态单二进制）

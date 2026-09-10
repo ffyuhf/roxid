@@ -15,6 +15,9 @@
 //!
 //! 修改历史：占位 2026-08-24 18:35；M4 实装 2026-08-24 19:11
 //! M31 三目录分离路由与 hf.co 名解析（原因：迭代11 F1 需求变更）2026-09-06 22-45
+//! M101（迭代32 碴2）：RFC3339→epoch 秒双形态解析下沉本模块（原 CLI
+//! 迭代28 私有实现迁移，CLI 委托复用）——/v1/models created 真实化
+//! 数据源（2026-09-10 21-28）
 
 pub mod migrate;
 pub mod model_json;
@@ -29,6 +32,71 @@ pub use ops::{
 use std::path::{Path, PathBuf};
 
 use crate::error::{RoxidError, RoxidResult};
+
+/// 公历日期 → epoch 天数（M101 迁移自 CLI 迭代28；Howard Hinnant 算法，
+/// registry::civil_from_days 的逆运算，单测权威锚点互证）。
+///
+/// - 参数 y / m / d：年、月、日
+/// - 返回：自 1970-01-01 起的天数
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// RFC3339 时间串 → epoch 秒（双形态解析，M101 迁移自 CLI 迭代28）。
+/// 兼容 roxid 自家 `YYYY-MM-DDTHH:MM:SSZ`（秒级 UTC，now_rfc3339 生成）
+/// 与官方 Ollama `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn±HH:MM`（纳秒 + 本地
+/// 偏移）；纳秒位忽略，`±HHMM` 紧凑形态一并接受，无时区后缀按 UTC
+///（宽松）。/v1/models created 字段数据源。
+///
+/// - 参数 s：RFC3339 原始串（如 meta.created_at）
+/// - 返回：epoch 秒；结构非法时 None（调用方兜底 0）
+pub fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+    let two = |at: usize| -> Option<i64> { s.get(at..at + 2)?.parse().ok() };
+    let sep = |at: usize, c: u8| s.as_bytes().get(at) == Some(&c);
+    if s.len() < 19
+        || !sep(4, b'-')
+        || !sep(7, b'-')
+        || !sep(10, b'T')
+        || !sep(13, b':')
+        || !sep(16, b':')
+    {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let (mon, day, hour, min, sec) = (two(5)?, two(8)?, two(11)?, two(14)?, two(17)?);
+    let mut rest = s.get(19..)?;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let n = frac.chars().take_while(|c| c.is_ascii_digit()).count();
+        rest = rest.get(1 + n..)?;
+    }
+    if !rest.is_ascii() {
+        return None;
+    }
+    let offset = match rest.as_bytes().first() {
+        None => 0,
+        Some(b'Z') | Some(b'z') => 0,
+        Some(&sign @ (b'+' | b'-')) => {
+            let digits: String = rest[1..].chars().filter(|&c| c != ':').collect();
+            if digits.len() != 4 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let oh: i64 = digits[..2].parse().ok()?;
+            let om: i64 = digits[2..].parse().ok()?;
+            (if sign == b'-' { -1 } else { 1 }) * (oh * 3600 + om * 60)
+        }
+        Some(_) => return None,
+    };
+    Some(
+        days_from_civil(year, mon as u32, day as u32) * 86400 + hour * 3600 + min * 60 + sec
+            - offset,
+    )
+}
 
 /// 默认 tag（与原版 Ollama 一致：不带 tag 的模型名即 latest）
 pub const DEFAULT_TAG: &str = "latest";

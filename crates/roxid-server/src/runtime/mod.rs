@@ -20,9 +20,16 @@
 mod backend;
 mod download;
 
-pub use backend::{detect_backend, Backend};
+// M99（迭代31）：backend 新增架构感知与 ELF 校验族导出（host_arch_fragment
+// 供 CLI 提示、diagnose_arch_mismatch 供 spawn 诊断）；download 新增启动
+// 扫描与 list 标注数据源导出 2026-09-10 18-30
+pub use backend::{
+    detect_backend, diagnose_arch_mismatch, elf_machine_of, host_arch_fragment, variant_fragment,
+    Backend,
+};
 pub use download::{
-    asset_url, ensure_llama_server, install_manual, install_version, is_valid_tag, list_installed,
-    manual_dir, manual_server_path, remove_version, resolve_llama_server_path, url_is_archive,
-    variant_cache_dir, ENV_LLAMA_SERVER_OVERRIDE, LOCKED_LLAMA_CPP_TAG,
+    asset_url, ensure_llama_server, install_manual, install_version,
+    installed_variant_arch_mismatch, is_valid_tag, list_installed, manual_dir, manual_server_path,
+    remove_version, resolve_llama_server_path, url_is_archive, variant_cache_dir,
+    warn_installed_arch_mismatch, ENV_LLAMA_SERVER_OVERRIDE, LOCKED_LLAMA_CPP_TAG,
 };

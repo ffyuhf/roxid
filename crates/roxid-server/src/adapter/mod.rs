@@ -211,6 +211,27 @@ fn next_tool_call_id() -> String {
     )
 }
 
+/// 上游 timings 覆盖 duration 两字段（M102，迭代32 碴3）。
+/// 非流式响应的墙钟口径以 headers 到达切分 prompt/eval——但 llama-server
+/// 生成完毕才一次性返回，eval 被计成 body 读取耗时（µs 级）、
+/// prompt_eval 混入全部生成时间（用户实测 eval_duration=69844ns≈7µs/token）。
+/// llama-server 非流式响应顶层携带精确计时 timings.prompt_ms/predicted_ms
+///（/v1/chat/completions、/v1/completions、/completion、/infill 同构，
+/// 官方 README 实证），本函数以之为准覆盖；total/load 维持 roxid 侧实测
+///（调用序：先 apply_duration_fields 墙钟兜底，再本函数覆盖两 duration）。
+///
+/// - 参数 ev：待注入的响应事件（原地修改）
+/// - 参数 timings：上游响应 timings 对象（缺失字段跳过覆盖——墙钟兜底保留）
+pub fn apply_timings_durations(ev: &mut Value, timings: &Value) {
+    let ms_to_ns = |v: &Value| v.as_f64().map(|ms| (ms * 1e6) as u64);
+    if let Some(ns) = ms_to_ns(&timings["prompt_ms"]) {
+        ev["prompt_eval_duration"] = json!(ns);
+    }
+    if let Some(ns) = ms_to_ns(&timings["predicted_ms"]) {
+        ev["eval_duration"] = json!(ns);
+    }
+}
+
 /// 注入 Ollama duration 四字段（纳秒；M28 碴6：原四字段硬编码 0）。
 /// 口径（R2-A 裁决）：total=请求到达→响应完成；load=本次 acquire 冷加载
 /// 耗时（复用实例为 0）；prompt_eval=响应首字节前（扣除 load）；
@@ -1292,6 +1313,32 @@ mod tests {
         let plain = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]});
         let out = openai_chat_response_to_ollama("m", &plain);
         assert!(out.get("logprobs").is_none());
+    }
+
+    /// M102（迭代32 碴3）：上游 timings 覆盖 duration 两字段——含 timings
+    /// 时精确覆盖（ms×1e6→ns），字段缺失时不覆盖（墙钟兜底保留）
+    #[test]
+    fn timings_durations_override_and_fallback() {
+        let mut ev = json!({
+            "total_duration": 100,
+            "load_duration": 10,
+            "prompt_eval_duration": 20,
+            "eval_duration": 5,
+        });
+        // 官方 README 实证形态：prompt_ms/predicted_ms（浮点毫秒）
+        let timings = json!({"prompt_ms": 30.958, "predicted_ms": 661.064});
+        apply_timings_durations(&mut ev, &timings);
+        assert_eq!(ev["prompt_eval_duration"], json!(30958000));
+        assert_eq!(ev["eval_duration"], json!(661064000));
+        // total/load 不受影响（roxid 侧实测口径维持）
+        assert_eq!(ev["total_duration"], json!(100));
+        assert_eq!(ev["load_duration"], json!(10));
+
+        // 缺失字段：不覆盖（墙钟兜底值保留）
+        let mut ev2 = json!({"prompt_eval_duration": 20, "eval_duration": 5});
+        apply_timings_durations(&mut ev2, &json!({"prompt_n": 12}));
+        assert_eq!(ev2["prompt_eval_duration"], json!(20));
+        assert_eq!(ev2["eval_duration"], json!(5));
     }
 
     /// M35 D1/D6：generate 请求 context/suffix 字段反序列化（官方续传与

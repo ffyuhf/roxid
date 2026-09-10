@@ -79,7 +79,7 @@ curl http://127.0.0.1:11434/api/version
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `model` | string | 是 | 模型名 |
-| `verbose` | bool | 否 | 附带 verbose 字段（M35 D13） |
+| `verbose` | bool | 否 | 附带 verbose 字段 |
 
 响应字段：`modelfile`（复原的 Modelfile 文本，含 RUNTIME 行）、`parameters`（**Modelfile 指令文本形态**，非官方 map 形态——已知边界，见文末）、`template`、`system`、`details`、`model_info`（官方键名：`{arch}.context_length`、`general.parameter_count`、`general.file_type`）、`capabilities`（字符串数组：`completion` / `embedding` / `vision` / `tools` / `thinking` / `rerank`…）、`license`、`projector`。
 
@@ -173,7 +173,7 @@ curl http://127.0.0.1:11434/api/chat -d '{
 
 响应：`{model, embeddings: [[…]], total_duration, load_duration, prompt_eval_count}`。
 
-> 对生成模型请求向量化时返回官方口径文案：`This server does not support embeddings. Please use an embedding model`。
+> 对生成模型请求向量化时返回：`此模型不支持向量化，请使用 embedding 模型`（上游英文 message 原样透传）。
 
 ### POST /api/embeddings
 
@@ -245,7 +245,7 @@ curl http://127.0.0.1:11434/api/create -d '{"model": "m2", "from": "FROM llama3.
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/v1/models` | GET | 本地仓库模型列表（OpenAI 形态） |
+| `/v1/models` | GET | 本地仓库模型列表（OpenAI 形态；`created` 为模型创建时间 Unix 秒） |
 | `/v1/chat/completions` | POST | Chat Completions（`stream` 可选；透传含 `reasoning_content` 等原生字段） |
 | `/v1/completions` | POST | 文本补全 |
 | `/v1/embeddings` | POST | 向量化 |

@@ -20,6 +20,10 @@ roxid [全局标志] <命令> [参数...]
   -v, --version  显示版本信息
 ```
 
+全局标志 `--nowordwrap` / `--verbose` 为 global 语义——可置于子命令之前或之后（`roxid --verbose run m` 与 `roxid run --verbose m` 等价）。
+
+**颜色与宽度自适应**：TTY 下错误行红色、成功回显绿色、表头粗体、REPL 横幅与提示符着色；`NO_COLOR` 环境变量非空、`TERM=dumb` 或输出重定向（非 TTY）时自动禁用全部 ANSI 转义（stdout 与 stderr 独立判定，管道解析不受污染）。进度帧、`list` / `ps` 表格按终端实际列数收敛（`COLUMNS` 环境变量优先），超宽内容 CJK 感知截断。
+
 ## 命令树
 
 | 命令 | 用途 | 来源 |
@@ -87,7 +91,7 @@ Modelfile 支持指令：`FROM` / `SYSTEM` / `TEMPLATE` / `PARAMETER` / `MESSAGE
 
 ## show
 
-查看模型信息（三段渲染：参数键值区 / Capabilities / RUNTIME 行；空段不渲染）。
+查看模型信息（四段渲染：Model 键值区（architecture / parameters / quantization / system）/ Parameters 下挂参数条目 / Capabilities / RUNTIME 行；空段不渲染；参数量并入 Model 段键值，不再与下挂参数区同名混淆，对齐官方形态）。
 
 ```text
 roxid show <model>
@@ -114,6 +118,8 @@ roxid run <model> [prompt...] [--hf] [--runtime <flags>]
 
 REPL 内建命令：`/bye`（或 `/exit` / `/quit`）退出、`/clear` 清空对话；thinking 增量以暗色渲染不回填上下文。模型未安装时收到 404 自动拉取一次后重发。
 
+REPL 呈现：横幅着色进入会话打印一次；提示符为青色 `{model}> `；每轮回复后空行分隔；`--verbose` 计时行形态为 `(输入 N tok / 输出 N tok / 总耗时 N.NN 秒 / 输出 N.N tok/s)`（字段缺失时省略对应段）。
+
 ```sh
 roxid run llama3.2:3b
 roxid run llama3.2:3b "一句话介绍量子计算"
@@ -123,7 +129,7 @@ roxid run my-model --runtime "--threads 3 -ngl 30"
 
 ## stop
 
-停止（卸载）运行中的模型实例。
+停止（卸载）运行中的模型实例。成功回显 `已停止 {model}`（绿色）。
 
 ```text
 roxid stop <model>
@@ -131,7 +137,12 @@ roxid stop <model>
 
 ## pull
 
-从 registry 拉取模型。支持 Ollama 主源与 HuggingFace 直引双源；断点续传、NDJSON 进度（TTY spinner / 非 TTY 周期文本行）、同层已存在且摘要一致时跳过下载。
+从 registry 拉取模型。支持 Ollama 主源与 HuggingFace 直引双源；断点续传、NDJSON 进度、同层已存在且摘要一致时跳过下载。
+
+进度呈现：
+
+- **TTY**：spinner 单行覆盖，消息按终端宽度 CJK 感知截断（窄终端不再折行残留）；阶段视觉区分——校验 sha256 摘要 / 写入清单 / 重试阶段 spinner 转黄色、层下载完成显示绿色 ✓、状态文案中文渲染（协议字段保持官方英文原文）；
+- **非 TTY**（管道/重定向/CI）：对齐官方每阶段一行——`拉取清单` / 层完成汇总行（`拉取 {digest}：100% 2.00 GB（平均 5.3 MB/s）`）/ `校验 sha256 摘要` / `写入清单`；下载中断自动重试（3 次）时输出 `下载中断，正在重试（第 N/3 次）`。
 
 ```text
 roxid pull <model> [--hf]
@@ -168,6 +179,8 @@ roxid signout
 
 表格列出本地模型：`NAME` / `SIZE` / `MODIFIED` 三列。`MODIFIED` 为人类可读混合格式——绝对时间 + 中文相对短语，如 `2026-06-04 03:04 (3 个月前)`（分段：秒 / 分钟 / 小时 / 天 / 周 / 个月 / 年 前；差值 ≤0 显示 `刚刚`；无法解析的时间串原样输出）。
 
+列宽自适应：`NAME` 按终端宽度截断（超长模型名尾部 `…`，CJK 感知）；`SIZE` 量纲自适应（KB/MB/GB，两位小数）；窄终端（<60 列）下 `MODIFIED` 仅显示相对短语、三列总宽收敛至终端宽度内（40 列终端不溢出）。
+
 ```text
 roxid list    # 别名：roxid ls
 ```
@@ -182,7 +195,7 @@ roxid ps
 
 ## cp
 
-复制模型（目标为衍生模型，大文件硬链接基础模型，不占双份磁盘）。
+复制模型（目标为衍生模型，大文件硬链接基础模型，不占双份磁盘）。成功回显 `已复制 {source} → {destination}`（绿色；与官方 ollama 静默输出不同）。
 
 ```text
 roxid cp <source> <destination>
@@ -194,7 +207,7 @@ roxid cp llama3.2:3b llama3.2:3b-copy
 
 ## rm
 
-删除本地模型。
+删除本地模型。成功回显 `已删除 {model}`（绿色）。
 
 ```text
 roxid rm <model>
@@ -236,7 +249,7 @@ roxid runtime rm <tag>
 | 子命令 | 参数 | 说明 |
 |---|---|---|
 | `list` | — | 列出已装版本（标注 `[默认]`）与 manual；含解析优先级说明 |
-| `install` | `<tag>`（`b\d+` 形态，如 `b10700`）或 `--url <url>`（二选一） | 按官方 tag 下载（自动探测变体：GPU → vulkan / 无 GPU → cpu）；`--url` 安装为 manual 版本 |
+| `install` | `<tag>`（`b\d+` 形态，如 `b10700`）或 `--url <url>`（二选一） | 按官方 tag 下载（变体按宿主 CPU 架构 `x64`/`arm64` 自动匹配 + GPU → vulkan / 无 GPU → cpu）；`--url` 安装为 manual 版本 |
 | `use` | `<tag>` 或 `manual` | 设默认版本并持久化；切换后首个请求即卸旧实例、以新版本拉起 |
 | `rm` | `<tag>` | 删除已装版本；默认版本需先切换后才能删除 |
 
@@ -289,8 +302,10 @@ roxid completion install              # 探测 $SHELL 自动落位标准补全�
 服务不可达时（连接失败）打印统一提示并退出 1：
 
 ```text
-无法连接 roxid 服务（http://127.0.0.1:11434）：...
+错误： 无法连接 roxid 服务（http://127.0.0.1:11434）：...
 请先运行：roxid serve
 ```
+
+错误输出统一形态：服务端错误体 `{"error":"..."}` 由 CLI 解析提取纯文本展示（原始 JSON 包裹不再透出），统一红色「错误：」前缀走 stderr。
 
 > 若 `ROXID_HOST` / `OLLAMA_HOST` 指向官方 Ollama 实例，CLI 会探测并在 stderr 提示「当前连接的不是 roxid 实例」，命令仍作用于该实例（stdout 保持官方对齐，不污染管道解析）。

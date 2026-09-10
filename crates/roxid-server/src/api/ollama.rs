@@ -141,9 +141,11 @@ fn format_upstream_error(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(text) {
         if let Some(inner) = v["error"]["message"].as_str() {
             if inner.contains("Pooling type") {
-                // 生成模型请求 embedding：对齐官方 A/B 实证口径（单层、无内部术语）
-                return "This server does not support embeddings. Please use an embedding model"
-                    .to_string();
+                // 生成模型请求 embedding：原对齐官方 A/B 实证英文口径（M34
+                // BUG-6）；M104（迭代32 碴5）按用户新裁决转写中文——全仓
+                // API 错误文案中文基线统一（上游英文 message 仍原样透传，
+                // 裁决 2026-09-10 19:00「仅①中文化」）
+                return "此模型不支持向量化，请使用 embedding 模型".to_string();
             }
             return inner.to_string();
         }
@@ -878,6 +880,9 @@ pub async fn chat(
         let mut out = openai_chat_response_to_ollama(&display_name, &openai);
         // M28 碴6：duration 四字段真实计量（原硬编码 0）
         crate::adapter::apply_duration_fields(&mut out, request_start, first_byte, load);
+        // M102（迭代32 碴3）：非流式墙钟切分失真（生成完毕才收 headers），
+        // 上游 timings 精确计时覆盖 prompt/eval 两 duration（缺失回退墙钟）
+        crate::adapter::apply_timings_durations(&mut out, &openai["timings"]);
         Json(out).into_response()
     }
 }
@@ -1131,6 +1136,10 @@ pub async fn generate(
         };
         // M28 碴6：duration 四字段真实计量（原硬编码 0）
         crate::adapter::apply_duration_fields(&mut out, request_start, first_byte, load);
+        // M102（迭代32 碴3）：非流式墙钟切分失真，上游 timings 覆盖 prompt/eval
+        // 两 duration——chat_mode（/v1/chat/completions）、raw（/v1/completions）、
+        // native（/completion、/infill）三通道响应顶层同构携带 timings
+        crate::adapter::apply_timings_durations(&mut out, &openai["timings"]);
         // M28 碴8：context 回填（prompt + 生成全文 tokenize，失败降级空数组）；
         // M35 D1：context 通道前置请求 context（完整续传序列）
         let response_text = out["response"].as_str().unwrap_or_default().to_string();
@@ -2095,11 +2104,12 @@ mod tests {
     /// M34 BUG-6：上游错误单层化——解包内层 message + Pooling 场景转官方口径
     #[test]
     fn upstream_error_unwrapped_single_layer() {
-        // OpenAI 风格嵌套：取内层 message；Pooling 场景转写官方口径文案
+        // OpenAI 风格嵌套：取内层 message；Pooling 场景转写中文口径文案
+        //（M104 迭代32 碴5：原英文官方口径按用户裁决 2026-09-10 19:00 中文化）
         let nested = r#"{"error":{"code":400,"message":"Pooling type 'none' is not OAI compatible. Use pooling type 'mean'."}}"#;
         assert_eq!(
             format_upstream_error(nested),
-            "This server does not support embeddings. Please use an embedding model"
+            "此模型不支持向量化，请使用 embedding 模型"
         );
         // 普通内层 message：单层透出
         let nested2 = r#"{"error":{"code":400,"message":"bad request body"}}"#;

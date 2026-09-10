@@ -79,7 +79,12 @@ pub async fn run_setup_command(llama_url: Option<String>) -> i32 {
 /// - 参数 url：包下载链接（tar.gz 或裸 llama-server 二进制）
 /// - 返回：进程退出码（0 成功；1 安装失败）
 async fn install_manual_and_record(url: &str) -> i32 {
-    match roxid_server::runtime::install_manual(url).await {
+    // M105（迭代32 碴6a）：下载进度可见（量纲/速度/剩余时间——渲染器
+    // 复用 main.rs 双路径实现：TTY spinner / 非 TTY 周期文本行）
+    let (bar, on_progress) = crate::runtime_download_progress("下载运行时");
+    let result = roxid_server::runtime::install_manual(url, on_progress).await;
+    bar.finish_and_clear();
+    match result {
         Ok(path) => {
             let mut cfg = config::load_persist_config();
             cfg.setup_done = true;
@@ -191,12 +196,16 @@ fn ask_yes_no(question: &str) -> bool {
 
 /// 预填询问（Q5 语义）：回车采用预填值；输入 none 清除；其他输入原样替换。
 /// 空串结果统一归一为 None（与读取链「空值视为未设置」语义对齐）。
+/// M116（迭代33 碴9）：两行式排版——原 label + 选项后缀单行 print 超
+/// 60 列，窄终端折行使确认问句与下一问句挤行混排；label 独占一行、
+/// 输入提示精简另起一行，窄终端不再折行。
 ///
 /// - 参数 label：配置项说明
 /// - 参数 prefill：预填建议值（推荐值或 setup 重开时的既有值）
 /// - 返回：Option<String>，用户最终确认的值
 fn ask_prefilled_value(label: &str, prefill: &str) -> Option<String> {
-    print!("{label} [回车={prefill} | 输入新值替换 | 输入 none 清除]: ");
+    println!("{label}");
+    print!("[回车={prefill} | 新值替换 | none 清除]: ");
     flush_stdout();
     let answer = read_line().trim().to_string();
     let value = if answer.is_empty() {

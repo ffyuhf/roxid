@@ -28,6 +28,12 @@
 #                                      URL 之前；ROXID_DOWNLOAD_URL 直链不受影响）
 #
 # 修改历史：
+#   2026-09-11 04-19 横幅与全面体验优化（迭代34，计划 v1.0.0 用户批准于
+#                     2026-09-11 04:19；裁决 Q1/Q2 2026-09-11 04:16/04:17）：
+#                     新增 ANSI Shadow 风格 ROXID 横幅（所有入口统一最先打印）、
+#                     green/cyan 颜色扩展、阶段分隔线、系统环境信息展示（systemd
+#                     两级状态前置探测一次、展示与配置判定两处复用）、安装/卸载
+#                     收尾区块美化；安装/卸载逻辑与交互序列零变化（纯呈现层）
 #   2026-09-10 03-55 修复两缺陷（迭代26，计划 v1.0.0 用户批准于 2026-09-10 03:55）：
 #                     缺陷1 用户实例探测仅凭退出码把 degraded（存在无关失败 unit，
 #                     用户总线仍可用）误判不可用，改按 running|degraded 输出状态匹配
@@ -59,8 +65,12 @@ set -eu
 
 red="$( (/usr/bin/tput bold || :; /usr/bin/tput setaf 1 || :) 2>&-)"
 plain="$( (/usr/bin/tput sgr0 || :) 2>&-)"
+# 迭代34：成功/信息双色扩展（green=成功与状态前缀，cyan=横幅/分隔线/信息标签）；
+# 沿用 tput 失败回退空串模式——非 TTY 下与既有 red/plain 行为完全一致
+green="$( (/usr/bin/tput bold || :; /usr/bin/tput setaf 2 || :) 2>&-)"
+cyan="$( (/usr/bin/tput bold || :; /usr/bin/tput setaf 6 || :) 2>&-)"
 
-status() { echo ">>> $*"; }
+status() { echo "${green}>>>${plain} $*"; }
 error() { echo "${red}错误:${plain} $*"; exit 1; }
 warning() { echo "${red}警告:${plain} $*"; }
 
@@ -90,6 +100,27 @@ ask_with_default() {
     REPLY="${answer:-$default}"
 }
 
+# 打印 roxid 横幅（迭代34，裁决 Q2 2026-09-11 04:17：所有入口统一最先打印——
+# 无参数菜单 / --uninstall 直达 / 环境变量非交互模式均打印；六行大字为用户
+# 提供的 ANSI Shadow 风格原文，逐字内嵌不改写；颜色经 tput 失败回退，非 TTY
+# 自动降级纯文本）
+print_banner() {
+    printf '%s\n' "${cyan}██████╗   ██████╗  ██╗  ██╗ ██╗ ██████╗
+██╔══██╗ ██╔═══██╗ ╚██╗██╔╝ ██║ ██╔══██╗
+██████╔╝ ██║   ██║  ╚███╔╝  ██║ ██║  ██║
+██╔══██╗ ██║   ██║  ██╔██╗  ██║ ██║  ██║
+██║  ██╗ ╚██████╔╝ ██╔╝ ██╗ ██║ ██████╔╝
+╚═╝  ╚═╝  ╚═════╝  ╚═╝  ╚═╝ ╚═╝ ╚═════╝${plain}"
+    printf '%s\n' "${cyan}roxid 安装/卸载脚本${plain}"
+}
+
+# 阶段分隔线（迭代34，裁决 Q1 2026-09-11 04:16：全面体验优化——统一阶段视觉
+# 边界；36 个横线与横幅视觉宽度协调）
+separator() { printf '%s\n' "${cyan}────────────────────────────────────${plain}"; }
+
+print_banner
+separator
+
 ###########################################
 # 平台与架构检查（仅 Linux，对齐官方骨架）
 ###########################################
@@ -111,6 +142,35 @@ case "$KERN" in
     *icrosoft) error "Microsoft WSL1 不受支持。请使用 WSL2：wsl --set-version <distro> 2" ;;
     *) ;;
 esac
+
+# 环境信息展示（迭代34，裁决 Q1 2026-09-11 04:16）：只读探测无副作用；systemd
+# 两级状态探测一次、两处使用——本块展示与后期服务配置分支（running|degraded
+# 判定，迭代26 修正语义保持不变）复用同一前置结果，省重复调用；函数内赋值为
+# 全局变量（POSIX sh 无 local 语义差异，此处有意泄漏供后期复用）
+print_env_info() {
+    status "系统环境:"
+    echo "  - 系统: $(uname -s) $KERN"
+    echo "  - 架构: $ARCH"
+    if [ "$IS_WSL2" = true ]; then
+        echo "  - 运行环境: WSL2"
+    fi
+    if available systemctl; then
+        SYSTEMCTL_SYSTEM_RUNNING="$(systemctl is-system-running 2>/dev/null || true)"
+        echo "  - systemd 系统实例: $SYSTEMCTL_SYSTEM_RUNNING"
+    else
+        SYSTEMCTL_SYSTEM_RUNNING=''
+        echo "  - systemd 系统实例: 未安装 systemctl"
+    fi
+    SYSTEMCTL_USER_RUNNING="$(systemctl --user is-system-running 2>/dev/null || true)"
+    if [ -n "$SYSTEMCTL_USER_RUNNING" ]; then
+        echo "  - systemd 用户实例: $SYSTEMCTL_USER_RUNNING"
+    else
+        echo "  - systemd 用户实例: 不可用"
+    fi
+}
+
+print_env_info
+separator
 
 ###########################################
 # 卸载流程（迭代22）：满卸 roxid 全部落痕
@@ -347,9 +407,12 @@ uninstall_flow() {
 
 # 卸载收尾提示（与安装侧 install_success 对称；不经 trap——卸载在安装
 # trap install_success EXIT 设置点之前分流退出，直接调用即可）
+# 迭代34：分隔线包围的成功区块（呈现升级，卸载逻辑零变化）
 uninstall_success() {
-    status 'roxid 卸载完成。'
+    separator
+    status '✓ roxid 卸载完成。'
     status "复核建议: pgrep -x roxid（应无输出）与 ls ${ROXID_HOME:-$HOME/.roxid}（应不存在或仅剩保留项）。"
+    separator
 }
 
 ###########################################
@@ -576,6 +639,8 @@ if available pgrep && pgrep -x roxid >/dev/null 2>&1; then
     esac
 fi
 
+separator
+
 ###########################################
 # 落位（install 天然覆盖旧版本；升级 = 重新运行本脚本）
 ###########################################
@@ -611,7 +676,9 @@ fi
 SERVICE_STARTED=0
 
 install_success() {
+    separator
     if [ "$SERVICE_STARTED" -eq 1 ]; then
+        status "✓ roxid 服务已启动。"
         status 'The roxid API is now available at 127.0.0.1:11434.'
     else
         status '未配置 roxid 自启动服务。手动启动方式：'
@@ -621,6 +688,7 @@ install_success() {
     fi
     status "安装完成。可执行文件: $BINDIR/roxid"
     status '首次运行 roxid 将进入 setup 引导（llama.cpp 后端下载源配置）。'
+    separator
 }
 trap install_success EXIT
 
@@ -725,8 +793,9 @@ EOF
 
 if [ "$SCOPE" = "system" ]; then
     if available systemctl; then
-        SYSTEMCTL_RUNNING="$(systemctl is-system-running || true)"
-        case "$SYSTEMCTL_RUNNING" in
+        # 迭代34：复用环境信息块前置探测结果（print_env_info 已赋值），
+        # running|degraded 判定语义与迭代26 保持不变，省重复调用
+        case "$SYSTEMCTL_SYSTEM_RUNNING" in
             running|degraded)
                 configure_systemd_system
                 ;;
@@ -738,12 +807,11 @@ if [ "$SCOPE" = "system" ]; then
         warning "未找到 systemctl，跳过系统实例服务配置。"
     fi
 else
-    # 用户实例探测（迭代26 缺陷1 修正 2026-09-10 03-55）：对齐系统实例分支，按
-    # is-system-running 输出状态匹配 running|degraded——degraded 仅表示存在无关
-    # 失败 unit，用户总线仍可用；原实现仅凭退出码（degraded 退出码为 1）误判不可用。
-    # stderr 静默：真不可用时 systemctl 的报错噪音不混入安装输出；|| true 护栏
-    # 兼容 set -eu（对齐系统实例分支 708 行写法）
-    SYSTEMCTL_USER_RUNNING="$(systemctl --user is-system-running 2>/dev/null || true)"
+    # 用户实例探测（迭代26 缺陷1 修正 2026-09-10 03-55）：按 is-system-running
+    # 输出状态匹配 running|degraded——degraded 仅表示存在无关失败 unit，用户总线
+    # 仍可用；原实现仅凭退出码（degraded 退出码为 1）误判不可用。
+    # 迭代34：探测前移至环境信息块（print_env_info，stderr 静默 + || true 护栏
+    # 兼容 set -eu），此处复用结果，判定语义不变
     case "$SYSTEMCTL_USER_RUNNING" in
         running|degraded)
             configure_systemd_user

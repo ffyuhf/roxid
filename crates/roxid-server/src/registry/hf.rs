@@ -41,6 +41,7 @@ use crate::error::{RoxidError, RoxidResult};
 use crate::repo::{ModelFiles, ModelMeta, ModelRef};
 
 use super::downloader::ChunkedDownloader;
+use super::downloader::DownloadPhase;
 use super::PullEvent;
 
 /// HuggingFace 官方基址（未设镜像变量时的默认值）
@@ -334,21 +335,29 @@ impl HuggingFaceSource {
                     dest.display()
                 );
             } else {
-                let mut progress = |done: u64, tot: u64| {
-                    on_event(PullEvent {
+                // M110（迭代33）：回调改阶段枚举——Progress 转进度事件、
+                // Verifying/Retrying 转状态事件（对齐主源事件形态）
+                let mut progress = |ph: DownloadPhase| match ph {
+                    DownloadPhase::Progress(done, tot) => on_event(PullEvent {
                         status: Some("pulling".into()),
                         digest: expected.as_deref().map(|s| format!("sha256:{s}")),
                         total: Some(tot),
                         completed: Some(done),
                         error: None,
-                    });
+                    }),
+                    DownloadPhase::Verifying => {
+                        on_event(PullEvent::status("verifying sha256 digest"))
+                    }
+                    DownloadPhase::Retrying(n, max) => on_event(PullEvent::status(format!(
+                        "retrying download (attempt {n}/{max})"
+                    ))),
                 };
                 self.downloader
                     .download(
                         &url,
                         &dest,
                         expected.as_deref(), // 下载完成后流式 sha256 校验（M16 增强）
-                        |done, tot| progress(done, tot),
+                        progress,
                     )
                     .await?;
             }

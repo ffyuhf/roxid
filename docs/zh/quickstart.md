@@ -26,7 +26,7 @@ HuggingFace 镜像基址（整体替换官方域名）[回车=https://hf-mirror.
 ```
 
 - 未检测到中国网络环境时自动跳过代理询问；引导可随时用 `roxid setup` 重开；
-- 引导完成后，serve 自动下载 llama.cpp 后端（默认锁定链，GPU 环境取 vulkan 变体、无 GPU 取 cpu 变体），随后开始监听：
+- 引导完成后，serve 自动下载 llama.cpp 后端（默认锁定链，变体按宿主 CPU 架构匹配——GPU 环境取 vulkan 变体、无 GPU 取 cpu 变体），随后开始监听：
 
 ```text
 roxid API 服务已启动: http://127.0.0.1:11434

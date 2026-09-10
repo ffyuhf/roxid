@@ -30,6 +30,21 @@ pub const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 /// 默认并发下载数
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
+/// 下载阶段事件（M110，迭代33 碴3+碴12）：进度回调由 (完成, 总量)
+/// 二元组扩展为阶段枚举——校验/重试阶段也上回调链（原校验耗时发生在
+/// 层 100% 之后的静默期且事件在校验完成后才补发、重试仅 tracing 日志，
+/// CLI 端全程不可见）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadPhase {
+    /// 下载进度（已完成字节, 总字节）
+    Progress(u64, u64),
+    /// 完整性校验开始（拼接 + sha256 计算前——此段是 100% 后的主要耗时）
+    Verifying,
+    /// 重试进行中（第 N 次, 上限 M 次）——退避等待前发出，CLI 在等待
+    /// 期即可见
+    Retrying(u32, u32),
+}
+
 /// 分块并发下载器
 pub struct ChunkedDownloader {
     http: reqwest::Client,
@@ -80,12 +95,12 @@ impl ChunkedDownloader {
         url: &str,
         dest: &Path,
         expected_sha256: Option<&str>,
-        mut on_progress: impl FnMut(u64, u64) + Send,
+        mut on_event: impl FnMut(DownloadPhase) + Send,
     ) -> RoxidResult<()> {
         let mut last_error = String::new();
         for attempt in 1..=3u32 {
             match self
-                .download_once(url, dest, expected_sha256, &mut on_progress)
+                .download_once(url, dest, expected_sha256, &mut on_event)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -93,6 +108,9 @@ impl ChunkedDownloader {
                     tracing::warn!("下载失败（第 {attempt}/3 次）{url}：{e}");
                     last_error = e.to_string();
                     if attempt < 3 {
+                        // M110：重试事件上回调链（退避前发出——等待期
+                        // CLI 即可见；原仅 serve 日志可见）
+                        on_event(DownloadPhase::Retrying(attempt, 3));
                         // 1s/2s 退避
                         tokio::time::sleep(Duration::from_secs(1u64 << (attempt - 1))).await;
                     }
@@ -113,16 +131,20 @@ impl ChunkedDownloader {
         url: &str,
         dest: &Path,
         expected_sha256: Option<&str>,
-        mut on_progress: impl FnMut(u64, u64) + Send,
+        mut on_event: impl FnMut(DownloadPhase) + Send,
     ) -> RoxidResult<()> {
         let total = self.probe_total_size(url).await?;
-        on_progress(0, total);
+        on_event(DownloadPhase::Progress(0, total));
         let parts_dir = parts_dir_of(dest);
-        self.download_chunks(url, &parts_dir, total, &mut on_progress)
+        self.download_chunks(url, &parts_dir, total, &mut on_event)
             .await?;
+        // M110：校验阶段事件前移——拼接 + sha256 是 100% 后的主要耗时
+        //（原 registry 尾部 verifying 事件在校验完成后才发，CLI 在
+        // 「100% 停留期」空转无阶段区分）
+        on_event(DownloadPhase::Verifying);
         self.assemble_and_verify(&parts_dir, dest, total, expected_sha256)
             .await?;
-        on_progress(total, total);
+        on_event(DownloadPhase::Progress(total, total));
         Ok(())
     }
 
@@ -173,7 +195,7 @@ impl ChunkedDownloader {
         url: &str,
         parts_dir: &Path,
         total: u64,
-        on_progress: &mut (impl FnMut(u64, u64) + Send),
+        on_event: &mut (impl FnMut(DownloadPhase) + Send),
     ) -> RoxidResult<()> {
         std::fs::create_dir_all(parts_dir)?;
         let chunk_count = total.div_ceil(self.chunk_size);
@@ -190,7 +212,7 @@ impl ChunkedDownloader {
                 _ => pending.push(index),
             }
         }
-        on_progress(done_bytes, total);
+        on_event(DownloadPhase::Progress(done_bytes, total));
 
         // 信号量限制并发；进度经共享计数器流式累计
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(self.concurrency));
@@ -248,7 +270,10 @@ impl ChunkedDownloader {
             }
             tokio::select! {
                 _ = ticker.tick() => {
-                    on_progress(done_counter.load(std::sync::atomic::Ordering::Relaxed), total);
+                    on_event(DownloadPhase::Progress(
+                        done_counter.load(std::sync::atomic::Ordering::Relaxed),
+                        total,
+                    ));
                 }
                 res = jobs.next() => {
                     match res {
@@ -259,10 +284,10 @@ impl ChunkedDownloader {
             }
         }
         // 终值兜底（断点全命中 jobs 为空时直接至此；保证收敛到 total）
-        on_progress(
+        on_event(DownloadPhase::Progress(
             done_counter.load(std::sync::atomic::Ordering::Relaxed),
             total,
-        );
+        ));
         Ok(())
     }
 
@@ -436,7 +461,7 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
             &format!("http://127.0.0.1:{port}/file"),
             &dest,
             Some(&expected),
-            |_, _| {},
+            |_| {},
         )
         .await
         .expect("坏块必须经重试自愈（第 2 轮全量重下成功）");
@@ -479,7 +504,7 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
                 &format!("http://127.0.0.1:{port}/file"),
                 &dest,
                 None,
-                |_, _| {},
+                |_| {},
             )
             .await
             .expect_err("非 206 响应必须报错（不得误作单块写入）");
@@ -536,7 +561,7 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
             &format!("http://127.0.0.1:{port}/file"),
             &dest,
             Some(&expected),
-            |_done, _total| events += 1,
+            |_| events += 1,
         )
         .await
         .unwrap();

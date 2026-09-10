@@ -31,6 +31,15 @@
 //! M97（迭代30 碴A增强）：stderr 尾部环形缓存（12 行）——「启动即退出」
 //! 报错附带 stderr 摘要；gemma4 案实证裸文案无法定位真实失败原因
 //! （wrong number of tensors 湮没在统一 404 与无效重拉噪音中）2026-09-10 07-20
+//! M99（迭代31，Q4）：spawn 失败 ENOENT 且二进制在位时读 ELF 头诊断
+//! 架构不匹配——原裸报「No such file or directory (os error 2)」无从
+//! 定位（x64 包误装 arm64 宿主即此形态，用户实测 2026-09-10）
+//! 2026-09-10 18-30
+//! M100（迭代32 碴1）：spawn_args 增 --alias 规范化模型名——透传层
+//! 剥离请求 model 字段后 llama-server 以加载路径兜底回显（用户实测
+//! model 字段返回 /root/.roxid/...gguf）；--alias 使全部回显点统一为
+//! model:tag（llama-server 官方 API 层命名参数，README 实证）
+//! 2026-09-10 21-26
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -103,8 +112,10 @@ pub struct SpawnSpec {
 ///
 /// - 参数 spec：启动参数
 /// - 参数 port：监听端口
+/// - 参数 alias：API 层模型别名（规范化完整名 model:tag）——llama-server
+///   响应与流式分片的 model 回显点统一以此填充（官方 --alias 参数语义）
 /// - 返回：argv 参数向量（不含程序名）
-pub fn spawn_args(spec: &SpawnSpec, port: u16) -> Vec<String> {
+pub fn spawn_args(spec: &SpawnSpec, port: u16, alias: &str) -> Vec<String> {
     let per_slot_ctx = spec.ctx_size.max(512);
     let total_ctx = per_slot_ctx.saturating_mul(spec.parallel.max(1));
     let mut args: Vec<String> = vec![
@@ -120,6 +131,12 @@ pub fn spawn_args(spec: &SpawnSpec, port: u16) -> Vec<String> {
         spec.parallel.max(1).to_string(),
         "--embeddings".into(),
         "--metrics".into(),
+        // M100（迭代32 碴1）：API 层模型别名——透传层剥离请求 model 字段后
+        // llama-server 以加载路径兜底回显（oaicompat_model），--alias 使
+        // 非流式响应/流式分片/直通层 /v1/models 的 model 字段统一为
+        // 规范化模型名（2026-09-10 21:22）
+        "--alias".into(),
+        alias.to_string(),
     ];
     if let Some(mmproj) = &spec.mmproj {
         args.push("--mmproj".into());
@@ -219,11 +236,16 @@ impl Runner {
         spec: &SpawnSpec,
     ) -> RoxidResult<Self> {
         let size = std::fs::metadata(&spec.gguf)?.len();
+        // M100：规范化名先行物化——同时作 spawn_with 的实例名与 --alias
+        // 回显值（所有权隔离，避免 move 顺序约束）
+        let name: String = model_name.into();
+        let alias = name.clone();
         let mut cmd = Command::new(&spec.llama_server_bin);
         // 参数统一经 spawn_args 构造（M19 抽取为纯函数；含 M18 实测必需的
-        // --embeddings/--metrics 与 M19 的 --parallel/-c 总量换算）
-        cmd.args(spawn_args(spec, port));
-        let mut runner = Self::spawn_with(model_name, port, keep_alive, &mut cmd).await?;
+        // --embeddings/--metrics 与 M19 的 --parallel/-c 总量换算；M100 增
+        // --alias API 层模型名回显）
+        cmd.args(spawn_args(spec, port, &alias));
+        let mut runner = Self::spawn_with(name, port, keep_alive, &mut cmd).await?;
         // 等待 /health 就绪后再交付（进程即退或超时在此暴露）
         runner.wait_until_healthy().await?;
         runner.ctx_per_slot = spec.ctx_size.max(512); // D4c：记录实例每 slot 窗口（重建比较键）
@@ -274,7 +296,24 @@ impl Runner {
             // 兜底防泄漏：Runner 被 drop（如宿主异常退出路径）时自动终止子进程
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| RoxidError::RunnerFailure(format!("拉起子进程失败：{e}")))?;
+            .map_err(|e| {
+                // M99（迭代31，Q4）：ENOENT 且二进制文件在位 → 内核 execve
+                // 拒载错误架构 ELF 的典型形态，读 ELF 头给出架构诊断
+                //（ELF 无法判定时维持原文案，不冒进）
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    let bin = cmd.as_std().get_program();
+                    if let Some((bin_arch, host_arch)) =
+                        crate::runtime::diagnose_arch_mismatch(std::path::Path::new(bin))
+                    {
+                        return RoxidError::ArchMismatch(format!(
+                            "llama-server 为 {bin_arch} 构建，与宿主 {host_arch} 不匹配，\
+                             无法执行；可 `roxid runtime rm <tag>` 清理后重装本机架构版本，\
+                             或设置 ROXID_LLAMA_SERVER 指向自编译产物"
+                        ));
+                    }
+                }
+                RoxidError::RunnerFailure(format!("拉起子进程失败：{e}"))
+            })?;
         // PID 在进程存活期间恒有效，spawn 后立即记录（显存查询键）；
         // child.id() 返回 Option<u32>：进程句柄存在即恒为 Some
 
@@ -595,8 +634,7 @@ fn spawn_log_forwarder<R>(
     stream: R,
     stream_name: &'static str,
     tail: Option<Arc<StdMutex<VecDeque<String>>>>,
-)
-where
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -841,16 +879,22 @@ mod tests {
             ctx_size: 2048,
             parallel: 4,
         };
-        let args = spawn_args(&spec, 32141);
+        let args = spawn_args(&spec, 32141, "m:latest");
         let idx = |k: &str| args.iter().position(|a| a == k).unwrap();
         assert_eq!(args[idx("-c") + 1], "8192", "-c 必须为 2048×4 总量");
         assert_eq!(args[idx("--parallel") + 1], "4");
         assert!(args.contains(&"--embeddings".to_string()));
         assert!(args.contains(&"--metrics".to_string()));
+        // M100：--alias API 层模型名回显（值 = 规范化完整名）
+        assert_eq!(args[idx("--alias") + 1], "m:latest");
         // ctx 下限保护：0 → 512×parallel
         let mut low = spec.clone();
         low.ctx_size = 0;
-        assert_eq!(spawn_args(&low, 1)[idx("-c") + 1], "2048", "512×4 下限");
+        assert_eq!(
+            spawn_args(&low, 1, "m:latest")[idx("-c") + 1],
+            "2048",
+            "512×4 下限"
+        );
     }
 
     /// M39：tokenize_flags——双/单引号值保留为单 token、空白分隔、
@@ -893,7 +937,7 @@ mod tests {
             parallel: 4,
             runtime_flags: Some(r#"-ngl 30 --override-tensor "exps=CPU" --no-mmap"#.into()),
         };
-        let args = spawn_args(&spec, 32141);
+        let args = spawn_args(&spec, 32141, "m:latest");
         // 追加段必须位于末尾（llama.cpp 后写覆盖先写——用户可覆盖 -c/--parallel）
         assert_eq!(
             args[args.len() - 5..],

@@ -27,6 +27,7 @@ pub mod hf;
 pub mod manifest;
 
 pub use downloader::ChunkedDownloader;
+pub use downloader::DownloadPhase;
 pub use hf::HuggingFaceSource;
 pub use manifest::{ImageConfig, LayerDescriptor, Manifest};
 
@@ -414,7 +415,10 @@ impl OllamaRegistry {
             RoxidError::RegistryRequest(format!("manifest 无 model 层：{}", r.full_name()))
         })?;
 
-        on_event(PullEvent::status("verifying sha256 digest"));
+        // M110（迭代33 碴3）：verifying 事件已前移至每层真实校验时刻
+        //（download_big_blob 内 DownloadPhase::Verifying——大 GGUF 的
+        // sha256 计算是 100% 后主要耗时，原尾部补发使 CLI 空转无阶段
+        // 区分）；此处仅保留写入清单事件
         on_event(PullEvent::status("writing manifest"));
         let meta = ModelMeta {
             runtime: None,
@@ -460,15 +464,21 @@ impl OllamaRegistry {
         let digest = layer.digest.clone();
         // M32 碴9a：事件 total 取 downloader 探测的真实资源大小（tot），
         // 移除未使用的 layer.size 死代码绑定
+        // M110（迭代33 碴3+碴12）：回调改阶段枚举——Progress 转进度事件、
+        // Verifying/Retrying 转状态事件（官方英文文案，CLI 渲染层中文映射）
         self.downloader
-            .download(&url, dest, Some(&expected), move |done, tot| {
-                on_event(PullEvent {
+            .download(&url, dest, Some(&expected), move |ph| match ph {
+                DownloadPhase::Progress(done, tot) => on_event(PullEvent {
                     status: Some("pulling".into()),
                     digest: Some(digest.clone()),
                     total: Some(tot),
                     completed: Some(done),
                     error: None,
-                });
+                }),
+                DownloadPhase::Verifying => on_event(PullEvent::status("verifying sha256 digest")),
+                DownloadPhase::Retrying(n, max) => on_event(PullEvent::status(format!(
+                    "retrying download (attempt {n}/{max})"
+                ))),
             })
             .await
     }
