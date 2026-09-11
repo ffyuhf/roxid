@@ -170,8 +170,9 @@ pub fn complete_for(
 }
 
 /// 本地已装模型名（直读 models 根目录，与 cmd_list 的服务端 tags 同源能力，
-/// 零网络——serve 未运行时 TAB 补全不受影响）
-fn local_model_names() -> Vec<String> {
+/// 零网络——serve 未运行时 TAB 补全不受影响）。
+/// M148（迭代41）改 pub：create TUI 向导的 FROM 候选复用同一数据源
+pub fn local_model_names() -> Vec<String> {
     roxid_server::repo::list_models(&roxid_server::config::models_root())
         .into_iter()
         .map(|m| m.name)

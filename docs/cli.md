@@ -68,7 +68,7 @@ roxid serve --addr 0.0.0.0:11434
 
 ## create
 
-Create a model from a Modelfile, or launch the interactive creation wizard.
+Create a model from a Modelfile, or launch the full-screen TUI creation wizard.
 
 ```text
 roxid create <model> [-f <Modelfile>] [-i]
@@ -78,7 +78,7 @@ roxid create <model> [-f <Modelfile>] [-i]
 |---|---|---|---|---|
 | `model` | string | yes | — | New model name |
 | `-f, --file` | string | one of `-f`/`-i` | — | Modelfile path |
-| `-i, --interactive` | flag | one of `-f`/`-i` | — | Wizard: FROM → SYSTEM (multi-line, ends with `.`) → RUNTIME → summary confirmation |
+| `-i, --interactive` | flag | one of `-f`/`-i` | — | Full-screen TUI wizard: ① pick base model from list (↑/↓, type-to-filter) → ② multi-line SYSTEM → ③ RUNTIME flags (example pinned at bottom) → ④ Modelfile preview & confirm; falls back to a line-by-line wizard on terminals without full-screen support |
 
 Missing both reports an error and exits (matching the official requirement of a Modelfile). Results stream as NDJSON events; failures surface as in-stream `error` events (exit code 1).
 
@@ -194,9 +194,9 @@ List running models in six columns:
 | Column | Meaning |
 |---|---|
 | `NAME` | Model name (padded to the longest running name for alignment; truncated on narrow terminals; all six columns kept) |
-| `ID` | First 12 chars of content digest |
+| `ID` | 12 chars of content digest (first 12 for registry models; last 12 for HuggingFace direct models) |
 | `SIZE` | Model size in bytes (adaptive unit) |
-| `PROCESSOR` | GPU/CPU layer split (e.g. `20%/80% CPU/GPU`, parsed from backend load log; failure reason shown verbatim) |
+| `PROCESSOR` | GPU/CPU layer split (e.g. `20%/80% CPU/GPU`, parsed from backend load log; failure reason shown verbatim; column width expands to the longest cell, keeping all columns aligned) |
 | `CONTEXT` | Context window total (e.g. `4096 token`; no usage ratio) |
 | `UNTIL` | Time left before keep_alive unload (Chinese phrase, e.g. `5 分钟后`; `即将卸载` when expired) |
 

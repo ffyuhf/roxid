@@ -63,9 +63,15 @@
 //! M117 错误整形（{"error":...} 提取 + 统一红色「错误：」前缀）+ cp/rm/
 //! stop 成功回显；M118 verbose/nowordwrap 标 global（子命令后可用）
 //! 2026-09-10 22-45
+//! M146–M148（迭代41，用户终裁 2026-09-11 09:26「全屏 TUI」/计划批准
+//! 09:30）：create -i 交互向导升级为 ratatui 全屏 TUI（四步：列表选基础
+//! 模型→SYSTEM 多行→RUNTIME 单行→预览确认；新依赖 ratatui 0.30 +
+//! crossterm 0.29，版本经 USTC 镜像索引核实；终端初始化失败降级既有
+//! 问答向导）2026-09-11 09-38
 
 mod complete;
 mod completion;
+mod create_tui;
 mod help_i18n;
 mod setup;
 
@@ -696,7 +702,7 @@ async fn cmd_create(model: &str, file: Option<String>, interactive: bool) -> i32
         },
         None => {
             if interactive {
-                return create_wizard(model).await;
+                return create_interactive(model).await;
             }
             eprintln!("create 需要 -f <Modelfile>，或 -f 缺省时加 -i 进入交互创建");
             return 1;
@@ -733,6 +739,27 @@ async fn submit_create(model: &str, text: &str) -> i32 {
         Err(e) => {
             print_error(&e);
             1
+        }
+    }
+}
+
+/// 交互创建入口（M148，迭代41）：TUI 全屏向导优先，终端初始化失败
+/// （TERM=dumb 等不支持 raw mode 的场景）降级既有逐行问答向导——
+/// 双路径共存，-f 路径与提交流复用 submit_create 不变
+///
+/// - 参数 model：新模型名
+/// - 返回：进程退出码
+async fn create_interactive(model: &str) -> i32 {
+    let models = complete::local_model_names();
+    match create_tui::run(model, models) {
+        Ok(Some(text)) => submit_create(model, &text).await,
+        Ok(None) => {
+            eprintln!("已取消");
+            1
+        }
+        Err(e) => {
+            eprintln!("全屏 TUI 不可用（{e}），降级为逐行问答向导");
+            create_wizard(model).await
         }
     }
 }
@@ -1943,7 +1970,8 @@ async fn cmd_list() -> i32 {
 
 /// ps：运行中模型六列表格（迭代36 M127，Q2 裁决 2026-09-11 05:46：
 /// NAME/ID/SIZE/PROCESSOR/CONTEXT/UNTIL；Q6 裁决六列不删、NAME 弹性截断）。
-/// 各列口径：ID=digest 剥 sha256: 前缀取前 12 位；PROCESSOR=层数百分比
+/// 各列口径：ID=digest 剥 sha256: 前缀取 12 位——HF 直引（hf.co/ 前缀）
+/// 取末尾 12 位，主源取前 12 位（迭代38 M135）；PROCESSOR=层数百分比
 /// `X%/Y% CPU/GPU`，解析失败直书原因不降级（Q3）；CONTEXT=仅窗口总量
 /// `{N} token`，无使用率（Q4）；UNTIL=中文未来短语（Q5）。
 async fn cmd_ps() -> i32 {
@@ -1959,12 +1987,16 @@ async fn cmd_ps() -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // 列宽预算：固定列 ID12+SIZE10+PROCESSOR16+CONTEXT12+UNTIL10=60，
-    // 间隙 2×5=10；NAME 取终端剩余宽（Q6：六列不删，窄终端 NAME 压缩）
-    // M131（迭代37）：改两遍渲染——NAME 统一列宽取本轮最长（含表头），
+    // 列宽预算：固定列 ID12+SIZE10+CONTEXT12+UNTIL10=44 + 间隙 2×5=10，
+    // PROCESSOR 列宽动态（M134）；NAME 取终端剩余宽（Q6：六列不删，
+    // 窄终端 NAME 压缩）
+    // M131（迭代37）：两遍渲染——NAME 统一列宽取本轮最长（含表头），
     // 截断后 pad_cols 补齐，六列起点固定全表对齐（来源：用户确认 Q1
     // 「list + ps 一并修」2026-09-11 06:51）
-    let name_col = term_width().saturating_sub(70).max(4);
+    // M134（迭代38）：PROCESSOR 列宽动态扩宽——取本轮最长单元格显示宽
+    // （16 下限维持无 note 时的既有形态），pad_cols 显示宽补齐替换
+    // `{:<16}` 字符数补齐，CJK 失败原因不再溢出挤压后列；NAME 预算由
+    // 固定 70 联动为 54+pw（来源：用户确认 Q1「动态扩宽」2026-09-11 07:27）
     let rows: Vec<(String, String, String, String, String, String)> = v["models"]
         .as_array()
         .cloned()
@@ -1973,7 +2005,11 @@ async fn cmd_ps() -> i32 {
         .map(|m| {
             (
                 m["name"].as_str().unwrap_or("?").to_string(),
-                short_id12(m["digest"].as_str().unwrap_or("")).to_string(),
+                short_id12(
+                    m["digest"].as_str().unwrap_or(""),
+                    m["name"].as_str().unwrap_or(""),
+                )
+                .to_string(),
                 fmt_bytes(m["size"].as_u64().unwrap_or(0)),
                 fmt_processor(&m),
                 fmt_context_total(&m),
@@ -1981,26 +2017,37 @@ async fn cmd_ps() -> i32 {
             )
         })
         .collect();
+    // M134：PROCESSOR 统一列宽——全行显示宽最大值（表头参与下限），
+    // 16 为无 note 场景的既有形态下限（百分比形态实际 15 列）
+    let pw = rows
+        .iter()
+        .map(|(_, _, _, p, _, _)| display_width(p))
+        .chain(std::iter::once(display_width("PROCESSOR")))
+        .max()
+        .unwrap_or(16)
+        .max(16);
+    // NAME 预算随 pw 联动收缩（54 = ID12+SIZE10+CONTEXT12+UNTIL10+间隙10）
+    let name_col = term_width().saturating_sub(54 + pw).max(4);
     let nw = name_col_width(
         &rows.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
         name_col,
     );
     let sc = stdout_color();
     println!(
-        "{}  {:<12}  {:>10}  {:<16}  {:<12}  UNTIL",
+        "{}  {:<12}  {:>10}  {}  {:<12}  UNTIL",
         paint(sc, "1", &pad_cols("NAME", nw)),
         "ID",
         "SIZE",
-        "PROCESSOR",
+        pad_cols("PROCESSOR", pw),
         "CONTEXT"
     );
     for (name, id, size, processor, context, until) in &rows {
         println!(
-            "{}  {:<12}  {:>10}  {:<16}  {:<12}  {}",
+            "{}  {:<12}  {:>10}  {}  {:<12}  {}",
             pad_cols(&truncate_cols(name, nw), nw),
             id,
             size,
-            processor,
+            pad_cols(processor, pw),
             context,
             until
         );
@@ -2008,17 +2055,31 @@ async fn cmd_ps() -> i32 {
     0
 }
 
-/// ID 列：digest 剥 `sha256:` 前缀取前 12 位（迭代36 M127，Q2 裁决）。
+/// ID 列：digest 剥 `sha256:` 前缀取 12 位（迭代36 M127，Q2 裁决）。
+/// 迭代38 M135 双口径（来源：用户确认「有sha256，取哈希值后12位」
+/// 2026-09-11 07:31 + 澄清「仅 HF 直引用末尾，主源保持前 12 位」07:33）：
+/// HF 直引（模型名 hf.co/ 前缀）取摘要末尾 12 位，主源取前 12 位。
 /// 与 short_digest（8 位，错误摘要用）区分——本处固定 12 位对齐官方 ps。
 ///
 /// - 参数 digest：完整摘要串（空串/缺前缀均容忍）
+/// - 参数 model_name：/api/ps 模型全名（hf.co/ 前缀判定两源口径）
 /// - 返回：12 位十六进制片段；空串输入返回 "?"
-fn short_id12(digest: &str) -> String {
+fn short_id12(digest: &str, model_name: &str) -> String {
     let hex = digest.rsplit(':').next().unwrap_or(digest);
     if hex.is_empty() {
         return "?".to_string();
     }
-    hex.chars().take(12).collect()
+    if model_name.starts_with("hf.co/") {
+        hex.chars()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    } else {
+        hex.chars().take(12).collect()
+    }
 }
 
 /// PROCESSOR 列：层数换算 `X%/Y% CPU/GPU`（迭代36 M127，Q3 裁决：
@@ -2354,10 +2415,25 @@ mod tests {
     /// 迭代36 M127：ps 六列渲染族（ID/PROCESSOR/CONTEXT/UNTIL 各列口径）
     #[test]
     fn ps_six_column_rendering() {
-        // ID：剥前缀取 12 位；空串容错
-        assert_eq!(super::short_id12("sha256:6a4c9f1b2c3d4e5f"), "6a4c9f1b2c3d");
-        assert_eq!(super::short_id12("6a4c9f1b"), "6a4c9f1b");
-        assert_eq!(super::short_id12(""), "?");
+        // ID：剥前缀取 12 位；空串容错（迭代38 M135：第二参模型名分流口径）
+        assert_eq!(
+            super::short_id12("sha256:6a4c9f1b2c3d4e5f", "smollm2:135m"),
+            "6a4c9f1b2c3d"
+        );
+        assert_eq!(super::short_id12("6a4c9f1b", "m:latest"), "6a4c9f1b");
+        assert_eq!(super::short_id12("", "m:latest"), "?");
+        // 迭代38 M135 双口径：HF 直引（hf.co/ 前缀）取末尾 12 位，主源
+        // 保持前 12 位（来源：用户澄清 2026-09-11 07:33，两源口径不同）
+        let sha64 = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            super::short_id12(&format!("sha256:{sha64}"), "hf.co/unsloth/X:Q4"),
+            "456789abcdef"
+        );
+        assert_eq!(
+            super::short_id12(&sha64, "hf.co/u/r:Q4_K_M"),
+            "456789abcdef"
+        );
+        assert_eq!(super::short_id12(&sha64, "gemma4:latest"), "0123456789ab");
         // PROCESSOR：33/41 → 80% GPU → 「20%/80% CPU/GPU」；全 GPU；纯 CPU；
         // 失败直书原因（Q3）；双缺 "?"
         let m = json!({"gpu_layers": 33, "total_layers": 41});
@@ -2500,31 +2576,48 @@ mod tests {
             "8.95 GB"
         );
         assert_eq!(head.find("8.95 GB"), Some(22 + 3));
-        // ps 六列对齐快照：ID 起点逐行一致（与 NAME 长短无关）
+        // ps 六列对齐快照：ID 起点逐行一致（与 NAME 长短无关）；
+        // 迭代38 M134 回归：PROCESSOR 混排（15 列百分比 + 21 列 CJK note）
+        // 时 CONTEXT 起点仍逐行一致（原 {：<16} 字符数补齐致漂移约 7 列）
         let ps_names = ["smollm2:135m", "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M"];
         let ids = ["b0f58c4c1a3c", "ea35d2362372"];
-        let pw = super::name_col_width(&ps_names, 40);
-        let id_starts: Vec<usize> = ps_names
+        let procs = ["20%/80% CPU/GPU", "stderr 未匹配层卸载行"];
+        let nw = super::name_col_width(&ps_names, 40);
+        // M134：PROCESSOR 列宽 = 全行显示宽最大值（16 下限维持既有形态）
+        let pcw = procs
+            .iter()
+            .map(|p| super::display_width(p))
+            .chain(std::iter::once(super::display_width("PROCESSOR")))
+            .max()
+            .unwrap()
+            .max(16);
+        assert_eq!(pcw, 21);
+        let (id_starts, ctx_starts): (Vec<usize>, Vec<usize>) = ps_names
             .iter()
             .zip(&ids)
-            .map(|(n, id)| {
-                format!(
-                    "{}  {:<12}  {:>10}  {:<16}  {:<12}  {}",
-                    super::pad_cols(&super::truncate_cols(n, pw), pw),
+            .zip(&procs)
+            .map(|((n, id), p)| {
+                let line = format!(
+                    "{}  {:<12}  {:>10}  {}  {:<12}  {}",
+                    super::pad_cols(&super::truncate_cols(n, nw), nw),
                     id,
                     "258.34 MB",
-                    "stderr 未匹配层卸载行",
+                    super::pad_cols(p, pcw),
                     "4096 token",
                     "5 分钟后"
-                )
-                .find(id)
-                .unwrap()
+                );
+                (line.find(id).unwrap(), line.find("4096").unwrap())
             })
-            .collect();
+            .unzip();
         assert!(
             id_starts.windows(2).all(|w| w[0] == w[1]),
             "ID 起点不一致：{id_starts:?}"
         );
         assert_eq!(id_starts[0], 36 + 2);
+        assert!(
+            ctx_starts.windows(2).all(|w| w[0] == w[1]),
+            "CONTEXT 起点不一致：{ctx_starts:?}"
+        );
+        assert_eq!(ctx_starts[0], 36 + 2 + 12 + 2 + 10 + 2 + pcw + 2);
     }
 }

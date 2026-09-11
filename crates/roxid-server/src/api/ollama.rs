@@ -1348,13 +1348,28 @@ fn parse_size_label_count(label: &str) -> Option<u64> {
 /// /api/ps：运行中模型
 pub async fn ps(State(st): State<Arc<AppState>>) -> Response {
     let mut models = st.scheduler.list_running().await;
-    // 补充 digest（仓库元数据）
+    // 补充 digest（仓库元数据；迭代38 M135：HF 直引回退 model 层 sha256）
     for m in &mut models {
         if let Ok(meta) = repo::find_model(&st.models_root, &m.name) {
-            m.digest = meta.digest;
+            m.digest = resolve_ps_digest(&meta);
         }
     }
     Json(json!({"models": models})).into_response()
+}
+
+/// /api/ps digest 补齐值：顶层 digest 空时回退 model 层 sha256
+/// （迭代38 M135）——HF 直引落 meta 时顶层 digest 置空、文件 sha256 仅
+/// 入 layer_digests["model"]（M20），原只读顶层致 CLI ID 列恒「?」断链。
+///
+/// - 参数 meta：仓库模型元数据
+/// - 返回：顶层摘要；空则 model 层摘要；两处皆空返回空串（CLI 兜底 "?"）
+/// 来源：用户确认「有sha256，取哈希值后12位」2026-09-11 07:31
+fn resolve_ps_digest(meta: &repo::ModelMeta) -> String {
+    if meta.digest.is_empty() {
+        meta.layer_digests.get("model").cloned().unwrap_or_default()
+    } else {
+        meta.digest.clone()
+    }
 }
 
 /// /api/pull：拉取模型（NDJSON 进度流）。
@@ -2145,6 +2160,49 @@ mod tests {
         assert_eq!(out["eval_count"], 2009, "后到统计键并入");
         assert_eq!(out["prompt_eval_count"], 26);
         assert!(buf.flush().is_none(), "flush 幂等（不重复产出）");
+    }
+
+    /// 迭代38 M135：/api/ps digest 补齐回退——顶层空 → model 层 sha256
+    /// （HF 直引断链修复）；主源非空不触发回退；两处皆空保持空串
+    #[test]
+    fn ps_digest_fallback_to_model_layer() {
+        let hf_meta = || repo::ModelMeta {
+            name: "hf.co/u/r:Q4".into(),
+            family: "qwen".into(),
+            families: vec!["qwen".into()],
+            parameter_size: "4B".into(),
+            quantization_level: "Q4_K_M".into(),
+            system: String::new(),
+            template: None,
+            parameters: Default::default(),
+            messages: vec![],
+            layer_digests: Default::default(),
+            adapters: vec![],
+            files: repo::ModelFiles {
+                model: "model.gguf".into(),
+                mmproj: None,
+            },
+            digest: String::new(),
+            license: String::new(),
+            source: "huggingface:u/r".into(),
+            created_at: "2026-09-11T07:00:00Z".into(),
+            runtime: None,
+        };
+        // 顶层空 + model 层有 sha256 → 回退取 model 层（HF 直引形态）
+        let mut m = hf_meta();
+        m.layer_digests
+            .insert("model".into(), "sha256:0123456789abcdef".into());
+        assert_eq!(
+            resolve_ps_digest(&m),
+            "sha256:0123456789abcdef",
+            "顶层空必须回退 model 层 sha256"
+        );
+        // 主源形态：顶层非空 → 原值直出（回退不触发）
+        let mut main_meta = hf_meta();
+        main_meta.digest = "sha256:maindigest".into();
+        assert_eq!(resolve_ps_digest(&main_meta), "sha256:maindigest");
+        // 两处皆空 → 空串（CLI 兜底 "?"）
+        assert_eq!(resolve_ps_digest(&hf_meta()), "");
     }
 
     /// M34 BUG-1：单包形态（finish_reason+usage 同包）与无 usage 兜底（M33 碴3 键缺省语义）

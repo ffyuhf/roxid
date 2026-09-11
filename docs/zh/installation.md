@@ -1,4 +1,4 @@
-# 安装与卸载
+# 安装、更新与卸载
 
 [English](../installation.md) | 中文
 
@@ -34,12 +34,13 @@ sh roxid_install.sh
 ### 交互流程
 
 ```text
-执行操作 [1]安装 roxid  [2]卸载 roxid（默认: 1）:          ← 回车默认安装
+执行操作 [1]安装 roxid  [2]卸载 roxid  [3]更新 roxid（默认: 1）: ← 回车默认安装
 安装范围 [1]系统全局 /usr/local/bin  [2]用户级 ~/.local/bin: ← root 运行默认 1，非 root 默认 2
 二进制来源 [1]本地构建产物  [2]远程下载（默认: 1）:          ← 本地默认 target/release/roxid，可输入自定义路径
 本地 roxid 路径（回车使用默认）:                            ← 仅来源=本地时询问
 GitHub 代理前缀（回车直连）:                                ← 仅来源=远程且未设 ROXID_GH_PROXY、
-                                                            ROXID_DOWNLOAD_URL 时询问
+                                                             ROXID_DOWNLOAD_URL 时询问
+监听地址 [1]127.0.0.1 仅本机  [2]0.0.0.0 局域网可访问（默认: 1）: ← 仅确认创建 systemd 服务后询问
 ```
 
 - **安装范围**：系统全局落位 `/usr/local/bin`（非 root 自动加 sudo）；用户级落位 `~/.local/bin`（全程免 sudo）。
@@ -54,7 +55,7 @@ GitHub 代理前缀（回车直连）:                                ← 仅来
 | 系统实例 | 系统全局安装 + systemd 运行中 | `/etc/systemd/system/roxid.service` | 以**安装发起用户**身份运行（root 执行时回退 `SUDO_USER`，数据目录绑定该用户 `~/.roxid`）；需 sudo；`Restart=always` |
 | 用户实例 | 用户级安装 + `systemctl --user` 可用 | `~/.config/systemd/user/roxid.service` | 全程免 root；随登录会话启停；可附问开启 `loginctl enable-linger`（默认 N）实现免登录持久运行 |
 
-两级服务均为 `ExecStart=<BINDIR>/roxid serve`，确认创建时才 `enable --now`。
+两级服务确认创建时才 `enable --now`，随后追问监听地址：`127.0.0.1`（仅本机，默认）或 `0.0.0.0`（局域网可访问）。默认路径 unit 为 `ExecStart=<BINDIR>/roxid serve`（沿用 serve 内置默认 `127.0.0.1:11434`）；选 `0.0.0.0` 时写入 `ExecStart=<BINDIR>/roxid serve --addr 0.0.0.0:11434`。重跑安装并再次确认创建即可改写地址（更新流程不触碰 unit，已部署服务的地址不因更新而变）。
 
 ### 非交互安装（CI / 脚本化）
 
@@ -69,6 +70,7 @@ GitHub 代理前缀（回车直连）:                                ← 仅来
 | `ROXID_VERSION` | tag（默认 `latest`） | 配合内置基地址拼接资产 URL |
 | `ROXID_GH_PROXY` | 代理前缀 | 拼接在内置基地址 URL 之前的 GitHub 代理前缀（与 roxid 运行时同名变量语义一致）；设置后跳过代理问句 |
 | `ROXID_RELEASE_BASE` | 基地址 URL | 覆盖脚本内置发布基地址（自建镜像） |
+| `ROXID_SERVE_ADDR` | `127.0.0.1` / `0.0.0.0` | systemd 服务监听地址（仅确认创建服务时生效；已设置跳过地址问句直接采用，非法值报错中止） |
 
 ## 方式二：手动安装二进制
 
@@ -111,16 +113,23 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile   # 或 ~/.bashrc
 
 重新登录后生效。验证：`roxid -v`。
 
-## 升级
-
-升级 = 重新运行安装脚本（`install -m755` 天然覆盖旧版本）：
+## 更新（自动检测并更新）
 
 ```sh
-sh roxid_install.sh        # 远程来源 + latest 自动取最新版
-ROXID_VERSION=v0.2.0 sh roxid_install.sh   # 指定版本
+sh roxid_install.sh --update   # 或无参数菜单选 3
 ```
 
-覆盖安装时若 roxid 正在运行，脚本默认终止后继续。
+更新流程（仅替换二进制本身，不询问服务创建、不动数据/补全/配置）：
+
+1. **定位已安装 roxid**：PATH 命中优先，其次 `/usr/local/bin/roxid`、`~/.local/bin/roxid`；检测到的路径即替换目标（系统全局目标自动加 sudo）；
+2. **检测最新版本**：请求 `${ROXID_GH_PROXY}${ROXID_RELEASE_BASE}/latest` 读取 302 重定向尾段取 tag（与下载同域，代理前缀与自建镜像覆盖天然兼容；代理来源与安装远程分支同款——`ROXID_GH_PROXY` 已设跳过问句，否则交互询问默认直连）；
+3. **版本对比**：展示「本机版本 vs 最新版本」；已最新则提示退出；落后时询问「是否更新到 vX.Y.Z? [Y/n]」默认 Y；
+4. **更新执行**：下载**固定 tag** 资产（消除检测与下载间的版本竞态）→ 解压 → **先就地替换**（运行中进程持旧 inode 不受影响）→ **再询问终止**（默认 Y；systemd 服务由 `Restart=always` 自动以新二进制拉起，前台运行请手动重启）；
+5. 本机版本无法解析时展示原始输出，默认 N 慎重询问是否仍更新。
+
+`ROXID_DOWNLOAD_URL` 直链模式下无法检测最新版本：展示本机版本后默认 N 询问是否直接下载该直链覆盖安装。
+
+手动方式依然有效：重新运行安装脚本（`install -m755` 天然覆盖，`ROXID_VERSION=v0.2.0` 可指定版本）。
 
 ## 卸载与残留清理
 

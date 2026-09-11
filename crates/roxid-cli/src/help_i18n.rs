@@ -111,14 +111,17 @@ Shell 补全：
             about: "从 Modelfile 创建模型",
             after: r##"示例：
   roxid create mymodel -f Modelfile
-  roxid create mymodel -i        # 交互式向导（FROM/SYSTEM/RUNTIME）
+  roxid create mymodel -i        # 全屏 TUI 向导（列表选基础模型/SYSTEM/RUNTIME/预览）
 
 Modelfile 关键指令：FROM（基础模型）、SYSTEM（系统提示，""" 多行）、
 PARAMETER（参数，可多条）、RUNTIME（llama.cpp 启动参数）。"##,
             args: &[
                 ("model", "新模型名"),
                 ("file", "Modelfile 路径（缺省时配合 -i 进入交互创建）"),
-                ("interactive", "交互式创建向导（-f 缺省时生效）"),
+                (
+                    "interactive",
+                    "全屏 TUI 交互创建向导（-f 缺省时生效；终端不支持时降级逐行问答）",
+                ),
             ],
         },
     ),
@@ -438,7 +441,7 @@ Downloads the llama.cpp runtime automatically on first start
             about: "Create a model",
             after: r##"Examples:
   roxid create mymodel -f Modelfile
-  roxid create mymodel -i        # interactive wizard
+  roxid create mymodel -i        # full-screen TUI wizard
 
 Modelfile directives: FROM (base model), SYSTEM (""" blocks),
 PARAMETER (repeatable), RUNTIME (llama.cpp flags)."##,
@@ -448,7 +451,7 @@ PARAMETER (repeatable), RUNTIME (llama.cpp flags)."##,
                     "file",
                     "Path to the Modelfile (omit with -i for interactive mode)",
                 ),
-                ("interactive", "Run the interactive creation wizard"),
+                ("interactive", "Run the full-screen TUI creation wizard"),
             ],
         },
     ),

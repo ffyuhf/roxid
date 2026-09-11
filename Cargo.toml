@@ -37,6 +37,11 @@ toml = "0.8"
 tower-http = { version = "0.5", features = ["cors"] }
 # M46 引入（迭代18 BUG-10）：runner 孤儿防护 prctl(PR_SET_PDEATHSIG)
 libc = "0.2"
+# M146 引入（迭代41 用户终裁 2026-09-11 09:26）：create -i 全屏 TUI 交互向导
+# （版本经 USTC 镜像索引核实 2026-09-11：ratatui 最新稳定 0.30.2，其官方
+# 声明配套 crossterm ^0.29；纯 Rust 无 C 绑定，musl 静态兼容）
+ratatui = "0.30"
+crossterm = "0.29"
 
 [profile.release]
 lto = true

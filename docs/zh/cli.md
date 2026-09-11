@@ -68,7 +68,7 @@ roxid serve --addr 0.0.0.0:11434
 
 ## create
 
-从 Modelfile 创建模型；或进入交互式创建向导。
+从 Modelfile 创建模型；或进入全屏 TUI 交互创建向导。
 
 ```text
 roxid create <model> [-f <Modelfile>] [-i]
@@ -78,7 +78,7 @@ roxid create <model> [-f <Modelfile>] [-i]
 |---|---|---|---|---|
 | `model` | string | 是 | — | 新模型名 |
 | `-f, --file` | string | 与 `-i` 二选一 | — | Modelfile 路径 |
-| `-i, --interactive` | flag | 与 `-f` 二选一 | — | 交互向导：FROM → SYSTEM（多行，`.` 结束）→ RUNTIME → 摘要确认 |
+| `-i, --interactive` | flag | 与 `-f` 二选一 | — | 全屏 TUI 向导：① 列表选基础模型（↑/↓ 移动、输入即过滤）→ ② SYSTEM 多行编辑 → ③ RUNTIME 参数（示例常驻底部）→ ④ Modelfile 预览确认。终端不支持全屏时自动降级为逐行问答向导 |
 
 两者皆缺省时报错退出（对齐官方必须给 Modelfile 的行为）。结果为 NDJSON 流式事件，失败经流内 `error` 事件传递（退出码 1）。
 
@@ -194,9 +194,9 @@ roxid list    # 别名：roxid ls
 | 列 | 含义 |
 |---|---|
 | `NAME` | 模型名（补齐到本轮最长名对齐；窄终端截断，六列不删） |
-| `ID` | 内容摘要前 12 位（区分同名不同版本） |
+| `ID` | 内容摘要 12 位（区分同名不同版本；主源取前 12 位，HuggingFace 直引取末尾 12 位） |
 | `SIZE` | 模型占用字节数（量纲自适应） |
-| `PROCESSOR` | GPU/CPU 层数占比（如 `20%/80% CPU/GPU`，来自子进程加载日志解析；解析失败直书原因） |
+| `PROCESSOR` | GPU/CPU 层数占比（如 `20%/80% CPU/GPU`，来自子进程加载日志解析；解析失败直书原因。列宽随本轮最长内容动态扩展，失败原因完整保留不截断） |
 | `CONTEXT` | 上下文窗口总量（如 `4096 token`；不含使用率） |
 | `UNTIL` | 距 keep_alive 自动卸载的剩余时间（中文短语，如 `5 分钟后`；到期显示 `即将卸载`） |
 

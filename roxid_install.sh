@@ -1,7 +1,7 @@
 #!/bin/sh
-# roxid 安装/卸载脚本（基于 ollama 官方安装脚本骨架裁剪扩展）
-# 入口：无参数 → 交互菜单先问「安装/卸载」（回车默认安装，等价原行为）；
-#       --uninstall/-u 直达卸载流程；其他参数 error 提示
+# roxid 安装/卸载/更新脚本（基于 ollama 官方安装脚本骨架裁剪扩展）
+# 入口：无参数 → 交互菜单先问「安装/卸载/更新」（回车默认安装，等价原行为）；
+#       --uninstall/-u 直达卸载流程；--update 直达更新流程；其他参数 error 提示
 # 功能：交互式安装 roxid 二进制，支持两种安装范围与两种二进制来源——
 #   安装范围：1) 系统全局 /usr/local/bin（需 root/sudo）
 #             2) 用户级   ~/.local/bin（全程免 sudo）
@@ -11,9 +11,17 @@
 #     - 系统全局模式 + systemd 运行中：系统实例 /etc/systemd/system/roxid.service
 #     - 用户级模式 + systemctl --user 可用：用户实例 ~/.config/systemd/user/roxid.service
 #       （用户实例可选 loginctl enable-linger 未登录持久运行）
+#     - 监听地址（迭代40）：确认创建服务时可选 127.0.0.1（默认，仅本机）
+#       或 0.0.0.0（局域网可访问）；两级问句一致
 # 卸载（迭代22）：满卸 roxid 全部落痕——运行实例 → systemd 两级服务 →
 #   shell 补全 → ~/.roxid 数据目录（体积展示+逐项询问，默认 N 保留）→
 #   二进制两处落位；补全/数据清理一律默认 N，仅明确确认才删除
+# 更新（迭代39）：自动检测并更新——定位已安装 roxid 就地替换二进制，
+#   剩下都不动（不询问服务创建、不动数据/补全/配置）；检测通道为
+#   ${ROXID_GH_PROXY}${ROXID_RELEASE_BASE}/latest 的 302 重定向尾段 tag；
+#   落后时展示对比经确认（默认 Y）后下载固定 tag 覆盖；先替换后终止
+#   （运行中进程持旧 inode 不受影响，终止后 systemd Restart=always 拉起
+#   的必是新版）
 # 剥离自官方脚本的部分：macOS 分支、GPU/CUDA/ROCm/JetPack 驱动安装
 #   （roxid 推理后端由运行时自管于 ~/.roxid/llama.cpp/，GPU 分载依赖 llama.cpp --fit）
 #
@@ -26,8 +34,26 @@
 #   ROXID_GH_PROXY=<前缀>              GitHub 代理前缀（来源=remote 且非直链时生效；非空即用
 #                                      并跳过代理问句；语义同软件本体：前缀拼接在 Releases
 #                                      URL 之前；ROXID_DOWNLOAD_URL 直链不受影响）
+#   ROXID_SERVE_ADDR=127.0.0.1|0.0.0.0 systemd 服务监听地址（仅确认创建服务时生效；
+#                                      已设置跳过地址问句直接采用，非法值报错；
+#                                      默认 127.0.0.1 仅本机；0.0.0.0 局域网可访问）
 #
 # 修改历史：
+#   2026-09-11 08-56 systemd 服务监听地址可选（迭代40，计划 v1.0.0 用户批准于
+#                     2026-09-11 08:56；三项裁决 Q1–Q3 于 08:51–08:52：确认创建
+#                     服务后追加地址问句，回车默认 127.0.0.1 仅本机、选 2 写入
+#                     --addr 0.0.0.0:11434（两级一致）；新增 ROXID_SERVE_ADDR
+#                     逃生口二选一白名单非法值报错；install_success 断言行按实际
+#                     监听地址动态输出）；默认路径 unit 与既有逐字一致（不写
+#                     --addr）；更新/卸载流程零触碰（迭代39「剩下都不动」沿用）
+#   2026-09-11 08-21 新增更新功能（迭代39，计划 v1.2.0 用户批准于
+#                     2026-09-11 08:19；五项裁决 Q1–Q5 于 08:11–08:21：
+#                     更新入口触发（菜单「3 更新」+ --update 直达，既有
+#                     安装/卸载行为零变化）、对比后确认默认 Y、latest 重定向
+#                     解析取 tag、「直接替换剩下都不动」+ 运行中询问终止
+#                     默认 Y、先替换后终止时序修正）；本机检测 PATH > 两处
+#                     落位，检测路径即替换目标；三段 semver 数值比较（预发布
+#                     后缀落后于正式版）；直链模式默认 N 询问直接覆盖）
 #   2026-09-11 04-19 横幅与全面体验优化（迭代34，计划 v1.0.0 用户批准于
 #                     2026-09-11 04:19；裁决 Q1/Q2 2026-09-11 04:16/04:17）：
 #                     新增 ANSI Shadow 风格 ROXID 横幅（所有入口统一最先打印）、
@@ -100,6 +126,30 @@ ask_with_default() {
     REPLY="${answer:-$default}"
 }
 
+# 三段语义化版本比较（迭代39 D5）：去 v 前缀后按 MAJOR.MINOR.PATCH 三段
+# 逐段数值比较；三段号相同但一方带预发布后缀（-pre 等）者视为落后于
+# 正式版（对齐 semver 惯例：0.2.0-pre < 0.2.0）
+# 参数：$1 版本A  $2 版本B；版本A 严格小于 版本B 时返回 0（真），否则返回 1
+version_lt() {
+    awk -v a="${1#v}" -v b="${2#v}" '
+        function seg(s, n,   p, q) {
+            split(s, p, ".")
+            if (n < 3) return p[n] + 0
+            split(p[3], q, "-")
+            return q[1] + 0
+        }
+        function ispre(s,   p) {
+            split(s, p, ".")
+            return index(p[3], "-") > 0 ? 1 : 0
+        }
+        BEGIN {
+            if (seg(a,1) != seg(b,1)) exit (seg(a,1) < seg(b,1)) ? 0 : 1
+            if (seg(a,2) != seg(b,2)) exit (seg(a,2) < seg(b,2)) ? 0 : 1
+            if (seg(a,3) != seg(b,3)) exit (seg(a,3) < seg(b,3)) ? 0 : 1
+            exit (ispre(a) > ispre(b)) ? 0 : 1
+        }'
+}
+
 # 打印 roxid 横幅（迭代34，裁决 Q2 2026-09-11 04:17：所有入口统一最先打印——
 # 无参数菜单 / --uninstall 直达 / 环境变量非交互模式均打印；六行大字为用户
 # 提供的 ANSI Shadow 风格原文，逐字内嵌不改写；颜色经 tput 失败回退，非 TTY
@@ -111,7 +161,7 @@ print_banner() {
 ██╔══██╗ ██║   ██║  ██╔██╗  ██║ ██║  ██║
 ██║  ██╗ ╚██████╔╝ ██╔╝ ██╗ ██║ ██████╔╝
 ╚═╝  ╚═╝  ╚═════╝  ╚═╝  ╚═╝ ╚═╝ ╚═════╝${plain}"
-    printf '%s\n' "${cyan}roxid 安装/卸载脚本${plain}"
+    printf '%s\n' "${cyan}roxid 安装/卸载/更新脚本${plain}"
 }
 
 # 阶段分隔线（迭代34，裁决 Q1 2026-09-11 04:16：全面体验优化——统一阶段视觉
@@ -415,26 +465,247 @@ uninstall_success() {
     separator
 }
 
+# 解析最终下载 URL 并输出；无法解析（直链与基地址皆空）时返回非 0
+# 迭代25：直链分支原样返回不拼代理（Q2 裁决 2026-09-10 03:18）；Releases 分支前置
+# 拼接 GH_PROXY（Q1 裁决 03:17，语义同软件本体 download.rs asset_url 的直接字符串
+# 拼接；GH_PROXY 为空即直连，与现状一致）
+# 迭代39：定义位移至入口分流之前（update_flow 调用点先于安装远程分支到达，
+# POSIX sh 自顶向下执行需保证定义先于全部调用点；函数体逐字未动）
+resolve_remote_url() {
+    if [ -n "${ROXID_DOWNLOAD_URL:-}" ]; then
+        printf '%s\n' "$ROXID_DOWNLOAD_URL"
+        return 0
+    fi
+    if [ -z "$ROXID_RELEASE_BASE" ]; then
+        return 1
+    fi
+    ROXID_VER="${ROXID_VERSION:-latest}"
+    if [ "$ROXID_VER" = "latest" ]; then
+        printf '%s\n' "${GH_PROXY}${ROXID_RELEASE_BASE}/latest/download/roxid-linux-$ARCH.tar.gz"
+    else
+        printf '%s\n' "${GH_PROXY}${ROXID_RELEASE_BASE}/download/$ROXID_VER/roxid-linux-$ARCH.tar.gz"
+    fi
+}
+
 ###########################################
-# 入口分流（迭代22）：--uninstall/-u 直达卸载；无参数交互菜单先问
-# 「安装/卸载」（回车默认安装，等价迭代21 无参数行为）；未知参数 error
-# （用户裁决 Q1 2026-09-10 01:57：菜单与参数两种形态组合）
+# 更新流程（迭代39）：自动检测并更新——定位已安装 roxid 就地替换二进制，
+# 剩下都不动（不询问服务创建、不动数据/补全/配置）
+# 时序（裁决 Q5 2026-09-11 08:21）：先替换（运行中进程持旧 inode 不受
+# 影响）→ 后终止（询问默认 Y；systemd 服务由 Restart=always 自动以新
+# 二进制拉起，前台运行场景见收尾提示）
+###########################################
+
+update_flow() {
+    # 1. 定位已安装的 roxid（裁决 Q4-补充 08:16：找到已经安装的软件，
+    #    直接替换它，剩下都不动）——PATH 命中优先 → 系统全局落位 → 用户级
+    #    落位；检测到的路径即替换目标（就地覆盖，不产生第二落位）
+    INSTALLED_BIN=''
+    if available roxid; then
+        INSTALLED_BIN=$(command -v roxid)
+    elif [ -f /usr/local/bin/roxid ]; then
+        INSTALLED_BIN=/usr/local/bin/roxid
+    elif [ -f "$HOME/.local/bin/roxid" ]; then
+        INSTALLED_BIN="$HOME/.local/bin/roxid"
+    else
+        error "未检测到已安装的 roxid，请先安装（运行本脚本选择安装）。"
+    fi
+    status "已安装 roxid: $INSTALLED_BIN"
+
+    # 2. 解析本机版本（--version 输出形态 roxid X.Y.Z——clap 编译期注入；
+    #    末字段去 v 前缀；形态不符走 D9 兜底分支）
+    LOCAL_VER_RAW="$("$INSTALLED_BIN" --version 2>/dev/null || true)"
+    LOCAL_VER=$(printf '%s\n' "$LOCAL_VER_RAW" | awk '{print $NF}' | sed 's/^v//')
+    LOCAL_VER_KNOWN=true
+    printf '%s' "$LOCAL_VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' || LOCAL_VER_KNOWN=false
+
+    # 3. 代理前缀解析（复用迭代25 语义：ROXID_GH_PROXY env 非空即用跳过
+    #    问句，否则交互兜底默认空=直连；尾斜杠卫生；直链不拼代理）
+    GH_PROXY=''
+    if [ -z "${ROXID_DOWNLOAD_URL:-}" ]; then
+        if [ -n "${ROXID_GH_PROXY:-}" ]; then
+            GH_PROXY="$ROXID_GH_PROXY"
+        else
+            ask_with_default "GitHub 代理前缀（回车直连）: " ""
+            GH_PROXY="$REPLY"
+        fi
+        case "$GH_PROXY" in
+            ''|*/) ;;
+            *) GH_PROXY="$GH_PROXY/" ;;
+        esac
+    fi
+
+    # 4. 检测工具前置（curl 检测+下载共用；awk 版本解析与比较）
+    NEEDS=$(require curl awk)
+    if [ -n "$NEEDS" ]; then
+        status "错误: 以下工具缺失，无法更新:"
+        for NEED in $NEEDS; do
+            echo "  - $NEED"
+        done
+        exit 1
+    fi
+
+    if [ -n "${ROXID_DOWNLOAD_URL:-}" ]; then
+        # 5a. 直链模式（D6：直链用户自控版本语义，脚本不代判——远程版本
+        #     未知，默认 N 询问是否直接下载该直链覆盖）
+        status "本机版本: ${LOCAL_VER:-未知}"
+        status "远程版本: 未知（ROXID_DOWNLOAD_URL 直链模式，无法检测最新版本）"
+        ask_with_default "是否直接下载该直链覆盖安装? [y/N]: " "N"
+        case "$REPLY" in
+            y|Y|yes) ;;
+            *) status "已取消更新。"; exit 0 ;;
+        esac
+        DOWNLOAD_URL=$(resolve_remote_url)
+    else
+        # 5b. latest 重定向解析取 tag（裁决 Q3 08:12：与基地址同域，代理
+        #     前缀与自建镜像覆盖天然兼容；--max-time 15 超时护栏）
+        REDIRECT_URL=$(curl -fsS -o /dev/null -w '%{redirect_url}' --max-time 15 \
+            "${GH_PROXY}${ROXID_RELEASE_BASE}/latest" 2>/dev/null || true)
+        REMOTE_TAG=''
+        case "$REDIRECT_URL" in
+            */tag/*) REMOTE_TAG="${REDIRECT_URL##*/tag/}" ;;
+        esac
+        # 尾段清理：去查询参数与路径残余，再校验 tag 形态（v?X.Y.Z 起头）
+        REMOTE_TAG=$(printf '%s' "$REMOTE_TAG" | cut -d'?' -f1 | cut -d'/' -f1)
+        printf '%s' "$REMOTE_TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+' \
+            || error "无法获取最新版本（重定向未指向有效 tag）。可设置 ROXID_GH_PROXY 代理前缀后重试。"
+        REMOTE_VER="${REMOTE_TAG#v}"
+        status "本机版本: ${LOCAL_VER:-未知}"
+        status "最新版本: $REMOTE_VER"
+
+        if [ "$LOCAL_VER_KNOWN" = true ]; then
+            if ! version_lt "$LOCAL_VER" "$REMOTE_VER"; then
+                status "已是最新版本，无需更新。"
+                exit 0
+            fi
+            ask_with_default "是否更新到 $REMOTE_TAG? [Y/n]: " "Y"
+        else
+            # D9 兜底：本机存在但版本解析失败——展示原始输出，默认 N 慎重询问
+            warning "无法解析本机版本（原始输出: ${LOCAL_VER_RAW:-空}）。"
+            ask_with_default "是否仍更新到 $REMOTE_TAG? [y/N]: " "N"
+        fi
+        case "$REPLY" in
+            n|N|no) status "已取消更新。"; exit 0 ;;
+        esac
+        # 下载固定 tag（非 latest）——消除检测与下载间的版本竞态（D7）
+        ROXID_VERSION="$REMOTE_TAG"
+        DOWNLOAD_URL=$(resolve_remote_url)
+    fi
+
+    # 6. 下载与解压（与安装远程分支同构：形态判定 + TEMP_DIR 中转 + find 定位）
+    REMOTE_NEEDS="tar"
+    case "$DOWNLOAD_URL" in
+        *.tar.zst) REMOTE_NEEDS="tar zstd" ;;
+    esac
+    NEEDS=$(require $REMOTE_NEEDS)
+    if [ -n "$NEEDS" ]; then
+        status "错误: 以下工具缺失，无法下载更新:"
+        for NEED in $NEEDS; do
+            echo "  - $NEED"
+        done
+        exit 1
+    fi
+    if [ -n "$GH_PROXY" ]; then
+        status "GitHub 代理前缀: $GH_PROXY"
+    fi
+    status "下载地址: $DOWNLOAD_URL"
+    mkdir -p "$TEMP_DIR/unpack"
+    case "$DOWNLOAD_URL" in
+        *.tar.gz|*.tgz)
+            curl --fail --show-error --location --progress-bar \
+                -o "$TEMP_DIR/roxid-pkg.tgz" "$DOWNLOAD_URL"
+            tar -xzf "$TEMP_DIR/roxid-pkg.tgz" -C "$TEMP_DIR/unpack"
+            BIN_SRC=$(find "$TEMP_DIR/unpack" -type f -name roxid | head -n 1)
+            [ -n "$BIN_SRC" ] || error "压缩包内未找到 roxid 二进制。"
+            ;;
+        *.tar.zst)
+            curl --fail --show-error --location --progress-bar \
+                -o "$TEMP_DIR/roxid-pkg.tar.zst" "$DOWNLOAD_URL"
+            zstd -d -c "$TEMP_DIR/roxid-pkg.tar.zst" | tar -xf - -C "$TEMP_DIR/unpack"
+            BIN_SRC=$(find "$TEMP_DIR/unpack" -type f -name roxid | head -n 1)
+            [ -n "$BIN_SRC" ] || error "压缩包内未找到 roxid 二进制。"
+            ;;
+        *)
+            curl --fail --show-error --location --progress-bar \
+                -o "$TEMP_DIR/roxid" "$DOWNLOAD_URL"
+            BIN_SRC="$TEMP_DIR/roxid"
+            ;;
+    esac
+
+    # 7. 先替换（裁决 Q5 08:21：运行中进程持旧 inode 不受影响；仅系统全局
+    #    落位需 sudo（对齐安装系统级语义）；其余目标直写——无写权限时由
+    #    install 失败 fail-fast）
+    UPDATE_FROM="${LOCAL_VER:-未知}"
+    status "替换 $INSTALLED_BIN ..."
+    case "$INSTALLED_BIN" in
+        /usr/local/bin/*)
+            UPDATE_SUDO=
+            if [ "$(id -u)" -ne 0 ]; then
+                available sudo || error "系统全局更新需要 root 权限。请以 root 运行，或安装 sudo 后重试。"
+                UPDATE_SUDO="sudo"
+            fi
+            $UPDATE_SUDO install -o0 -g0 -m755 "$BIN_SRC" "$INSTALLED_BIN"
+            ;;
+        *)
+            install -m755 "$BIN_SRC" "$INSTALLED_BIN"
+            ;;
+    esac
+    [ -x "$INSTALLED_BIN" ] || error "落位校验失败: $INSTALLED_BIN 不可执行"
+    # 替换后实测新版本号（直链模式同样可得真实版本）
+    UPDATE_TO="$("$INSTALLED_BIN" --version 2>/dev/null | awk '{print $NF}' || printf '未知')"
+
+    # 8. 后终止（裁决 Q4 08:17 + Q5 08:21：仅运行中询问，默认 Y；systemd
+    #    服务场景 RestartSec=3 后由 Restart=always 自动以新二进制拉起）
+    if available pgrep && pgrep -x roxid >/dev/null 2>&1; then
+        warning "检测到 roxid 正在运行（新版本已就位，重启后生效）。"
+        ask_with_default "终止运行中的 roxid 使新版本生效? [Y/n]: " "Y"
+        case "$REPLY" in
+            n|N|no)
+                warning "已保留运行中的旧版本进程。新版本将在 roxid 下次启动时生效。"
+                ;;
+            *)
+                pkill -x roxid 2>/dev/null || true
+                sleep 2
+                status "运行中的 roxid 已终止。"
+                ;;
+        esac
+    fi
+}
+
+# 更新收尾提示（与安装/卸载收尾对称；不经 trap——更新在安装 trap 设置点
+# 之前分流退出，直接调用即可；对齐 uninstall 先例）
+update_success() {
+    separator
+    status "✓ roxid 已更新: ${UPDATE_FROM:-未知} → ${UPDATE_TO:-未知}"
+    status "可执行文件: $INSTALLED_BIN"
+    status "复核版本: roxid -v"
+    status "若 roxid 以 systemd 服务运行，服务将自动以新版本重启（Restart=always）；前台运行的 roxid 请手动重新启动。"
+    separator
+}
+
+###########################################
+# 入口分流（迭代22 + 迭代39）：--uninstall/-u 直达卸载；--update 直达更新；
+# 无参数交互菜单先问「安装/卸载/更新」（回车默认安装，等价迭代21 无参数
+# 行为）；未知参数 error（迭代22 裁决 Q1 2026-09-10 01:57 + 迭代39 D1/D2：
+# 更新入口仅 --update 全拼，-u 已被卸载占用不加短参避免混淆；菜单别名
+# 3/update/U——大写 U 区别于小写 u=uninstall）
 ###########################################
 
 MODE=install
 case "${1:-}" in
     --uninstall|-u) MODE=uninstall ;;
+    --update) MODE=update ;;
     "") ;;
-    *) error "未知参数: $1（可选: --uninstall 卸载；无参数进入交互菜单）" ;;
+    *) error "未知参数: $1（可选: --uninstall 卸载；--update 更新；无参数进入交互菜单）" ;;
 esac
 
 if [ "$MODE" = "install" ] && [ -z "${1:-}" ]; then
     while true; do
-        ask_with_default "执行操作 [1]安装 roxid  [2]卸载 roxid（默认: 1）: " "1"
+        ask_with_default "执行操作 [1]安装 roxid  [2]卸载 roxid  [3]更新 roxid（默认: 1）: " "1"
         case "$REPLY" in
             1|install|i) break ;;
             2|uninstall|u) MODE=uninstall; break ;;
-            *) warning "无效输入: $REPLY（可选 1/2/install/uninstall）" ;;
+            3|update|U) MODE=update; break ;;
+            *) warning "无效输入: $REPLY（可选 1/2/3/install/uninstall/update）" ;;
         esac
     done
 fi
@@ -442,6 +713,12 @@ fi
 if [ "$MODE" = "uninstall" ]; then
     uninstall_flow
     uninstall_success
+    exit 0
+fi
+
+if [ "$MODE" = "update" ]; then
+    update_flow
+    update_success
     exit 0
 fi
 
@@ -529,25 +806,8 @@ fi
 # 远程下载分支（D3/D4：直链优先 > 占位基地址；tar/裸二进制形态判定）
 ###########################################
 
-# 解析最终下载 URL 并输出；无法解析（两处地址皆空）时返回非 0
-# 迭代25：直链分支原样返回不拼代理（Q2 裁决 2026-09-10 03:18）；Releases 分支前置
-# 拼接 GH_PROXY（Q1 裁决 03:17，语义同软件本体 download.rs asset_url 的直接字符串
-# 拼接；GH_PROXY 为空即直连，与现状一致）
-resolve_remote_url() {
-    if [ -n "${ROXID_DOWNLOAD_URL:-}" ]; then
-        printf '%s\n' "$ROXID_DOWNLOAD_URL"
-        return 0
-    fi
-    if [ -z "$ROXID_RELEASE_BASE" ]; then
-        return 1
-    fi
-    ROXID_VER="${ROXID_VERSION:-latest}"
-    if [ "$ROXID_VER" = "latest" ]; then
-        printf '%s\n' "${GH_PROXY}${ROXID_RELEASE_BASE}/latest/download/roxid-linux-$ARCH.tar.gz"
-    else
-        printf '%s\n' "${GH_PROXY}${ROXID_RELEASE_BASE}/download/$ROXID_VER/roxid-linux-$ARCH.tar.gz"
-    fi
-}
+# resolve_remote_url 定义已位移至入口分流之前（迭代39：update_flow 复用，
+# POSIX sh 自顶向下执行需定义先于全部调用点；函数体逐字未动，此处不再重复定义）
 
 if [ "$SOURCE" = "remote" ]; then
     # GitHub 代理前缀解析（迭代25，裁决 Q1 2026-09-10 03:17）：
@@ -674,17 +934,22 @@ fi
 # enable --now 成功才置 1（set -eu 下失败即中止到不了置位行）；install_success 据
 # 此分支——未启动（探测跳过/用户拒绝创建/无 systemctl）时不再虚假宣称 API 已可用
 SERVICE_STARTED=0
+# 监听地址全局初值（迭代40 D4）：默认 127.0.0.1 仅本机；确认创建服务时由
+# resolve_serve_addr 按问句/环境变量结果覆盖；未创建服务路径保持默认，
+# install_success 收尾断言行据此动态输出（127 路径输出与既有逐字一致）
+SERVE_ADDR="127.0.0.1"
+SERVE_ADDR_NOTE=""
 
 install_success() {
     separator
     if [ "$SERVICE_STARTED" -eq 1 ]; then
         status "✓ roxid 服务已启动。"
-        status 'The roxid API is now available at 127.0.0.1:11434.'
+        status "The roxid API is now available at ${SERVE_ADDR}:11434${SERVE_ADDR_NOTE}."
     else
         status '未配置 roxid 自启动服务。手动启动方式：'
         status "  前台运行: $BINDIR/roxid serve"
         status '  或重新运行本脚本，在 systemd 服务询问处选择 y 创建并启动'
-        status '服务启动后 API 监听 127.0.0.1:11434。'
+        status "服务启动后 API 监听 ${SERVE_ADDR}:11434${SERVE_ADDR_NOTE}。"
     fi
     status "安装完成。可执行文件: $BINDIR/roxid"
     status '首次运行 roxid 将进入 setup 引导（llama.cpp 后端下载源配置）。'
@@ -695,6 +960,37 @@ trap install_success EXIT
 ###########################################
 # systemd 服务（两级可选，默认 N；确认创建才 enable --now）
 ###########################################
+
+# 监听地址解析（迭代40，三项裁决 2026-09-11 08:51–08:52）：仅在两级 configure_*
+# 确认创建服务之后调用；ROXID_SERVE_ADDR 环境变量优先（二选一白名单，非法值
+# error fail-fast——D3），未设置走交互问句（回车默认 127.0.0.1 仅本机——D1）；
+# 结果写入全局 SERVE_ADDR/SERVE_ADDR_NOTE，unit 写入与 install_success 收尾
+# 断言共用同一事实源（D2/D4）；两级服务问句文案逐字一致
+resolve_serve_addr() {
+    if [ -n "${ROXID_SERVE_ADDR:-}" ]; then
+        case "$ROXID_SERVE_ADDR" in
+            127.0.0.1) SERVE_ADDR="127.0.0.1" ;;
+            0.0.0.0) SERVE_ADDR="0.0.0.0" ;;
+            *) error "ROXID_SERVE_ADDR 无效值: $ROXID_SERVE_ADDR（可选 127.0.0.1/0.0.0.0）" ;;
+        esac
+        status "监听地址（来自环境变量）: $SERVE_ADDR"
+    else
+        while true; do
+            ask_with_default "监听地址 [1]127.0.0.1 仅本机  [2]0.0.0.0 局域网可访问（默认: 1）: " "1"
+            case "$REPLY" in
+                1) SERVE_ADDR="127.0.0.1"; break ;;
+                2) SERVE_ADDR="0.0.0.0"; break ;;
+                *) warning "无效输入: $REPLY（可选 1/2）" ;;
+            esac
+        done
+    fi
+    # 0.0.0.0 时附注记（收尾断言行拼接「（局域网可访问）」）；127 路径注记为空，
+    # 输出与既有基线逐字一致。if 形式防 set -eu 下 && 短路假退出（对齐迭代34 先例）
+    SERVE_ADDR_NOTE=""
+    if [ "$SERVE_ADDR" = "0.0.0.0" ]; then
+        SERVE_ADDR_NOTE="（局域网可访问）"
+    fi
+}
 
 # 系统实例服务以"安装发起用户"身份运行（roxid 数据目录绑定 ~/.roxid/，须与交互 CLI 一致）
 # root（sudo）执行时回退到 SUDO_USER 原用户，避免服务落在 /root/.roxid
@@ -722,13 +1018,19 @@ configure_systemd_system() {
     esac
 
     status "创建系统实例服务（运行用户: $SERVICE_USER，数据目录: $SERVICE_HOME/.roxid）..."
+    resolve_serve_addr
+    # 仅 0.0.0.0 显式写 --addr；默认路径不加参数，unit 与既有部署逐字一致（D2 最小写入）
+    EXEC_START="$BINDIR/roxid serve"
+    if [ "$SERVE_ADDR" = "0.0.0.0" ]; then
+        EXEC_START="$EXEC_START --addr 0.0.0.0:11434"
+    fi
     cat <<EOF | $SUDO tee /etc/systemd/system/roxid.service >/dev/null
 [Unit]
 Description=roxid Service
 After=network-online.target
 
 [Service]
-ExecStart=$BINDIR/roxid serve
+ExecStart=$EXEC_START
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 Restart=always
@@ -754,6 +1056,12 @@ configure_systemd_user() {
     esac
 
     status "创建用户实例服务（systemctl --user，无需 root）..."
+    resolve_serve_addr
+    # 仅 0.0.0.0 显式写 --addr；默认路径不加参数，unit 与既有部署逐字一致（D2 最小写入）
+    EXEC_START="$BINDIR/roxid serve"
+    if [ "$SERVE_ADDR" = "0.0.0.0" ]; then
+        EXEC_START="$EXEC_START --addr 0.0.0.0:11434"
+    fi
     USER_UNIT_DIR="$HOME/.config/systemd/user"
     mkdir -p "$USER_UNIT_DIR"
     cat > "$USER_UNIT_DIR/roxid.service" <<EOF
@@ -762,7 +1070,7 @@ Description=roxid Service
 After=network-online.target
 
 [Service]
-ExecStart=$BINDIR/roxid serve
+ExecStart=$EXEC_START
 Restart=always
 RestartSec=3
 Environment="PATH=$PATH"

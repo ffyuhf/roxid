@@ -1,4 +1,4 @@
-# Installation & Uninstall
+# Installation, Update & Uninstall
 
 English | [中文](zh/installation.md)
 
@@ -34,12 +34,13 @@ You can also use [`roxid_install.sh`](../roxid_install.sh) from the repository r
 ### Interactive flow
 
 ```text
-执行操作 [1]安装 roxid  [2]卸载 roxid（默认: 1）:           ← Enter = install
+执行操作 [1]安装 roxid  [2]卸载 roxid  [3]更新 roxid（默认: 1）: ← Enter = install
 安装范围 [1]系统全局 /usr/local/bin  [2]用户级 ~/.local/bin: ← default 1 as root, 2 otherwise
 二进制来源 [1]本地构建产物  [2]远程下载（默认: 1）:          ← local defaults to target/release/roxid
 本地 roxid 路径（回车使用默认）:                            ← asked only when source = local
 GitHub 代理前缀（回车直连）:                                ← asked only when source = remote and neither
-                                                            ROXID_GH_PROXY nor ROXID_DOWNLOAD_URL is set
+                                                             ROXID_GH_PROXY nor ROXID_DOWNLOAD_URL is set
+监听地址 [1]127.0.0.1 仅本机  [2]0.0.0.0 局域网可访问（默认: 1）: ← asked only after confirming service creation
 ```
 
 - **Install scope**: system-wide lands in `/usr/local/bin` (sudo added automatically for non-root); user-level lands in `~/.local/bin` (no sudo at all).
@@ -54,7 +55,7 @@ GitHub 代理前缀（回车直连）:                                ← asked 
 | System instance | system-wide install + systemd running | `/etc/systemd/system/roxid.service` | Runs as the **installing user** (falls back to `SUDO_USER` when run via sudo, so the data dir stays on that user's `~/.roxid`); needs sudo; `Restart=always` |
 | User instance | user-level install + `systemctl --user` available | `~/.config/systemd/user/roxid.service` | No root required; starts and stops with the login session; optional `loginctl enable-linger` prompt (default N) for run-without-login |
 
-Both use `ExecStart=<BINDIR>/roxid serve` and only run `enable --now` upon explicit confirmation.
+Both only run `enable --now` upon explicit confirmation, then prompt for the listen address: `127.0.0.1` (local only, default) or `0.0.0.0` (LAN reachable). The default path writes `ExecStart=<BINDIR>/roxid serve` (serve's built-in default `127.0.0.1:11434`); choosing `0.0.0.0` writes `ExecStart=<BINDIR>/roxid serve --addr 0.0.0.0:11434`. Re-run the installer and confirm service creation again to change the address (the update flow never touches the unit).
 
 ### Non-interactive install (CI / scripting)
 
@@ -69,6 +70,7 @@ Set environment variables to skip the corresponding prompts:
 | `ROXID_VERSION` | tag (default `latest`) | Combined with the built-in release base |
 | `ROXID_GH_PROXY` | proxy prefix | GitHub proxy prefix prepended to the built-in release base URLs (same semantics as the roxid runtime variable); when set, the proxy prompt is skipped |
 | `ROXID_RELEASE_BASE` | release base URL | Overrides the built-in release base (self-hosted mirror) |
+| `ROXID_SERVE_ADDR` | `127.0.0.1` / `0.0.0.0` | systemd service listen address (applies when service creation is confirmed; skips the address prompt when set, invalid values abort) |
 
 ## Option 2: Manual binary install
 
@@ -111,16 +113,23 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile   # or ~/.bashrc
 
 Log in again for it to take effect. Verify with `roxid -v`.
 
-## Upgrading
-
-Upgrading = re-run the installer (`install -m755` naturally overwrites the old version):
+## Updating (auto-detect and update)
 
 ```sh
-sh roxid_install.sh                        # remote source + latest picks the newest
-ROXID_VERSION=v0.2.0 sh roxid_install.sh   # pin a version
+sh roxid_install.sh --update   # or choose 3 in the menu
 ```
 
-If roxid is running during an overwrite install, the script terminates it before continuing (default Y).
+The update flow replaces only the binary itself — no service-creation prompt, no touching of data/completions/configs:
+
+1. **Locate the installed roxid**: PATH hit first, then `/usr/local/bin/roxid`, `~/.local/bin/roxid`; the detected path is the replace target (sudo is added automatically for system-wide targets).
+2. **Detect the latest version**: request `${ROXID_GH_PROXY}${ROXID_RELEASE_BASE}/latest` and read the tag from the 302 redirect tail (same domain as downloads, so proxy prefixes and self-hosted mirrors work natively; the proxy source matches the remote install branch — a preset `ROXID_GH_PROXY` skips the prompt, otherwise it is asked with direct connection as the default).
+3. **Compare versions**: prints "local version vs latest version"; exits if already up to date; asks "update to vX.Y.Z? [Y/n]" (default Y) when behind.
+4. **Apply the update**: downloads the **pinned tag** asset (eliminating the race between detection and download) → unpack → **replace in place first** (running processes keep the old inode and are unaffected) → **then ask to terminate** (default Y; a systemd service is automatically restarted on the new binary by `Restart=always`, foreground instances need a manual restart).
+5. If the local version cannot be parsed, the raw output is shown and a cautious "still update? [y/N]" (default N) is asked.
+
+With a `ROXID_DOWNLOAD_URL` direct link the latest version cannot be detected: the local version is shown, then a default-N prompt asks whether to download that link and overwrite.
+
+The manual path still works: re-run the installer (`install -m755` naturally overwrites; `ROXID_VERSION=v0.2.0` pins a version).
 
 ## Uninstall and cleanup
 
