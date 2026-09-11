@@ -64,9 +64,86 @@ use super::backend::diagnose_arch_mismatch;
 use crate::config::llama_runtime_root;
 use crate::error::{RoxidError, RoxidResult};
 
-/// 版本锁定的 llama.cpp 构建 tag（来源：用户确认 2026-08-24 18:49 b10605
-/// 为当时最新；2026-09-10 07:15 用户指示硬编码升级为 b10883，覆盖旧裁决）
-pub const LOCKED_LLAMA_CPP_TAG: &str = "b10883";
+/// 从 Releases JSON 数组选取最新预发布 tag（迭代46 M173）：过滤
+/// prerelease==true 且 draft==false，按 created_at 降序取首个 tag_name
+///（用户 curl 命令 jq 管道的 Rust 等价实现；抽纯函数供单测锚定语义）。
+///
+/// - 参数 releases：GitHub Releases 列表（已解析 JSON）
+/// - 返回：最新 tag_name（无候选 None）
+fn pick_latest_prerelease_tag(releases: &[serde_json::Value]) -> Option<String> {
+    let mut candidates: Vec<(&str, &str)> = releases
+        .iter()
+        .filter(|r| r["prerelease"].as_bool() == Some(true) && r["draft"].as_bool() != Some(true))
+        .filter_map(|r| Some((r["tag_name"].as_str()?, r["created_at"].as_str()?)))
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(a.1));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(tag, _)| tag.to_string())
+}
+
+/// 查询 llama.cpp 官方 GitHub Releases 最新预发布版本 tag（迭代46 M173，
+/// 用户裁决 2026-09-12 02:06 提供 curl 命令 / 02:17 下载时才查 / 02:41
+/// 完整逻辑确认）：GET releases 列表，过滤 prerelease==true 且
+/// draft==false，按 created_at 降序取首个 tag_name——curl+jq 管道的
+/// Rust 等价实现。重试语义对齐 M32/M49：3 次指数退避，4xx 确定性失败
+/// （429 限流除外）快速报错；无任何写死兜底值（用户裁决 02:11）。
+///
+/// - 返回：最新预发布 tag（如 "b10909"，经 is_valid_tag 校验）
+async fn latest_llama_cpp_tag() -> RoxidResult<String> {
+    const API_URL: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100";
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| RoxidError::RegistryRequest(format!("构建 HTTP 客户端失败：{e}")))?;
+    let mut last_error = String::new();
+    for attempt in 1..=3 {
+        match client
+            .get(API_URL)
+            .header("User-Agent", "roxid")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let releases: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
+                    RoxidError::RegistryRequest(format!("解析 Releases 响应失败：{e}"))
+                })?;
+                return match pick_latest_prerelease_tag(&releases) {
+                    Some(tag) if is_valid_tag(&tag) => Ok(tag),
+                    Some(tag) => Err(RoxidError::RegistryRequest(format!(
+                        "最新版本 tag 非法：{tag}"
+                    ))),
+                    None => Err(RoxidError::RegistryRequest(
+                        "GitHub Releases 无预发布版本（prerelease 均为 false）".into(),
+                    )),
+                };
+            }
+            // M49 语义：4xx 确定性失败快速报错；429 限流属瞬态保留重试
+            Ok(resp) if resp.status().is_client_error() && resp.status().as_u16() != 429 => {
+                return Err(RoxidError::RegistryRequest(format!(
+                    "查询 GitHub Releases 失败：HTTP {}（第 {attempt}/3 次）",
+                    resp.status().as_u16()
+                )));
+            }
+            Ok(resp) => last_error = format!("HTTP {}", resp.status().as_u16()),
+            Err(e) => last_error = format!("{e}"),
+        }
+        if attempt < 3 {
+            let backoff = Duration::from_secs(1u64 << (attempt - 1));
+            tracing::warn!(
+                "查询 llama.cpp 最新版本失败（{last_error}），{backoff:?} 后重试（{attempt}/3）"
+            );
+            tokio::time::sleep(backoff).await;
+        }
+    }
+    Err(RoxidError::RegistryRequest(format!(
+        "查询 llama.cpp 最新版本失败（{last_error}）。可手动安装：roxid runtime install \
+         --llama-url <包地址>；或设置 gh 代理（ROXID_GH_PROXY env / config [proxy].gh）后重试"
+    )))
+}
 
 /// 覆盖运行时二进制的环境变量（来源：用户确认 2026-08-24 18:51 Q10 方案 B：
 /// 用户自编译 CUDA 版 llama-server 时直接复用）
@@ -173,7 +250,7 @@ pub fn is_valid_tag(tag: &str) -> bool {
 /// android bionic 包 e_machine 同为 0xb7 不受影响）。
 ///
 /// - 参数 bin：已装 llama-server 路径
-/// - 参数 ctx：报错文案上下文（如 "锁定链 b10883 变体 ubuntu-arm64"）
+/// - 参数 ctx：报错文案上下文（如 "最新版 b10909 变体 ubuntu-arm64"）
 /// - 返回：Ok(()) 放行；Err 确认不匹配（含 rm 重装 / env 逃生口指引）
 fn ensure_arch_matches(bin: &std::path::Path, ctx: &str) -> RoxidResult<()> {
     if let Some((bin_arch, host_arch)) = diagnose_arch_mismatch(bin) {
@@ -197,7 +274,9 @@ fn arch_ok(bin: &std::path::Path) -> bool {
 /// 确保 llama-server 可用并返回其路径。
 /// 优先级（M36 更新）：ROXID_LLAMA_SERVER 环境变量 → manual 手动版本
 /// （setup --llama-url 安装）→ config default_version 指定版本的变体缓存
-/// （未安装则告警回退）→ 锁定链（缓存 → 下载解压；M95 起 b10883）。
+/// （未安装则告警回退）→ 在线最新版兜底链（查 GitHub API 最新预发布
+/// tag；已装复用/未装下载，落定写 default_version 设默认。迭代46 M173
+/// 起替代原锁定链；历史：b10605 → b10883（M95）→ 删除）。
 /// M99（迭代31）：各分支命中已装缓存时 ELF 架构校验，不匹配报 ArchMismatch。
 ///
 /// - 参数 backend_variant：探测得到的变体片段（Backend::asset_variant()）
@@ -223,7 +302,7 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
         ensure_arch_matches(&manual, "manual 手动版本")?;
         return Ok(manual);
     }
-    // 3) M36：config default_version 指定版本优先于锁定链（use 命令的生效点）
+    // 3) M36：config default_version 指定版本优先于兜底链（use 命令的生效点）
     if let Some(tag) = crate::config::load_persist_config()
         .runtime
         .default_version
@@ -234,38 +313,43 @@ pub async fn ensure_llama_server(backend_variant: &str) -> RoxidResult<PathBuf> 
             ensure_arch_matches(&server, &format!("默认版本 {tag} 变体 {backend_variant}"))?;
             return Ok(server);
         }
-        // 指定版本未安装（如被手删目录）：告警回退锁定链，不硬失败
-        tracing::warn!(
-            "默认后端版本 {tag} 的变体 {backend_variant} 未安装，回退 {LOCKED_LLAMA_CPP_TAG} 锁定链"
-        );
+        // 指定版本未安装（如被手删目录）：告警回退在线兜底链，不硬失败
+        tracing::warn!("默认后端版本 {tag} 的变体 {backend_variant} 未安装，回退在线最新版兜底链");
     }
-    // 4) 锁定链（M95 起 b10883）：缓存命中直接复用，未命中下载解压落位
-    let server = variant_cache_dir(backend_variant, LOCKED_LLAMA_CPP_TAG).join("llama-server");
+    // 4) 兜底链（迭代46 M173：删除硬编码锁定 tag，用户裁决 2026-09-12
+    //    02:06「不再硬编码」/02:11「下载时才查」/02:17「下载最新版并设
+    //    置为默认」/02:41 完整逻辑确认）——查 GitHub API 最新预发布版本；
+    //    已装该版本复用，未装下载；落定后写 default_version 设为默认，
+    //    下次启动走第3层命中不再联网
+    let tag = latest_llama_cpp_tag().await?;
+    let server = variant_cache_dir(backend_variant, &tag).join("llama-server");
     if server.is_file() {
-        ensure_arch_matches(
-            &server,
-            &format!("锁定链 {LOCKED_LLAMA_CPP_TAG} 变体 {backend_variant}"),
-        )?;
-        return Ok(server);
+        ensure_arch_matches(&server, &format!("最新版 {tag} 变体 {backend_variant}"))?;
+    } else {
+        // M105（迭代32 碴6a）：serve 自动下载场景进度——5s 周期日志（无
+        // TTY 无 spinner，原全程静默）；CLI 显式安装场景由调用方传渲染回调
+        install_version(&tag, backend_variant, periodic_log_progress()).await?;
     }
-    // M105（迭代32 碴6a）：serve 自动下载场景进度——5s 周期日志（无 TTY
-    // 无 spinner，原全程静默）；CLI 显式安装场景由调用方传渲染回调
-    install_version(
-        LOCKED_LLAMA_CPP_TAG,
-        backend_variant,
-        periodic_log_progress(),
-    )
-    .await?;
+    // 设为默认版本（用户裁决 02:17「设置为默认」）：写 config 让后续启动
+    // 直接走第3层命中；写失败仅告警不阻断——缓存已就位，无行为差异
+    let mut cfg = crate::config::load_persist_config();
+    if cfg.runtime.default_version.as_deref() != Some(tag.as_str()) {
+        cfg.runtime.default_version = Some(tag.clone());
+        if let Err(e) = crate::config::save_persist_config(&cfg) {
+            tracing::warn!("设置默认版本 {tag} 失败（非致命）：{e}");
+        }
+    }
     Ok(server)
 }
 
 /// resolve-only 路径解析（M54b 碴B）：按 ensure_llama_server 同序链
-/// （env → manual → default_version 已装 → 锁定链缓存，M95 起 b10883）解析当前
+/// （env → manual → default_version 已装 → 兜底 None 放行——迭代46
+/// M174 起原锁定链缓存检查移除，零网络函数不查在线 tag）解析当前
 /// 应然二进制路径，仅存在性检查、零下载零网络。scheduler 复用判定用它
 /// 与实例记录路径比对，不一致（runtime use 切换默认版本 / env 改指向）
 /// 时触发重建——碴B修复：原仅 ctx/RUNTIME 双键，后端版本切换后运行
 /// 实例无感知，keep_alive 窗口内一直用旧版本跑。
-/// 与 ensure 的差异面（调用方语义）：env 指向不存在或锁定链未缓存时
+/// 与 ensure 的差异面（调用方语义）：env 指向不存在或兜底链未落定时
 /// 返回 None 而非报错/下载——调用方按「不可比对」保守放行，加载路径
 /// 仍由 ensure 完整链兜底；链序与命中判定必须与 ensure 保持逐字一致
 /// （双链漂移防护：修改任一处须同步另一处）。
@@ -287,8 +371,8 @@ pub fn resolve_llama_server_path(backend_variant: &str) -> Option<PathBuf> {
     if manual.is_file() {
         return arch_ok(&manual).then_some(manual);
     }
-    // 3) config default_version 指定版本（仅已装命中；未装回退锁定链，
-    //    不打 warn——本函数每请求调用，告警刷屏；留痕由 ensure 承担；
+    // 3) config default_version 指定版本（仅已装命中；未装落第4步 None
+    //    放行，不打 warn——本函数每请求调用，告警刷屏；留痕由 ensure 承担；
     //    M99：已装但不匹配 → None 终止（ensure 同分支 Err 终止，对齐））
     if let Some(tag) = crate::config::load_persist_config()
         .runtime
@@ -300,10 +384,11 @@ pub fn resolve_llama_server_path(backend_variant: &str) -> Option<PathBuf> {
             return arch_ok(&server).then_some(server);
         }
     }
-    // 4) 锁定链缓存（M95 起 b10883；未缓存 None——不下载，下载由 ensure 承担；
-    //    M99：已缓存但不匹配同样 None）
-    let server = variant_cache_dir(backend_variant, LOCKED_LLAMA_CPP_TAG).join("llama-server");
-    server.is_file().then_some(server).filter(|p| arch_ok(p))
+    // 4) 兜底链（迭代46 M174：硬编码锁定 tag 已删除；本函数设计上零网络
+    //    零下载，无本地可判定的兜底版本——返回 None 保守放行，加载路径
+    //    由 ensure 完整链查最新版并落 default_version；用户裁决 2026-09-12
+    //    02:41「resolve 第4步找不到就返回『没有』，真正下载由 ensure 负责」）
+    None
 }
 
 /// 手动版本缓存目录：{roxid_home}/llama.cpp/manual（R2 裁决：单目录不分变体）
@@ -858,6 +943,28 @@ mod tests {
         assert!(!is_valid_tag(""));
     }
 
+    /// 迭代46 M173：GitHub Releases 最新预发布 tag 选取——prerelease
+    /// 过滤 / draft 排除 / created_at 降序 / 空候选 None（用户 curl 命令
+    /// jq 管道语义锚定，样本含晚于目标但非预发布与草稿的干扰项）
+    #[test]
+    fn pick_latest_prerelease_tag_semantics() {
+        let releases: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+              {"tag_name":"b10909","prerelease":true,"draft":false,"created_at":"2026-09-11T10:00:00Z"},
+              {"tag_name":"b10883","prerelease":true,"draft":false,"created_at":"2026-09-10T08:00:00Z"},
+              {"tag_name":"v1.0.0","prerelease":false,"draft":false,"created_at":"2026-09-11T12:00:00Z"},
+              {"tag_name":"b10910","prerelease":true,"draft":true,"created_at":"2026-09-11T11:00:00Z"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_latest_prerelease_tag(&releases).as_deref(),
+            Some("b10909"),
+            "v1.0.0 非预发布、b10910 为草稿，均排除；b10909 created_at 最新的合法候选"
+        );
+        assert_eq!(pick_latest_prerelease_tag(&[]), None, "空列表无候选");
+    }
+
     /// M36：list_installed 扫描 {tag}/{variant} 两级目录——manual 与
     /// .installing 残留不计入；空 tag 目录（无变体）不计入；结果按 tag 排序
     #[test]
@@ -943,8 +1050,10 @@ mod tests {
     }
 
     /// M31 F2 + M36：ensure_llama_server 优先级——manual 存在时优先于变体缓存
-    ///（不触发 b10605 自动下载链；env 逃生口语义维持在前）；
-    /// M36 扩展：default_version 已装时优先于锁定链缓存，未装回退锁定链
+    ///（不触发自动下载链；env 逃生口语义维持在前）；
+    /// M36 扩展：default_version 已装时优先于兜底链缓存；
+    /// 迭代46 M173：原「未装回退兜底链缓存」断言删除（第4步起先联网查
+    /// tag，API 返回值不定，离线不可锚定——在线回退由实机验收覆盖）
     #[tokio::test]
     async fn ensure_prefers_manual_over_variant_cache() {
         use crate::config::{save_persist_config, PersistConfig};
@@ -960,7 +1069,9 @@ mod tests {
         let manual = manual_dir();
         std::fs::create_dir_all(&manual).unwrap();
         std::fs::write(manual.join("llama-server"), b"manual-build").unwrap();
-        let variant = variant_cache_dir("ubuntu-vulkan-x64", LOCKED_LLAMA_CPP_TAG);
+        // 迭代46 M173：锁定常量已删除，改历史字面量锚定（本测试语义为
+        // manual 优先于变体缓存，tag 值无关紧要，不触第4步网络路径）
+        let variant = variant_cache_dir("ubuntu-vulkan-x64", "b10883");
         std::fs::create_dir_all(&variant).unwrap();
         std::fs::write(variant.join("llama-server"), b"variant-build").unwrap();
 
@@ -971,12 +1082,12 @@ mod tests {
             "manual 必须优先于变体缓存"
         );
 
-        // 删 manual 后回退变体缓存
+        // 迭代46 M173：原「删 manual 后回退兜底缓存」断言删除（第4步联网
+        // 查 tag 离线不可锚定，见函数 doc 注记）；删 manual 动作保留——
+        // 段3 需越过第2层验证 default_version 优先级
         std::fs::remove_dir_all(&manual).unwrap();
-        let fallback = ensure_llama_server("ubuntu-vulkan-x64").await.unwrap();
-        assert_eq!(fallback, variant.join("llama-server"));
 
-        // M36：default_version 指向已装 tag 时优先于锁定链缓存
+        // M36：default_version 指向已装 tag 时优先于兜底缓存
         let custom = variant_cache_dir("ubuntu-vulkan-x64", "b99999");
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(custom.join("llama-server"), b"b99999-build").unwrap();
@@ -993,17 +1104,11 @@ mod tests {
         assert_eq!(
             by_config,
             custom.join("llama-server"),
-            "default_version 已装时必须优先于锁定链"
+            "default_version 已装时必须优先于兜底缓存"
         );
 
-        // default_version 未装（目录被手删）→ 告警回退锁定链缓存
-        std::fs::remove_dir_all(&custom).unwrap();
-        let degraded = ensure_llama_server("ubuntu-vulkan-x64").await.unwrap();
-        assert_eq!(
-            degraded,
-            variant.join("llama-server"),
-            "default_version 未装必须回退锁定链而非硬失败"
-        );
+        // 迭代46 M173：原「default_version 未装回退兜底缓存」段删除
+        //（同上：第4步联网查 tag 离线不可锚定）
         std::fs::remove_dir_all(&dir).ok();
         std::env::remove_var("ROXID_HOME");
     }
@@ -1151,9 +1256,12 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
         h
     }
 
-    /// M99（迭代31，Q3 校验 2）：ensure 命中锁定链缓存时 ELF 架构校验——
+    /// M99（迭代31，Q3 校验 2）：ensure 命中已装版本缓存时 ELF 架构校验——
     /// 交叉架构假 llama-server 必须报 ArchMismatch（原实现放行到 spawn
     /// 阶段才裸报 os error 2），且报错即返回不触发下载。
+    /// 迭代46 M173：原「锁定链缓存」场景改经 default_version 通道构造
+    ///（锁定常量已删除、兜底链第4步先联网查 tag 无法离线构造）——
+    /// ensure 第3层同走 ensure_arch_matches，ELF 校验逻辑等价覆盖。
     /// allow：锁须跨 await 持有——ROXID_HOME 全局环境隔离的完整语义
     ///（与 registry.rs 存量测试同模式，清偿标准：不新增即挂账容忍）
     #[tokio::test]
@@ -1166,7 +1274,15 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("ROXID_HOME", &dir);
         std::env::remove_var(ENV_LLAMA_SERVER_OVERRIDE);
-        let variant = variant_cache_dir("ubuntu-x64", LOCKED_LLAMA_CPP_TAG);
+        crate::config::save_persist_config(&crate::config::PersistConfig {
+            runtime: crate::config::RuntimeSection {
+                default_version: Some("b99999".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("测试 config 写盘必须成功");
+        let variant = variant_cache_dir("ubuntu-x64", "b99999");
         std::fs::create_dir_all(&variant).unwrap();
         std::fs::write(variant.join("llama-server"), cross_arch_elf_header()).unwrap();
 
@@ -1188,6 +1304,9 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
     /// M99（迭代31）：resolve 双链同步——命中但交叉架构视为不可得（None），
     /// 调用方保守放行、诊断由 ensure 承担（既有分工维持）；
     /// 非 ELF 假二进制宽容面照常命中（不误伤自备非常规产物）。
+    /// 迭代46 M174：原「锁定链缓存」场景改经 default_version 通道构造
+    ///（resolve 第4步已改 None 放行——兜底链缓存不再被 resolve 检查，
+    /// 第3层 default_version 命中面维持 ELF 校验语义等价覆盖）。
     #[test]
     fn resolve_treats_arch_mismatch_as_unavailable() {
         let _guard = crate::config::ROXID_HOME_TEST_LOCK
@@ -1197,7 +1316,15 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("ROXID_HOME", &dir);
         std::env::remove_var(ENV_LLAMA_SERVER_OVERRIDE);
-        let variant = variant_cache_dir("ubuntu-x64", LOCKED_LLAMA_CPP_TAG);
+        crate::config::save_persist_config(&crate::config::PersistConfig {
+            runtime: crate::config::RuntimeSection {
+                default_version: Some("b99999".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("测试 config 写盘必须成功");
+        let variant = variant_cache_dir("ubuntu-x64", "b99999");
         std::fs::create_dir_all(&variant).unwrap();
 
         std::fs::write(variant.join("llama-server"), cross_arch_elf_header()).unwrap();

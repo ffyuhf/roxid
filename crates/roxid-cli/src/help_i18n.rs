@@ -1,6 +1,7 @@
-//! help 双语国际化（迭代20 M56）：`--help` 文本跟随用户 locale 动态显示
-//! （zh* → 中文，其余 → 英文），输出 GNU 风格完整帮助（用法行 + 平实描述
-//! + 逐选项说明 + 尾部详解段）。
+//! help 双语国际化（迭代20 M56 + 迭代47 M176/M177/M178）：`--help` 文本与
+//! 参数解析错误均跟随用户 locale 动态显示（zh* → 中文，其余 → 英文），
+//! 输出 GNU 风格完整帮助（用法行 + 平实描述 + 逐选项说明 + 尾部详解段；
+//! 全命令统一「说明独立成行」布局）。
 //!
 //! 裁决来源（用户确认 2026-09-09 21:28 Q1）：help 语言跟随用户语言环境，
 //! 不提供静态单语。locale 判定走 POSIX 惯例 LC_ALL → LC_MESSAGES → LANG，
@@ -11,8 +12,18 @@
 //! `parse_from` 之前递归覆盖 about / long_about / after_long_help 与参数
 //! help。命令树漂移防护：单测断言每个非隐藏子命令路径双语条目非空。
 //!
+//! 迭代47（M176/M177/M178，用户裁决链 2026-09-12 03:01–03:06）：
+//! - M176：`render_clap_error` 按 locale 渲染 clap 参数错误（错误行 +
+//!   用法行 + 提示行），退出码 2（GNU 惯例，Q3-A 裁决）；
+//! - M177：`localize_help_headings` 在渲染层将 help 输出的段落标题
+//!   （Usage:/Options:/Arguments:/Commands:）与 clap 自动生成的 -h
+//!   说明替换为中文（help flag 惰性注入，mut_arg 声明期不可及故走
+//!   渲染后处理——与标题替换同机制，零 parse 干扰）；
+//! - M178：命令树全量 `next_line_help(true)`——参数说明统一独立成行
+//!   （Q2-A 裁决，消除跨命令「同行/独立行」布局混杂）。
+//!
 //! 修改历史：M56 新增 2026-09-09 21-40（迭代19 已占用 M53–M55，
-//! 本迭代自 M56 起编号）
+//! 本迭代自 M56 起编号）；M176–M178 增补 2026-09-12 03-13（迭代47）
 
 use clap::Command;
 
@@ -772,7 +783,10 @@ fn apply_recursive(cmd: &mut Command, path: &str, lang: Lang) {
         builder = builder
             .about(h.about)
             .long_about(h.about)
-            .after_long_help(h.after);
+            .after_long_help(h.after)
+            // M178（Q2-A 裁决 2026-09-12 03:05）：参数说明统一独立成行，
+            // 消除 clap 自动布局在长短说明命令间的「同行/独立行」混杂
+            .next_line_help(true);
         for (id, help) in known_args {
             builder = builder.mut_arg(id, |a| a.help(help));
         }
@@ -781,6 +795,183 @@ fn apply_recursive(cmd: &mut Command, path: &str, lang: Lang) {
     for sub in cmd.get_subcommands_mut() {
         apply_recursive(sub, &format!("{path} {}", sub.get_name()), lang);
     }
+}
+
+// ==================== 错误输出双语（迭代47 M176/M177） ====================
+// 背景：clap 4 无内建错误 i18n，参数解析失败时 e.exit() 直接透出英文
+// （"error: the following required arguments..."），绕过 locale 判定链。
+// 本区按 ErrorKind + ContextKind 重建双语文案；覆盖范围与形态对齐
+// clap 原生输出（错误行 + 缩进上下文 + 用法行 + 提示行）。
+
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+/// 渲染 clap 参数错误为本地化文本（M176，纯函数便于单测）。
+///
+/// 结构对齐 clap 原生三段式：错误行（含上下文）→ 空行 + 用法行（zh 下
+/// 前缀「用法：」）→ 空行 + 提示行。表内 kind 双语渲染；表外 kind 与
+/// 上下文缺失的极端形态回退 clap 英文渲染（与 derive doc 英文兜底同哲学，
+/// 不吞上游信息）。
+///
+/// - 参数 e：clap 解析错误
+/// - 参数 lang：显示语言
+/// - 返回：完整错误文本（不含「错误：」前缀——前缀与颜色由调用方组装）
+pub fn render_clap_error(e: &clap::Error, lang: Lang) -> String {
+    let headline = match error_headline(e, lang) {
+        Some(h) => h,
+        // Display* 三类为 help/version 正常输出、未知 kind 极端路径：
+        // 英文兜底（调用方对 Display* 不会走到本函数）
+        None => return e.render().to_string(),
+    };
+    let mut out = headline;
+    if let Some(ContextValue::StyledStr(usage)) = e.get(ContextKind::Usage) {
+        let usage = usage.to_string();
+        // 用法行前缀替换：zh「用法：」，en 保持 "Usage:"
+        let usage = match (lang, usage.strip_prefix("Usage:")) {
+            (Lang::Zh, Some(rest)) => format!("用法：{rest}"),
+            (_, _) => usage,
+        };
+        out.push_str("\n\n");
+        out.push_str(&usage);
+    }
+    out.push_str(match lang {
+        Lang::Zh => "\n\n更多信息请尝试 '--help'。",
+        Lang::En => "\n\nFor more information, try '--help'.",
+    });
+    out
+}
+
+/// 按错误种类与上下文构建错误首段（含缩进的上下文行）。
+/// - 返回 None：该 kind 不在双语表（Display* / 未知），调用方英文兜底
+fn error_headline(e: &clap::Error, lang: Lang) -> Option<String> {
+    let zh = matches!(lang, Lang::Zh);
+    let single = |kind: ContextKind| -> Option<String> {
+        match e.get(kind) {
+            Some(ContextValue::String(s)) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    Some(match e.kind() {
+        ErrorKind::MissingRequiredArgument => {
+            let mut s = if zh {
+                "以下必选参数未提供：".to_string()
+            } else {
+                "the following required arguments were not provided:".to_string()
+            };
+            if let Some(ContextValue::Strings(list)) = e.get(ContextKind::InvalidArg) {
+                for v in list {
+                    s.push_str(&format!("\n  {v}"));
+                }
+            }
+            s
+        }
+        ErrorKind::UnknownArgument => match (zh, single(ContextKind::InvalidArg)) {
+            (true, Some(a)) => format!("未预期的参数 '{a}'"),
+            (true, None) => "未预期的参数".to_string(),
+            (false, Some(a)) => format!("unexpected argument '{a}' found"),
+            (false, None) => "unexpected argument found".to_string(),
+        },
+        ErrorKind::InvalidSubcommand => match (zh, single(ContextKind::InvalidSubcommand)) {
+            (true, Some(s)) => format!("未识别的子命令 '{s}'"),
+            (true, None) => "未识别的子命令".to_string(),
+            (false, Some(s)) => format!("unrecognized subcommand '{s}'"),
+            (false, None) => "unrecognized subcommand".to_string(),
+        },
+        ErrorKind::MissingSubcommand => if zh {
+            "缺少子命令：请从可用子命令中选择一个"
+        } else {
+            "'roxid' requires a subcommand but one was not provided"
+        }
+        .to_string(),
+        ErrorKind::ArgumentConflict => match (zh, single(ContextKind::InvalidArg)) {
+            (true, Some(a)) => format!("参数 '{a}' 不能与其他互斥参数同时使用"),
+            (true, None) => "参数不能与其他互斥参数同时使用".to_string(),
+            (false, Some(a)) => format!("the argument '{a}' cannot be used with other conflicting arguments"),
+            (false, None) => "arguments cannot be used together".to_string(),
+        },
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+            let (a, v) = (
+                single(ContextKind::InvalidArg),
+                single(ContextKind::InvalidValue),
+            );
+            match (zh, a, v) {
+                (true, Some(a), Some(v)) => format!("参数 '{a}' 的值 '{v}' 无效"),
+                (true, _, _) => "参数值无效".to_string(),
+                (false, Some(a), Some(v)) => format!("invalid value '{v}' for argument '{a}'"),
+                (false, _, _) => "invalid value".to_string(),
+            }
+        }
+        ErrorKind::TooManyValues => if zh {
+            "提供的参数值数量超出上限"
+        } else {
+            "too many values were provided"
+        }
+        .to_string(),
+        ErrorKind::TooFewValues => if zh {
+            "提供的参数值数量不足"
+        } else {
+            "too few values were provided"
+        }
+        .to_string(),
+        ErrorKind::WrongNumberOfValues => if zh {
+            "参数值数量与要求不符"
+        } else {
+            "wrong number of values were provided"
+        }
+        .to_string(),
+        ErrorKind::NoEquals => if zh {
+            "该参数需要 --名称=值 的等号形态"
+        } else {
+            "equal sign is needed when assigning values to one of the arguments"
+        }
+        .to_string(),
+        ErrorKind::InvalidUtf8 => if zh {
+            "参数中检测到无效的 UTF-8 序列"
+        } else {
+            "invalid UTF-8 was detected in one or more arguments"
+        }
+        .to_string(),
+        ErrorKind::Io => if zh { "标准流读写失败" } else { "I/O error" }.to_string(),
+        ErrorKind::Format => if zh { "输出格式化失败" } else { "formatting error" }.to_string(),
+        // Display* 三类不经本函数（help/version 正常输出路径）；ErrorKind
+        // 标记 non_exhaustive——未来新增变体一并走英文兜底（clap 升级防炸）
+        _ => return None,
+    })
+}
+
+/// help 输出段落标题与 -h 说明中文化（M177，Q1 裁决 2026-09-12 03:02）：
+/// Usage:/Options:/Arguments:/Commands: → 用法：/选项：/参数：/命令：；
+/// clap 自动生成的 help flag 说明（惰性注入，mut_arg 声明期不可及）
+/// 一并替换为中文。
+///
+/// 采用子串替换而非行首锚定：clap 标题以样式 span 原子写入（模板
+/// `"{}Usage:{}"`），标题文本在 ANSI 转义序列内保持连续可命中；本项目
+/// 双语表正文经核对不含四个英文标题词与 "Print help" 字样，无误替换面
+///（单测锚定）。带尾注形态先替换、裸形态后兜底，避免二次误伤。
+///
+/// - 参数 rendered：clap 渲染出的 help 文本（可含 ANSI 转义）
+/// - 返回：标题替换后的文本
+pub fn localize_help_headings(rendered: &str) -> String {
+    rendered
+        .replace("Usage:", "用法：")
+        .replace("Options:", "选项：")
+        .replace("Arguments:", "参数：")
+        .replace("Commands:", "命令：")
+        // help flag 说明：--help 长形态（带短概览尾注）→ -h 短形态（带长
+        // 详情尾注）→ 裸 "Print help"（-h 短输出 / help()==long_help 场景）
+        .replace(
+            "Print help (see a summary with '-h')",
+            "打印帮助（概览见 '-h'）",
+        )
+        .replace(
+            "Print help (see more with '--help')",
+            "打印帮助（完整内容见 '--help'）",
+        )
+        .replace("Print help", "打印帮助")
+        // clap 自动生成的 help 子命令条目（二级命令列表尾部）
+        .replace(
+            "Print this message or the help of the given subcommand(s)",
+            "打印本消息或指定子命令的帮助",
+        )
 }
 
 #[cfg(test)]
@@ -799,6 +990,104 @@ mod tests {
         assert_eq!(lang_from_locale(""), Lang::En);
         assert_eq!(lang_from_locale("en_US.UTF-8"), Lang::En);
         assert_eq!(lang_from_locale("ja_JP.UTF-8"), Lang::En);
+    }
+
+    /// M176：错误渲染双语锚定——缺必选参数（用户报告场景）zh/en 双语
+    /// 关键词、缩进上下文、用法行前缀与提示行全覆盖
+    #[test]
+    fn error_render_missing_required_both_languages() {
+        use clap::CommandFactory;
+        let e = crate::Cli::command()
+            .try_get_matches_from(["roxid", "create"])
+            .unwrap_err();
+        let zh = render_clap_error(&e, Lang::Zh);
+        assert!(zh.contains("以下必选参数未提供："), "zh 缺主文案：{zh}");
+        assert!(zh.contains("\n  <MODEL>"), "zh 缺参数上下文：{zh}");
+        assert!(zh.contains("用法："), "zh 缺用法行前缀：{zh}");
+        assert!(zh.contains("--help"), "zh 缺提示行：{zh}");
+        let en = render_clap_error(&e, Lang::En);
+        assert!(
+            en.contains("the following required arguments were not provided:"),
+            "en 缺主文案：{en}"
+        );
+        assert!(en.contains("Usage:"), "en 缺用法行前缀：{en}");
+    }
+
+    /// M176：未知参数与未识别子命令的双语渲染锚定
+    #[test]
+    fn error_render_unknown_and_invalid_subcommand() {
+        use clap::CommandFactory;
+        let e = crate::Cli::command()
+            .try_get_matches_from(["roxid", "create", "m", "--foo"])
+            .unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument);
+        let zh = render_clap_error(&e, Lang::Zh);
+        assert!(zh.contains("未预期的参数 '--foo'"), "{zh}");
+        let en = render_clap_error(&e, Lang::En);
+        assert!(en.contains("unexpected argument '--foo' found"), "{en}");
+
+        let e = crate::Cli::command()
+            .try_get_matches_from(["roxid", "frobnicate"])
+            .unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        let zh = render_clap_error(&e, Lang::Zh);
+        assert!(zh.contains("未识别的子命令 'frobnicate'"), "{zh}");
+    }
+
+    /// M177：help 段落标题与 -h 说明替换锚定——四标题、help flag 三形态
+    #[test]
+    fn help_headings_localization() {
+        let src = "Usage: roxid create [OPTIONS] <MODEL>\nOptions:\n  -h, --help\nArguments:\nCommands:";
+        let zh = localize_help_headings(src);
+        assert!(zh.starts_with("用法： roxid create"), "{zh}");
+        assert!(zh.contains("选项：\n"), "{zh}");
+        assert!(zh.contains("参数：\n"), "{zh}");
+        assert!(zh.ends_with("命令："), "{zh}");
+        // help flag 说明三形态：长形态尾注 / 短形态尾注 / 裸形态
+        assert_eq!(
+            localize_help_headings("Print help (see a summary with '-h')"),
+            "打印帮助（概览见 '-h'）"
+        );
+        assert_eq!(
+            localize_help_headings("Print help (see more with '--help')"),
+            "打印帮助（完整内容见 '--help'）"
+        );
+        assert_eq!(localize_help_headings("Print help"), "打印帮助");
+        // clap 自动生成的 help 子命令条目
+        assert_eq!(
+            localize_help_headings(
+                "Print this message or the help of the given subcommand(s)"
+            ),
+            "打印本消息或指定子命令的帮助"
+        );
+        // 正文行内的同形词（非标题语境）同样被替换——经核对双语表正文
+        // 不含四个英文标题词与 "Print help" 字样，此为已接受设计边界
+        assert!(!localize_help_headings("打印帮助").contains("用法"));
+    }
+
+    /// M178：命令树全量 next_line_help 布局断言（Q2-A 裁决）——
+    /// 每个非隐藏命令的参数说明都必须是「独立成行」形态
+    #[test]
+    fn next_line_help_all_set() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        apply_localized_help(&mut cmd);
+        assert_next_line(&mut cmd);
+    }
+
+    /// 递归断言单命令及全部非隐藏子命令的 next_line_help 设置
+    fn assert_next_line(cmd: &mut clap::Command) {
+        assert!(
+            cmd.is_next_line_help_set(),
+            "命令 {} 未设独立成行布局",
+            cmd.get_name()
+        );
+        for sub in cmd.get_subcommands_mut() {
+            if sub.is_hide_set() {
+                continue; // __complete 等内部命令不进 help 体系
+            }
+            assert_next_line(sub);
+        }
     }
 
     /// 文本表完整性：树上每个非隐藏子命令（含二级）双语条目都必须存在且

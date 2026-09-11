@@ -7,7 +7,7 @@ English | [中文](zh/cli.md)
 The roxid CLI ships **19 command forms**: 15 ollama-aligned subcommands + the `setup --llama-url` parameter mode + the `runtime` multi-version family + the `completion` family + the hidden `__complete` internal command. Command names and argument structures align with the original ollama, so existing scripts migrate seamlessly.
 
 - The CLI talks to a local serve instance over HTTP (default `127.0.0.1:11434`) and prints a clear hint when serve is not running;
-- `--help` text is bilingual based on locale (`LC_ALL` → `LC_MESSAGES` → `LANG`; `zh*` prefix → Chinese, otherwise English), in GNU-style complete form.
+- `--help` text and argument-parse errors are bilingual based on locale (`LC_ALL` → `LC_MESSAGES` → `LANG`; `zh*` prefix → Chinese, otherwise English): errors cover the headline, usage line and hint line; help section headings and the `-h` description are localized as well; argument descriptions use a uniform next-line layout (iteration 47).
 
 ## Syntax overview
 
@@ -78,7 +78,7 @@ roxid create <model> [-f <Modelfile>] [-i]
 |---|---|---|---|---|
 | `model` | string | yes | — | New model name |
 | `-f, --file` | string | one of `-f`/`-i` | — | Modelfile path |
-| `-i, --interactive` | flag | one of `-f`/`-i` | — | Full-screen TUI wizard: ① pick base model from list (↑/↓, type-to-filter) → ② multi-line SYSTEM → ③ RUNTIME flags (example pinned at bottom) → ④ Modelfile preview & confirm; falls back to a line-by-line wizard on terminals without full-screen support |
+| `-i, --interactive` | flag | one of `-f`/`-i` | — | Full-screen TUI wizard: ① pick base model from list (↑/↓, type-to-filter) → ② multi-line SYSTEM (Enter to finish, Alt+Enter for a newline, pasted text keeps its line breaks, viewport scrolls to follow the cursor) → ③ RUNTIME flags (example pinned at bottom) → ④ Modelfile preview & confirm (↑/↓ to scroll, PgUp/PgDn by ten lines); falls back to a line-by-line wizard on terminals without full-screen support |
 
 Missing both reports an error and exits (matching the official requirement of a Modelfile). Results stream as NDJSON events; failures surface as in-stream `error` events (exit code 1).
 
@@ -308,7 +308,8 @@ Server-side variables (proxies / backend / parallelism) are covered in [Configur
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | Failure: bad arguments / server error responses / file I/O errors / wizard cancellation, etc. |
+| `1` | Failure: server error responses / file I/O errors / wizard cancellation, etc. |
+| `2` | Argument-parse errors (GNU convention: missing required arguments / unknown arguments / unrecognized subcommands, with locale-aware messages; iteration 47 aligns docs with actual behavior) |
 
 When the server is unreachable (connection failure), a unified hint is printed and the process exits 1:
 

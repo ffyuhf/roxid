@@ -33,7 +33,14 @@
 //! M99（迭代31）：acquire 变体名拼接宿主架构（arm64 宿主不再误下
 //! ubuntu-x64 包）；spawn_with_port_retry 对 ArchMismatch 确定性失败
 //! 直接透出不换端口重试（原盲目重试 3 次刷误导日志；用户裁决 Q4
-//! 2026-09-10 18:21）2026-09-10 18-30
+//! 2026-09-10 18:21）2026-09-10 18-30；
+//! M169（迭代45 Q4-A 裁决 2026-09-12 01:44）：重建路径停机后台化——
+//! 旧实例 kill+wait 与新实例加载并行，模型切换不再等待旧进程退出
+//! 与驱动显存回收滞后（用户实测切换过慢根因：串行停机全部计入
+//! 新请求等待）2026-09-12 01-55；
+//! M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：显存/内存不足判型 +
+//! 空闲实例 LRU 自动卸载腾位重试（对齐 ollama 语义；在途实例受
+//! M27 保护绝不卸载）2026-09-12 01-55
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -190,11 +197,18 @@ impl RunnerRegistry {
                 stale = writers.remove(&full);
             }
         }
-        // 锁外停机：shutdown_mut 对已退出进程跳过 kill 仅 wait（M26 前置）
+        // 锁外停机（M169 迭代45 Q4-A 裁决 2026-09-12 01:44）：后台化——
+        // 旧实例 kill+wait 移入 tokio::spawn 与新实例加载完全并行，
+        // 重建不再等待旧进程退出与驱动显存回收滞后（原串行停机把该
+        // 时长全部计入新请求等待，用户实测模型切换过慢的根因）。
+        // 句柄已 remove 出表：stop/并发 acquire 不受影响；shutdown_mut
+        // 对已退出进程幂等（M26 前置）；同模型加载锁仍持有，无并发双拉
         if let Some(old) = stale {
-            if let Err(e) = old.lock().await.shutdown_mut().await {
-                tracing::warn!("重建前卸载旧实例失败：{e}");
-            }
+            tokio::spawn(async move {
+                if let Err(e) = old.lock().await.shutdown_mut().await {
+                    tracing::warn!("后台卸载旧实例失败：{e}");
+                }
+            });
         }
 
         // 4) 全流程加载（全局锁外：读盘/探测/下载/健康等待不再阻塞其他模型
@@ -213,11 +227,49 @@ impl RunnerRegistry {
         if let Some(rt) = want_runtime {
             spec.runtime_flags = Some(rt);
         }
-        // M28 碴13：拉起经换端口重试包装（失败重取端口，上限 3 次）
-        let runner = spawn_with_port_retry(&full, |port| {
+        // M28 碴13：拉起经换端口重试包装（失败重取端口，上限 3 次）；
+        // M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：重试耗尽且判型为
+        // 资源不足时，逐个卸载空闲实例（LRU）腾位后重试——对齐 ollama
+        // 显存不足自动卸载语义；空闲实例清空仍失败则透出原错误
+        let runner = match spawn_with_port_retry(&full, |port| {
             Runner::spawn_llama_server(full.clone(), port, keep_alive, &spec)
         })
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(first) if is_resource_exhausted(&first.to_string()) => {
+                let mut last = first;
+                let mut spawned = None;
+                while let Some(idle) = self.evict_one_idle(&full).await {
+                    let name = idle.lock().await.model_name.clone();
+                    tracing::info!("显存/内存不足：自动卸载空闲实例 {name} 腾位重试");
+                    // 同步等待退出（腾显存必须等驱动回收——与重建停机的
+                    // 后台化不同，此处卸载是加载成功的前置条件）
+                    if let Err(e) = idle.lock().await.shutdown_mut().await {
+                        tracing::warn!("卸载空闲实例失败：{e}");
+                    }
+                    match spawn_with_port_retry(&full, |port| {
+                        Runner::spawn_llama_server(full.clone(), port, keep_alive, &spec)
+                    })
+                    .await
+                    {
+                        Ok(r) => {
+                            spawned = Some(r);
+                            break;
+                        }
+                        Err(e) => last = e,
+                    }
+                }
+                match spawned {
+                    Some(r) => r,
+                    None => {
+                        tracing::warn!("无空闲实例可卸载，资源不足错误透出：{last}");
+                        return Err(last);
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
         let arc = Arc::new(Mutex::new(runner));
         // 5) 短写锁落表（临界区仅条目插入；模型锁保证同模型不会并发到达此处）
         self.runners.write().await.insert(full, arc.clone());
@@ -341,6 +393,41 @@ impl RunnerRegistry {
         }
     }
 
+    /// M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：卸载一个空闲实例腾
+    /// 显存/内存——按 keep_alive 到期时刻最早优先（LRU：最久未使用先
+    /// 卸载，对齐 ollama 官方语义）；在途实例（in_flight > 0）受 M27
+    /// 在途保护绝不卸载；正在加载的模型自身排除。
+    ///
+    /// - 参数 exclude：当前正在加载的模型全名（不得自卸）
+    /// - 返回：被移出注册表的实例句柄（调用方负责等待其退出以释放资源）；
+    ///   无符合条件的空闲实例返回 None
+    async fn evict_one_idle(&self, exclude: &str) -> Option<Arc<Mutex<Runner>>> {
+        let mut writers = self.runners.write().await;
+        let mut victim: Option<(String, std::time::Instant)> = None;
+        for (k, r) in writers.iter() {
+            if k == exclude {
+                continue; // 加载目标自身不得自卸
+            }
+            let exp = {
+                let guard = r.lock().await;
+                if guard.in_flight() > 0 {
+                    continue; // M27 在途保护：推理中的实例绝不卸载
+                }
+                guard.expires_at()
+            };
+            // match 形态（避免 map_or 简化告警）：无候选或到期更早者胜出
+            let earlier = match victim.as_ref() {
+                None => true,
+                Some((_, e)) => exp < *e,
+            };
+            if earlier {
+                victim = Some((k.clone(), exp));
+            }
+        }
+        let (key, _) = victim?;
+        writers.remove(&key)
+    }
+
     /// 测试辅助：直接注入替身实例（绕过仓库查找与真实拉起）
     #[cfg(test)]
     pub(crate) async fn inject(&self, runner: Runner) -> Arc<Mutex<Runner>> {
@@ -379,6 +466,29 @@ fn runtime_matches(
         None => effective == model_default,
         Some(w) => effective == Some(w),
     }
+}
+
+/// M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：资源不足错误判型——对
+/// spawn 失败错误全文（含 M97 stderr 尾部摘要）做特征子串匹配（大小写
+/// 不敏感）。宽容设计：漏判时维持现状报错（不误触发卸载），特征表
+/// 集中便于按 llama.cpp 版本措辞扩展；跨模型显存不足场景的根治通道。
+///
+/// - 参数 err_text：spawn 失败的错误全文
+/// - 返回：true 表示判定为显存/内存资源不足
+fn is_resource_exhausted(err_text: &str) -> bool {
+    let lower = err_text.to_ascii_lowercase();
+    [
+        "out of memory",        // CUDA/系统内存通用形态
+        "outofmemoryerror",     // CUDA API 异常名形态
+        "failed to allocate",   // ggml CPU/GPU 张量分配形态
+        "cuda_malloc_failed",   // llama.cpp CUDA 形态
+        "cumalloc failed",      // llama.cpp 新版形态
+        "not enough memory",    // 系统内存不足形态
+        "insufficient memory",  // Vulkan vkAllocateMemory 形态
+        "out of device memory", // Vulkan 设备显存形态
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
 }
 
 /// M54b：后端二进制路径比对（复用第四键）——resolve-only 解析当前应然
@@ -548,6 +658,78 @@ mod tests {
             .unwrap();
         let arc = reg.inject(runner).await;
         (reg, arc)
+    }
+
+    /// M170：资源不足判型纯函数——特征命中/大小写不敏感/无关错误不命中
+    #[test]
+    fn resource_exhaustion_patterns() {
+        assert!(is_resource_exhausted(
+            "llama-server 启动即退出：CUDA error: out of memory"
+        ));
+        assert!(is_resource_exhausted("failed to allocate 4096 MiB"));
+        assert!(
+            is_resource_exhausted("cudaMalloc failed: Out Of Memory"),
+            "大小写不敏感"
+        );
+        assert!(
+            is_resource_exhausted("vkAllocateMemory: insufficient memory"),
+            "Vulkan 形态"
+        );
+        assert!(is_resource_exhausted("out of device memory"));
+        // 无关错误不得误判（宽容漏判、严禁误杀）
+        assert!(!is_resource_exhausted(
+            "llama-server 启动即退出：wrong number of tensors"
+        ));
+        assert!(!is_resource_exhausted("健康检查超时 300s"));
+        assert!(!is_resource_exhausted("重取端口重试"));
+    }
+
+    /// M170：evict_one_idle——最早到期优先（LRU）、在途不卸（M27 保护）、
+    /// 加载目标自身排除；空闲清空返回 None
+    #[tokio::test]
+    async fn evict_picks_earliest_idle_and_spares_inflight() {
+        async fn inject_stub(
+            reg: &Arc<RunnerRegistry>,
+            model: &str,
+            keep_alive: Duration,
+        ) -> Arc<Mutex<Runner>> {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("300").stdout(Stdio::null()).stderr(Stdio::null());
+            let runner = Runner::spawn_with(model, 0, keep_alive, &mut cmd)
+                .await
+                .unwrap();
+            reg.inject(runner).await
+        }
+        let reg = Arc::new(RunnerRegistry::new(
+            std::env::temp_dir().join("roxid-reg-evict"),
+        ));
+        let a_older = inject_stub(&reg, "stub:older", Duration::from_secs(1)).await;
+        let _a_newer = inject_stub(&reg, "stub:newer", Duration::from_secs(300)).await;
+        let a_busy = inject_stub(&reg, "stub:busy", Duration::from_secs(1)).await;
+        a_busy.lock().await.enter_request(); // 在途（到期但不卸）
+        tokio::time::sleep(Duration::from_millis(80)).await; // older/busy 窗口耗尽
+
+        // 第一次驱逐：older（到期最早=最久未用，且空闲；busy 在途跳过）
+        let v1 = reg
+            .evict_one_idle("stub:target")
+            .await
+            .expect("须命中 older");
+        assert_eq!(v1.lock().await.model_name, "stub:older");
+        v1.lock().await.shutdown_mut().await.unwrap(); // 清理替身
+
+        // 第二次驱逐：newer（空闲可驱逐——LRU 按到期时刻，非仅到期实例）
+        let v2 = reg.evict_one_idle("stub:self").await.expect("须命中 newer");
+        assert_eq!(v2.lock().await.model_name, "stub:newer");
+        v2.lock().await.shutdown_mut().await.unwrap();
+
+        // 第三次：仅剩 busy（在途）与 self（排除）→ 无候选
+        assert!(
+            reg.evict_one_idle("stub:self").await.is_none(),
+            "在途与自身排除后必须无候选"
+        );
+        // 清理余下替身
+        a_older.lock().await.shutdown_mut().await.unwrap();
+        a_busy.lock().await.shutdown_mut().await.unwrap();
     }
 
     /// stop：注入实例 → 停止 → 再停报不存在

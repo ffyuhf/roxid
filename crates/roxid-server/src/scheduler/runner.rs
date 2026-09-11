@@ -39,7 +39,10 @@
 //! 剥离请求 model 字段后 llama-server 以加载路径兜底回显（用户实测
 //! model 字段返回 /root/.roxid/...gguf）；--alias 使全部回显点统一为
 //! model:tag（llama-server 官方 API 层命名参数，README 实证）
-//! 2026-09-10 21-26
+//! 2026-09-10 21-26；
+//! M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：expires_at() getter
+//! 公开——registry 空闲实例 LRU 卸载（evict_one_idle）按到期时刻
+//! 最早优先的比较键 2026-09-12 01-56
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -500,6 +503,14 @@ impl Runner {
     pub(crate) fn leave_request(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
         self.expires_at = Instant::now() + self.keep_alive;
+    }
+
+    /// keep_alive 到期时刻（M170：registry evict_one_idle 的 LRU 比较键——
+    /// 到期时刻最早 = 空闲起点最早 = 最久未使用）。
+    ///
+    /// - 返回：到期绝对时刻
+    pub(crate) fn expires_at(&self) -> Instant {
+        self.expires_at
     }
 
     /// 空闲是否已到期（到期即可被卸载）。

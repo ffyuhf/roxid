@@ -4,8 +4,10 @@
 //! - GPU 探测：nvidia-smi / vulkaninfo 任一可用 → Vulkan 预编译包；否则 CPU 包
 //!   （实测 Linux 官方预编译无 CUDA 包，NVIDIA 经 Vulkan 加速；
 //!    需原生 CUDA 时设 ROXID_LLAMA_SERVER 复用用户自编译产物）
-//! - 从 llama.cpp 官方 GitHub Releases 下载 tar.gz（锁定链 b10883 兜底
-//!   （M95 升级 2026-09-10 07:17，原 b10605，用户指示）；
+//! - 从 llama.cpp 官方 GitHub Releases 下载 tar.gz（迭代46 M173 起
+//!   兜底链在线查最新预发布版本并落 default_version——硬编码锁定 tag
+//!   已删除，用户裁决 2026-09-12 02:11/02:17/02:41；历史：b10605
+//!   （2026-08-24）→ b10883（M95 2026-09-10）；
 //!   M36 起支持任意 tag 多版本并存 + config default_version 持久默认），
 //!   解压平铺缓存于 {roxid_home}/llama.cpp/{tag}/{variant}/，
 //!   llama-server 的 rpath 含 $ORIGIN，直接运行即可
@@ -16,6 +18,8 @@
 //! 公开导出供 `roxid runtime` 子命令族调用 2026-09-09 04-37
 //! M54（迭代19 碴B）：resolve_llama_server_path 导出——scheduler 复用
 //! 第四键的 resolve-only 解析（runtime use 切换感知）2026-09-09 20-30
+//! M173/M174（迭代46）：LOCKED_LLAMA_CPP_TAG 常量删除（兜底链改在线查
+//! 最新版 + resolve 第4步 None 放行）2026-09-12 02-45
 
 mod backend;
 mod download;
@@ -31,5 +35,5 @@ pub use download::{
     asset_url, ensure_llama_server, install_manual, install_version,
     installed_variant_arch_mismatch, is_valid_tag, list_installed, manual_dir, manual_server_path,
     remove_version, resolve_llama_server_path, url_is_archive, variant_cache_dir,
-    warn_installed_arch_mismatch, ENV_LLAMA_SERVER_OVERRIDE, LOCKED_LLAMA_CPP_TAG,
+    warn_installed_arch_mismatch, ENV_LLAMA_SERVER_OVERRIDE,
 };

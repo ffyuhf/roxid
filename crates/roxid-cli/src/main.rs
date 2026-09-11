@@ -333,6 +333,44 @@ fn normalize_hf_arg(model: String, hf: bool) -> String {
     }
 }
 
+/// clap 错误/帮助输出统一出口（迭代47 M176，Q1/Q3 裁决 2026-09-12 03:02/03:06）：
+/// Display* 三类「错误」实为 help/version 正常输出——zh 下段落标题双语替换
+/// （M177）后走 stdout（退出码 0，保留 clap 原生着色）；其余参数错误按
+/// locale 渲染双语文案走 stderr（红「错误：」前缀，退出码 2——GNU 惯例，
+/// docs 退出码表同步修正）。原 e.exit() 直接透出 clap 内置英文，绕过
+/// locale 判定链——本函数是报错语言跟随用户语言环境的唯一出口。
+///
+/// - 参数 e：clap 解析/derive 转换错误
+/// - 返回：永不返回（输出后进程退出）
+fn exit_with_localized_error(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    match e.kind() {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion => {
+            let text = e.render().ansi().to_string();
+            let text = match help_i18n::detect_lang() {
+                help_i18n::Lang::Zh => help_i18n::localize_help_headings(&text),
+                help_i18n::Lang::En => text,
+            };
+            // render 文本尾换行形态不恒定：剥一个尾换行再统一补齐单换行
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            println!("{text}");
+            std::process::exit(e.exit_code());
+        }
+        _ => {
+            let lang = help_i18n::detect_lang();
+            let body = help_i18n::render_clap_error(&e, lang);
+            let prefix = match lang {
+                help_i18n::Lang::Zh => "错误：",
+                help_i18n::Lang::En => "error:",
+            };
+            eprintln!("{} {body}", paint(stderr_color(), "31;1", prefix));
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // parse_from 首元素是程序名位：保留真实 argv[0]，其余经 -hf 预扫描重写
@@ -340,16 +378,17 @@ async fn main() {
     let rewritten = rewrite_hf_flag(&argv[1..]);
     argv.truncate(1);
     argv.extend(rewritten);
-    // 迭代20 M56：构建后、解析前注入 locale 双语 help（zh* → 中文，
-    // 其余 → 英文兜底 derive doc comment；命令树结构零改动）
+    // 迭代20 M56 + 迭代47 M176：构建后、解析前注入 locale 双语 help
+    // （zh* → 中文，其余 → 英文兜底 derive doc comment；命令树结构零改动）；
+    // 解析错误经 exit_with_localized_error 双语渲染（不再 e.exit() 透英文）
     let mut command = Cli::command();
     help_i18n::apply_localized_help(&mut command);
     let cli = Cli::from_arg_matches(
         &command
             .try_get_matches_from(argv)
-            .unwrap_or_else(|e| e.exit()),
+            .unwrap_or_else(|e| exit_with_localized_error(e)),
     )
-    .unwrap_or_else(|e| e.exit());
+    .unwrap_or_else(|e| exit_with_localized_error(e));
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -451,15 +490,16 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
             let installed = rt::list_installed();
             let manual_ok = rt::manual_server_path().is_file();
             if installed.is_empty() && !manual_ok {
+                // 迭代46 M175：锁定常量删除——文案改「最新版」措辞
+                //（兜底链在线查最新预发布版本并设为默认，用户裁决
+                // 2026-09-12 02:17/02:41）
                 println!(
-                    "尚未安装任何 llama.cpp 运行时（serve 首次启动将自动下载 {}/{{vulkan|cpu}} 锁定链）",
-                    rt::LOCKED_LLAMA_CPP_TAG
+                    "尚未安装任何 llama.cpp 运行时（serve 首次启动将自动下载最新版 {{vulkan|cpu}} 并设为默认）"
                 );
                 return 0;
             }
             println!(
-                "已安装 llama.cpp 运行时（解析优先级：env → manual → 默认版本 → {} 锁定链）：",
-                rt::LOCKED_LLAMA_CPP_TAG
+                "已安装 llama.cpp 运行时（解析优先级：env → manual → 默认版本 → 在线最新版兜底）："
             );
             if manual_ok {
                 let mark = if default.as_deref() == Some("manual") {
@@ -1348,6 +1388,22 @@ fn short_digest(digest: &str) -> &str {
     &hex[..hex.len().min(8)]
 }
 
+/// 进度条字符块（迭代46 M172，用户裁决 Q1-A 2026-09-12 02:09）：官方
+/// ollama 风格——填充 █ 与剩余 ░ 共 12 格，按百分比截断填充；定宽保证
+/// 事件间刷新帧稳定不跳动，窄终端由既有 truncate_cols 截断兜底。
+///
+/// - 参数 pct：百分比（0-100，超界钳制）
+/// - 返回：形如 "[████████░░░░░░░░]" 的 14 字符定宽块
+fn render_bar(pct: u64) -> String {
+    const WIDTH: u64 = 12;
+    let filled = (pct.min(100) * WIDTH / 100).min(WIDTH);
+    format!(
+        "[{}{}]",
+        "█".repeat(filled as usize),
+        "░".repeat((WIDTH - filled) as usize)
+    )
+}
+
 /// NDJSON status 中文映射（M110，迭代33 碴3）：协议侧保持官方英文
 /// 原文（Ollama 语义对齐，e2e 断言不破），CLI 渲染层转中文；未知
 /// status 原样输出（兼容服务端后续新增阶段）。
@@ -1360,6 +1416,9 @@ fn status_zh(status: &str) -> String {
         "verifying sha256 digest" => "校验 sha256 摘要".into(),
         "writing manifest" => "写入清单".into(),
         "pulling manifest" => "拉取清单".into(),
+        // M172（迭代46）：字节级进度事件 "pulling" 的中文映射（仅 TTY msg
+        // 消费面变化；非 TTY 进度事件只入层状态不走 println 路径）
+        "pulling" => "拉取".into(),
         "reading gguf header" => "读取 GGUF 头".into(),
         _ => {
             if let Some(rest) = status.strip_prefix("pulling ") {
@@ -1737,14 +1796,24 @@ async fn consume_ndjson_progress(resp: reqwest::Response) -> Result<(), String> 
                             100
                         };
                         let sp = speed.push(done);
-                        let speed_s = sp
-                            .map(|s| format!("，{}/s", fmt_bytes(s as u64)))
-                            .unwrap_or_default();
-                        let eta_s = match (total, sp) {
-                            (t, Some(s)) if t > done && s > 0.0 => {
-                                format!("，剩余 {}", fmt_eta((t - done) as f64 / s))
+                        // M172（迭代46）：官方风格进度条——bar 字符块 +
+                        // 层 digest 短串；速度/剩余时间括号尾包（用户裁决
+                        // Q1-A 2026-09-12 02:09，示例「✓ 拉取 3c1c9d
+                        // [████████░░░░░░░░] 45% 2.0/4.4 GB（5.3 MB/s，
+                        // 剩余 3分20秒）」）
+                        let mut tail: Vec<String> = Vec::new();
+                        if let Some(s) = sp {
+                            tail.push(format!("{}/s", fmt_bytes(s as u64)));
+                        }
+                        if let (t, Some(s)) = (total, sp) {
+                            if t > done && s > 0.0 {
+                                tail.push(format!("剩余 {}", fmt_eta((t - done) as f64 / s)));
                             }
-                            _ => String::new(),
+                        }
+                        let tail_s = if tail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("（{}）", tail.join("，"))
                         };
                         // M110：层完成绿色 ✓ 前缀（100% 与下载中区分）
                         let check = if total > 0 && done >= total {
@@ -1752,11 +1821,17 @@ async fn consume_ndjson_progress(resp: reqwest::Response) -> Result<(), String> 
                         } else {
                             String::new()
                         };
+                        let digest_s = layer
+                            .as_ref()
+                            .map(|l| short_digest(&l.digest))
+                            .unwrap_or_default();
                         let msg = format!(
-                            "{check}{} {}/{}（{pct}%{speed_s}{eta_s}）",
+                            "{check}{} {} {} {pct}% {}/{}{tail_s}",
                             status_zh(status),
+                            digest_s,
+                            render_bar(pct),
                             fmt_bytes(done),
-                            fmt_bytes(total)
+                            fmt_bytes(total),
                         );
                         // M109：msg 按终端宽 CJK 感知截断（spinner 前缀 2 列）
                         bar.set_message(truncate_cols(&msg, term_width().saturating_sub(2)));
@@ -2443,8 +2518,24 @@ mod tests {
             "下载中断，正在重试（第 1/3）"
         );
         assert_eq!(super::status_zh("future phase"), "future phase");
-        // 纯 "pulling"（进度事件 status）无后缀内容——原样（进度行自组装）
-        assert_eq!(super::status_zh("pulling"), "pulling");
+        // 纯 "pulling"（字节级进度事件 status）——迭代46 M172 起映射「拉取」
+        //（进度行自组装 bar 形态：拉取 {digest} [bar] pct% ...）
+        assert_eq!(super::status_zh("pulling"), "拉取");
+    }
+
+    /// 迭代46 M172：进度条字符块——定宽 12 格、百分比整数截断填充、
+    /// 超界钳制（形态锚定用户裁决示例 [████████░░░░░░░░]）
+    #[test]
+    fn render_bar_shapes() {
+        assert_eq!(super::render_bar(0), "[░░░░░░░░░░░░]");
+        assert_eq!(
+            super::render_bar(45),
+            "[█████░░░░░░░]",
+            "45% → 5 格（整数截断）"
+        );
+        assert_eq!(super::render_bar(50), "[██████░░░░░░]");
+        assert_eq!(super::render_bar(100), "[████████████]");
+        assert_eq!(super::render_bar(150), "[████████████]", "超界钳制到满格");
     }
 
     /// M117（迭代33 碴10）：错误体整形——单层/嵌套 error 提取、非 JSON 原样

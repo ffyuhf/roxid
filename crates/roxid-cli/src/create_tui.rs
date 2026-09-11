@@ -9,9 +9,22 @@
 //! 终端卫生：EnterAlternateScreen + panic hook 恢复 + LeaveAlternateScreen；
 //! 初始化失败返回 Err 由调用方降级既有问答向导（TERM=dumb 等场景兜底）。
 //!
-//! 修改历史：M146/M147 新增 2026-09-11 09-35
+//! 修改历史：M146/M147 新增 2026-09-11 09-35；
+//! M166（迭代45 Q1-A 裁决 2026-09-12 01:43）：bracketed paste 启用 +
+//! EditSystem 键位改造（Enter=完成、Alt+Enter=换行、Esc=取消向导）——
+//! 原 Enter=换行/Esc=完成与通用 TUI 直觉相反（用户实测报告）；粘贴
+//! 多行文本经 bracketed paste 整块到达，换行符保留不被拆解为按键序列
+//! 2026-09-12 01-50；
+//! M167（迭代45 Q2-A 裁决 01:43）：EditSystem 视口滚动（底部对齐跟随
+//! 光标——长提示词粘贴后底部内容与光标恒可见）+ Preview 预览滚动
+//! （Up/Down 单行、PgUp/PgDn 十行，渲染层钳上限）2026-09-12 01-52；
+//! M168（迭代45 Q3-A 裁决 01:43）：光标列按显示宽折算（CJK 2 列/字，
+//! 复用 crate::display_width 零新依赖）+ Wrap 折行 y 偏移
+//! 2026-09-12 01-52
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -54,11 +67,15 @@ impl Step {
             Step::PickFrom => {
                 "↑/↓ 或 j/k 移动    Enter 选中    输入即过滤    Backspace 删过滤    Esc 取消"
             }
-            Step::EditSystem => "输入内容    Enter 换行    Esc 完成    Ctrl+C 取消",
+            // M166：Enter=完成 / Alt+Enter=换行（粘贴自动保留换行经 bracketed paste）
+            Step::EditSystem => {
+                "输入内容    Enter 完成    Alt+Enter 换行    粘贴自动保留换行    Esc/Ctrl+C 取消"
+            }
             Step::EditRuntime => {
                 "输入参数    Enter 完成（空=跳过 RUNTIME）    Esc 完成    Ctrl+C 取消"
             }
-            Step::Preview => "Enter 创建    Esc 取消",
+            // M167：预览滚动键（Up/Down 单行、PgUp/PgDn 十行）
+            Step::Preview => "Enter 创建    Esc 取消    ↑/↓ 滚动（PgUp/PgDn 十行）",
         }
     }
 }
@@ -92,6 +109,8 @@ struct WizardApp {
     sys_col: usize,
     /// 步骤③ RUNTIME 参数文本（单行，按字符）
     runtime_chars: Vec<char>,
+    /// 步骤④ 预览滚动偏移（M167：Up/Down/PgUp/PgDn 调整，渲染层钳上限）
+    preview_scroll: u16,
 }
 
 impl WizardApp {
@@ -114,6 +133,7 @@ impl WizardApp {
             sys_row: 0,
             sys_col: 0,
             runtime_chars: Vec::new(),
+            preview_scroll: 0,
         }
     }
 
@@ -144,6 +164,84 @@ impl WizardApp {
             Step::EditRuntime => self.on_key_runtime(code),
             Step::Preview => self.on_key_preview(code),
         }
+    }
+
+    /// 粘贴事件分发（M166，bracketed paste：多行文本整块到达，换行符
+    /// 保留在串内不被拆解为 Enter 按键——长系统提示词一次性粘贴不截断）。
+    /// - PickFrom：滤除换行追加为过滤串
+    /// - EditSystem：按换行拆分在光标处多行插入
+    /// - EditRuntime：滤除换行追加为单行
+    /// - Preview：忽略
+    fn on_paste(&mut self, text: &str) {
+        match self.step {
+            Step::PickFrom => {
+                for c in text.chars() {
+                    if c != '\n' && c != '\r' {
+                        self.filter.push(c);
+                    }
+                }
+                self.list_state.select(if self.filtered().is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+            }
+            Step::EditSystem => self.insert_paste_multiline(text),
+            Step::EditRuntime => {
+                for c in text.chars() {
+                    if c != '\n' && c != '\r' {
+                        self.runtime_chars.insert(self.runtime_chars.len(), c);
+                    }
+                }
+            }
+            Step::Preview => {}
+        }
+    }
+
+    /// EditSystem 光标处多行插入：当前行按光标分裂为前/后段——粘贴首行
+    /// 接前段、末行与后段拼接、中间行整行插入；光标落在插入内容末尾。
+    /// 单行粘贴（无换行）合并不新增行（等同连续手输）。
+    fn insert_paste_multiline(&mut self, text: &str) {
+        // 统一按 \n 与 \r 拆行（兼容 CRLF 粘贴形态），与手输同按字符存储
+        let lines: Vec<Vec<char>> = text
+            .split(['\n', '\r'])
+            .map(|l| l.chars().collect())
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        // 光标行兜底补齐（与 on_key_system 同防御：行号不越界）
+        while self.system_rows.len() <= self.sys_row {
+            self.system_rows.push(Vec::new());
+        }
+        let tail = self.system_rows[self.sys_row].split_off(self.sys_col); // 光标后段
+        let head = std::mem::take(&mut self.system_rows[self.sys_row]);
+        let n = lines.len();
+        if n == 1 {
+            // 单行：head + 粘贴行 + tail 合并，不新增行
+            let mut row = head;
+            row.extend(lines[0].iter().copied());
+            row.extend(tail);
+            self.system_rows[self.sys_row] = row;
+            self.sys_col += lines[0].len();
+            return;
+        }
+        let paste_last_len = lines[n - 1].len();
+        // 首行 = head + 粘贴首行
+        let mut first = head;
+        first.extend(lines[0].iter().copied());
+        self.system_rows[self.sys_row] = first;
+        // 中间行（1..n-1）整行插入
+        for (i, mid) in lines[1..n - 1].iter().enumerate() {
+            self.system_rows.insert(self.sys_row + 1 + i, mid.clone());
+        }
+        // 末行 = 粘贴末行 + tail
+        let mut last = lines[n - 1].clone();
+        last.extend(tail);
+        self.system_rows.insert(self.sys_row + n - 1, last);
+        // 光标移至插入内容末尾（末行、粘贴末段结尾）
+        self.sys_row += n - 1;
+        self.sys_col = paste_last_len;
     }
 
     /// 步骤①：字符追加过滤（重置选中首项）；Enter 选中前进；Esc 取消。
@@ -199,7 +297,9 @@ impl WizardApp {
         self.list_state.select(Some(next));
     }
 
-    /// 步骤②：多行编辑（插入/退格/换行/四向移动）；Esc 或 Ctrl+S 完成。
+    /// 步骤②：多行编辑（插入/退格/换行/四向移动）；Enter 或 Ctrl+S 完成，
+    /// Alt+Enter 手动换行，Esc 取消向导（M166 键位改造，Q1-A 裁决
+    /// 2026-09-12 01:43——原 Enter=换行/Esc=完成与通用 TUI 直觉相反）。
     /// 各分支独立借用行数据（避免跨 match 长可变借用）
     fn on_key_system(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyAction {
         // 光标行兜底补齐（防御状态漂移：行号不越界）
@@ -226,12 +326,17 @@ impl WizardApp {
                 }
                 KeyAction::Continue
             }
-            KeyCode::Enter => {
-                // 光标处分裂换行：后半段成为新行
+            // Alt+Enter：光标处分裂换行（后半段成为新行）——手动换行通道
+            KeyCode::Enter if mods.contains(KeyModifiers::ALT) => {
                 let tail = self.system_rows[self.sys_row].split_off(self.sys_col);
                 self.system_rows.insert(self.sys_row + 1, tail);
                 self.sys_row += 1;
                 self.sys_col = 0;
+                KeyAction::Continue
+            }
+            // Enter：完成编辑进入下一步（M166 主出口）
+            KeyCode::Enter => {
+                self.step = Step::EditRuntime;
                 KeyAction::Continue
             }
             KeyCode::Left if self.sys_col > 0 => {
@@ -252,11 +357,9 @@ impl WizardApp {
                 self.sys_col = self.sys_col.min(self.system_rows[self.sys_row].len());
                 KeyAction::Continue
             }
-            KeyCode::Esc => {
-                self.step = Step::EditRuntime;
-                KeyAction::Continue
-            }
-            // Ctrl+S 完成（Esc 之外的编辑器惯例出口）
+            // Esc：取消整个向导（与步骤①④ 全局 Esc=取消语义对齐，M166）
+            KeyCode::Esc => KeyAction::Cancel,
+            // Ctrl+S 完成（Enter 之外的编辑器惯例出口，保留）
             KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
                 self.step = Step::EditRuntime;
                 KeyAction::Continue
@@ -278,13 +381,14 @@ impl WizardApp {
             }
             KeyCode::Enter | KeyCode::Esc => {
                 self.step = Step::Preview;
+                self.preview_scroll = 0; // M167：进入预览重置滚动
                 KeyAction::Continue
             }
             _ => KeyAction::Continue,
         }
     }
 
-    /// 步骤④：Enter 组装 Modelfile 确认创建；Esc 取消
+    /// 步骤④：Enter 组装 Modelfile 确认创建；Esc 取消；M167 滚动键翻看长文
     fn on_key_preview(&mut self, code: KeyCode) -> KeyAction {
         match code {
             KeyCode::Enter => {
@@ -296,6 +400,25 @@ impl WizardApp {
                     .collect();
                 let runtime: String = self.runtime_chars.iter().collect();
                 KeyAction::ConfirmCreate(build_modelfile(&from, &system, &runtime))
+            }
+            // M167：预览滚动（Up/Down 单行、PgUp/PgDn 十行；渲染层钳上限）
+            KeyCode::Up | KeyCode::PageUp => {
+                let step = if matches!(code, KeyCode::PageUp) {
+                    10
+                } else {
+                    1
+                };
+                self.preview_scroll = self.preview_scroll.saturating_sub(step);
+                KeyAction::Continue
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                let step = if matches!(code, KeyCode::PageDown) {
+                    10
+                } else {
+                    1
+                };
+                self.preview_scroll = self.preview_scroll.saturating_add(step);
+                KeyAction::Continue
             }
             KeyCode::Esc => KeyAction::Cancel,
             _ => KeyAction::Continue,
@@ -338,20 +461,23 @@ pub fn run(model: &str, models: Vec<String>) -> io::Result<Option<String>> {
     result
 }
 
-/// 终端初始化（raw mode + 备用屏幕 + panic hook 兜底恢复——TUI 中途
-/// panic 时先还原终端再走原 panic 输出，避免现场花屏锁死）
+/// 终端初始化（raw mode + 备用屏幕 + bracketed paste + panic hook 兜底
+/// 恢复——TUI 中途 panic 时先还原终端再走原 panic 输出，避免现场花屏
+/// 锁死）。M166：启用 bracketed paste 使多行粘贴作为整块 Paste 事件
+/// 到达（换行符保留在内容里，不被终端拆解为 Enter 按键序列）
 fn try_init() -> io::Result<ratatui::Terminal<CrosstermBackend<Stdout>>> {
     set_panic_hook();
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(io::stdout());
     ratatui::Terminal::new(backend)
 }
 
-/// 终端恢复（先退 raw mode 再退备用屏幕——副作用大的先收拾）
+/// 终端恢复（先退 raw mode，再退 bracketed paste 与备用屏幕——
+/// 副作用大的先收拾；panic hook 路径同样覆盖 paste 序列清理）
 fn try_restore() -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
     Ok(())
 }
 
@@ -373,15 +499,17 @@ fn event_loop(
 ) -> io::Result<Option<String>> {
     loop {
         terminal.draw(|frame| draw(app, frame))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                match app.on_key(key.code, key.modifiers) {
+                    KeyAction::Cancel => return Ok(None),
+                    KeyAction::ConfirmCreate(text) => return Ok(Some(text)),
+                    KeyAction::Continue => {}
+                }
             }
-            match app.on_key(key.code, key.modifiers) {
-                KeyAction::Cancel => return Ok(None),
-                KeyAction::ConfirmCreate(text) => return Ok(Some(text)),
-                KeyAction::Continue => {}
-            }
+            // M166：bracketed paste 整块多行内容（换行保留）
+            Event::Paste(text) => app.on_paste(&text),
+            _ => {}
         }
     }
 }
@@ -458,15 +586,29 @@ fn draw_pick_from(app: &WizardApp, frame: &mut Frame, area: ratatui::layout::Rec
     frame.render_stateful_widget(list, area, &mut app.list_state.clone());
 }
 
-/// 步骤②/③ 渲染：编辑内容 + 可见光标（行首缩进 1 空格留边）
+/// 步骤②/③ 渲染：编辑内容 + 可见光标（行首缩进 1 空格留边）。
+/// M167：多行内容超可视高度时按「底部对齐跟随光标」滚动——光标行恒
+/// 可见（nano/vim 标准视口行为；视口由光标位置派生，无独立滚动状态）。
+/// M168：光标列按显示宽折算（CJK 宽字符 2 列，复用 crate::display_width
+/// 零新依赖）；Wrap 折行时 y 按折行段偏移（近似口径：显示宽 ÷ 内区宽
+/// 均匀折算——Wrap 实际按词界断行，此近似较原字符列大幅改善）
 fn draw_editor(app: &WizardApp, frame: &mut Frame, area: ratatui::layout::Rect, multiline: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(app.step.title());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // M167 视口：内容行数超可视高度时底部对齐光标行（可视窗口切片）
+    let vis_h = inner.height as usize;
+    let view = if multiline {
+        app.sys_row
+            .saturating_sub(vis_h.saturating_sub(1))
+            .min(app.system_rows.len().saturating_sub(1))
+    } else {
+        0
+    };
     let lines: Vec<Line> = if multiline {
-        app.system_rows
+        app.system_rows[view..]
             .iter()
             .map(|r| Line::from(format!(" {}", r.iter().collect::<String>())))
             .collect()
@@ -478,26 +620,38 @@ fn draw_editor(app: &WizardApp, frame: &mut Frame, area: ratatui::layout::Rect, 
     };
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
-    // 光标定位（+1 为行首缩进列；TODO：CJK 宽字符时光标列按显示宽折算，
-    // 当前按字符列近似——不引 unicode-width 依赖的最小实现）
-    let (row, col) = if multiline {
-        (app.sys_row, app.sys_col)
+    // M168 光标定位：可视行号 + 光标前缀显示宽（+1 为行首缩进列；
+    // 折行段偏移 = 显示宽 ÷ 内区宽，列内偏移 = 显示宽 % 内区宽）
+    let (vis_row, col_chars, row_chars) = if multiline {
+        (
+            app.sys_row - view,
+            app.sys_col,
+            app.system_rows[app.sys_row].clone(),
+        )
     } else {
-        (0, app.runtime_chars.len())
+        (0usize, app.runtime_chars.len(), app.runtime_chars.clone())
     };
+    let prefix: String = row_chars.iter().take(col_chars).collect();
+    let pw = crate::display_width(&prefix) as u16;
+    let w = inner.width.max(1);
+    let y_off = pw / w;
+    let x_off = (1 + pw % w).min(w - 1); // 含缩进列，越界钳制到行尾
     frame.set_cursor_position(Position {
-        x: inner.x + col as u16 + 1,
-        y: inner.y + row as u16,
+        x: inner.x + x_off,
+        y: inner.y + vis_row as u16 + y_off,
     });
 }
 
-/// 步骤④ 渲染：组装后 Modelfile 全文预览
+/// 步骤④ 渲染：组装后 Modelfile 全文预览。
+/// M167：preview_scroll 滚动偏移（上限钳制到总行数防过度滚动空白）
 fn draw_preview(app: &WizardApp, frame: &mut Frame, area: ratatui::layout::Rect) {
     let from = app.selected_from().unwrap_or_default();
     let system: Vec<String> = app.system_rows.iter().map(|r| r.iter().collect()).collect();
     let runtime: String = app.runtime_chars.iter().collect();
     let text = build_modelfile(from, &system, &runtime);
+    let max_scroll = text.lines().count().saturating_sub(1) as u16;
     let preview = Paragraph::new(text)
+        .scroll((app.preview_scroll.min(max_scroll), 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -559,6 +713,7 @@ mod tests {
     }
 
     /// 步骤② 多行编辑核心操作：插入/退格跨行合并/换行分裂
+    ///（M166 后换行通道为 Alt+Enter，Enter 为完成）
     #[test]
     fn system_editor_editing_ops() {
         let mut app = WizardApp::new("t", vec!["m".to_string()]);
@@ -566,7 +721,7 @@ mod tests {
         for c in "ab".chars() {
             app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
-        app.on_key(KeyCode::Enter, KeyModifiers::NONE); // 换行
+        app.on_key(KeyCode::Enter, KeyModifiers::ALT); // Alt+Enter 换行
         app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
         assert_eq!(
             app.system_rows
@@ -574,7 +729,7 @@ mod tests {
                 .map(|r| r.iter().collect::<String>())
                 .collect::<Vec<_>>(),
             vec!["ab".to_string(), "c".to_string()],
-            "Enter 应在光标处分裂换行"
+            "Alt+Enter 应在光标处分裂换行"
         );
         // 光标先移回行首（c 之后 Backspace 只是删字符，不触发合并）
         app.on_key(KeyCode::Left, KeyModifiers::NONE);
@@ -583,14 +738,85 @@ mod tests {
         assert_eq!(app.system_rows[0].iter().collect::<String>(), "abc");
     }
 
-    /// 步骤流转：② Esc → ③ Enter → ④ Enter 组装确认（全链按键驱动）
+    /// M166：粘贴多行整块插入——换行保留、光标落插入末尾；单行粘贴合并不增行
+    #[test]
+    fn paste_multiline_inserts_rows_and_moves_cursor() {
+        let mut app = WizardApp::new("t", vec!["m".to_string()]);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ① 选中 → ②
+        for c in "AB".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Enter, KeyModifiers::ALT); // 换行后输入 CD
+        for c in "CD".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        // 光标回第一行行中（A|B 处）粘贴三行
+        app.on_key(KeyCode::Left, KeyModifiers::NONE);
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!((app.sys_row, app.sys_col), (0, 1));
+        app.on_paste("x\ny\nz");
+        assert_eq!(
+            app.system_rows
+                .iter()
+                .map(|r| r.iter().collect::<String>())
+                .collect::<Vec<_>>(),
+            vec![
+                "Ax".to_string(),
+                "y".to_string(),
+                "zB".to_string(),
+                "CD".to_string()
+            ],
+            "三行粘贴应分裂为：首行接 A、末行接 B、中间整行"
+        );
+        assert_eq!(
+            (app.sys_row, app.sys_col),
+            (2, 1),
+            "光标须落在粘贴末行内容结尾"
+        );
+        // 单行粘贴（无换行）：合并不新增行
+        app.on_paste("Q");
+        assert_eq!(app.system_rows.len(), 4, "单行粘贴不新增行");
+        assert_eq!(
+            app.system_rows[2].iter().collect::<String>(),
+            "zQB".to_string()
+        );
+        assert_eq!(app.sys_col, 2, "单行粘贴后光标在 Q 之后");
+    }
+
+    /// M166：EditSystem 键位——Enter 完成、Esc 取消向导
+    #[test]
+    fn edit_system_enter_completes_esc_cancels() {
+        let mut app = WizardApp::new("t", vec!["m".to_string()]);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ① 选中 → ②
+        app.on_key(KeyCode::Char('你'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ② Enter 完成
+        assert_eq!(app.step, Step::EditRuntime, "Enter 必须完成进入步骤③");
+        // Ctrl+S 仍为完成出口
+        let mut app2 = WizardApp::new("t", vec!["m".to_string()]);
+        app2.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        app2.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app2.step, Step::EditRuntime, "Ctrl+S 完成出口保留");
+        // Esc 取消整个向导
+        let mut app3 = WizardApp::new("t", vec!["m".to_string()]);
+        app3.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(
+                app3.on_key(KeyCode::Esc, KeyModifiers::NONE),
+                KeyAction::Cancel
+            ),
+            "步骤② Esc 必须取消向导（与①④语义对齐）"
+        );
+    }
+
+    /// 步骤流转：② Enter → ③ Enter → ④ Enter 组装确认（全链按键驱动，
+    /// M166 键位改造后完成通道为 Enter）
     #[test]
     fn full_flow_steps_advance_to_confirm() {
         let mut app = WizardApp::new("my-model", vec!["llama3.2:3b".to_string()]);
         app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ① 选中
         assert_eq!(app.step, Step::EditSystem);
         app.on_key(KeyCode::Char('你'), KeyModifiers::NONE);
-        app.on_key(KeyCode::Esc, KeyModifiers::NONE); // ② 完成
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ② 完成（M166：Enter）
         assert_eq!(app.step, Step::EditRuntime);
         app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ③ 跳过（空）
         assert_eq!(app.step, Step::Preview);
@@ -630,14 +856,75 @@ mod tests {
             "步骤① 快照：{snap1}"
         );
         assert!(snap1.contains("llama3.2:3b"));
-        // 步骤④：预览含 FROM 行
+        // 步骤④：预览含 FROM 行（M166 后步骤② 完成键为 Enter）
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
-        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.step, Step::Preview);
         let snap4 = snapshot_text(&mut term, &app);
         assert!(snap4.contains("FROM llama3.2:3b"), "步骤④ 快照：{snap4}");
         assert!(snap4.contains("my-model"));
+    }
+
+    /// M167：视口底部跟随——20 行内容在 14 行终端中光标行（末行）恒可见、
+    /// 首行滚出视口（长提示词粘贴后底部内容可见的行为学断言）
+    #[test]
+    fn edit_system_viewport_follows_cursor() {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 14))
+            .expect("TestBackend 构造");
+        let mut app = WizardApp::new("t", vec!["m".to_string()]);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ① 选中 → ②
+        let paste: String = (0..20).map(|i| format!("行{i}\n")).collect();
+        app.on_paste(&paste); // 20 行 + 末空行，光标落末空行
+        let snap = snapshot_text(&mut term, &app);
+        let flat = compact(&snap); // CJK 宽字符 skip cell 间断，压缩口径匹配
+        assert!(flat.contains("行19"), "末行（光标行）必须在视口内：{snap}");
+        assert!(!flat.contains("行0"), "首行应已滚出视口：{snap}");
+    }
+
+    /// M167：预览滚动键（Down 单行 / PgUp 十行 saturating / 超限渲染钳制）
+    #[test]
+    fn preview_scroll_keys_and_clamp() {
+        let mut app = WizardApp::new("my-model", vec!["llama3.2:3b".to_string()]);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.step, Step::Preview);
+        assert_eq!(app.preview_scroll, 0, "进入预览须重置滚动");
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.preview_scroll, 1);
+        app.on_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.preview_scroll, 11, "PgDn 十行步进");
+        app.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        app.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(app.preview_scroll, 0, "PgUp 越零 saturating 归零");
+        // 渲染钳制：滚动超总行数时渲染不 panic（快照可重复产出）
+        app.preview_scroll = 999;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 14))
+            .expect("TestBackend 构造");
+        let _ = snapshot_text(&mut term, &app);
+    }
+
+    /// M168：CJK 光标显示宽折算——3 个汉字后光标 x 按显示宽 6 列而非
+    /// 字符数 3 列（60x14 布局：主体 inner.x=1、首行 y=4）
+    #[test]
+    fn cursor_x_uses_display_width() {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 14))
+            .expect("TestBackend 构造");
+        let mut app = WizardApp::new("t", vec!["m".to_string()]);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE); // ① 选中 → ②
+        for c in "汉字字".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        use ratatui::backend::Backend as _; // get_cursor_position 在 Backend trait
+        term.draw(|f| draw(&app, f)).expect("draw");
+        // ratatui 0.30：经 Backend::get_cursor_position（&mut）取回置位坐标
+        let pos = term
+            .backend_mut()
+            .get_cursor_position()
+            .expect("光标必须置位");
+        assert_eq!(pos.x, 1 + 1 + 6, "CJK 光标列须按显示宽 2 列/字折算");
+        assert_eq!(pos.y, 4, "单行内容光标在主体区首行（y=4）");
     }
 
     /// 去空白压缩（TestBackend 宽字符 cell 后跟空格 skip cell，
