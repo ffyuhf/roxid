@@ -1153,12 +1153,14 @@ async fn print_assistant_stream(resp: reqwest::Response, verbose: bool) -> Strin
 /// thinking 增量的终端渲染形态（M29 碴10，R3-A 裁决：ANSI dim 暗色）。
 ///
 /// - 参数 thinking：思考文本增量
-/// - 返回：带暗色转义的渲染串（空增量为空串，不输出转义对）
+/// - 返回：带暗色转义的渲染串（空增量为空串，不输出转义对）；
+///   迭代42 D5（N-7 清偿 2026-09-11）：dim 经 M108 颜色层门控——
+///   NO_COLOR/TERM=dumb/非 TTY 下纯文本，管道消费零转义污染
 fn thinking_view(thinking: &str) -> String {
     if thinking.is_empty() {
         String::new()
     } else {
-        format!("\x1b[2m{thinking}\x1b[0m")
+        paint(stdout_color(), "2", thinking)
     }
 }
 
@@ -1564,13 +1566,21 @@ async fn cmd_pull(model: &str) -> i32 {
 
 /// 发起 /api/pull 并渲染进度流（M33 碴8：cmd_pull 与 cmd_run 404 自动
 /// 拉取共用）。
+/// 迭代44 M164：hf.co 形态且 TTY 时前置投影器变体交互选择（R2 裁决
+/// 2026-09-11 23:28），选定文件名经 /api/pull 可选 mmproj 字段传入
+/// 服务端（Q3-X 裁决 23:36）。
 ///
 /// - 参数 model：模型名（hf.co/ 形态直通服务端辅源分支）
 /// - 返回：0 成功；1 失败（错误已打印）
 async fn pull_and_render(model: &str) -> i32 {
+    let mmproj_choice = prompt_mmproj_choice(model).await;
+    let mut body = json!({"model": model});
+    if let Some(name) = &mmproj_choice {
+        body["mmproj"] = json!(name);
+    }
     let resp = match http()
         .post(format!("{}/api/pull", base_url()))
-        .json(&json!({"model": model}))
+        .json(&body)
         .send()
         .await
     {
@@ -1589,6 +1599,51 @@ async fn pull_and_render(model: &str) -> i32 {
             1
         }
     }
+}
+
+/// HF 直引拉取的投影器变体交互选择（迭代44 M164，R2 + Q2-B + Q3-X
+/// 裁决 2026-09-11 23:28/23:36）：
+/// - hf.co 名 + stdin 为 TTY：本地列 repo GGUF 文件（轻量 tree API），
+///   含 ≥2 个 mmproj 变体时打印编号列表（文件名 + 人类可读大小——
+///   mmproj_variants 保证 fp16/f16 优先、首项即默认项），回车默认 1，
+///   非法输入宽容钳制到范围；选定文件名随请求返回。
+/// - 非 hf.co 名 / 非 TTY / list 失败 / 变体 ≤1：返回 None——服务端
+///   权威处理（单一变体自动下载、多变体报错引导 CLI 交互，Q2-B）。
+///
+/// - 参数 model：规整后模型名（hf.co/ 前缀判定）
+/// - 返回：选定的投影器文件名（None 表示不指定）
+async fn prompt_mmproj_choice(model: &str) -> Option<String> {
+    use std::io::IsTerminal;
+    if !model.starts_with("hf.co/") || !std::io::stdin().is_terminal() {
+        return None;
+    }
+    // repo 段提取：hf.co/{user}/{repo}[:{quant}] → {user}/{repo}
+    let repo = model
+        .trim_start_matches("hf.co/")
+        .split(':')
+        .next()?
+        .to_string();
+    let files = roxid_server::registry::HuggingFaceSource::new()
+        .list_gguf_files(&repo)
+        .await
+        .ok()?;
+    let variants = roxid_server::registry::HuggingFaceSource::mmproj_variants(&files);
+    if variants.len() < 2 {
+        return None; // 0 个：无投影器；1 个：服务端自动选中（R2 单一自动）
+    }
+    println!("该仓库含 {} 个多模态投影器（mmproj）变体：", variants.len());
+    for (i, v) in variants.iter().enumerate() {
+        let name = v.path.rsplit('/').next().unwrap_or(&v.path);
+        println!("  {}) {}（{}）", i + 1, name, fmt_bytes(v.size));
+    }
+    print!("请输入序号 [1-{}]，回车默认 1：", variants.len());
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok()?;
+    let choice: usize = input.trim().parse().unwrap_or(1);
+    let idx = choice.clamp(1, variants.len()) - 1;
+    variants[idx].path.rsplit('/').next().map(str::to_string)
 }
 
 /// 消费 NDJSON 进度/状态流并渲染（M33 碴8 自 cmd_pull 抽取；M34 O-1 双
@@ -2230,12 +2285,18 @@ mod tests {
         assert_eq!(super::assistant_content_from_event(&done), None);
     }
 
-    /// M29 碴10（R3-A）：thinking 渲染形态——非空增量带 ANSI dim 包裹，
-    /// 空增量不产出转义对（避免污染输出）
+    /// M29 碴10（R3-A）+ 迭代42 D5（N-7）：thinking 渲染经 M108 颜色层
+    /// 门控——TTY 下 dim 包裹、非 TTY/NO_COLOR 下纯文本；空增量恒空串
     #[test]
-    fn thinking_view_wraps_with_ansi_dim() {
-        assert_eq!(super::thinking_view("推理中"), "\x1b[2m推理中\x1b[0m");
+    fn thinking_view_goes_through_color_gate() {
+        // 等价性断言（环境无关）：thinking_view ≡ paint(stdout_color(), "2", ·)
+        assert_eq!(
+            super::thinking_view("推理中"),
+            super::paint(super::stdout_color(), "2", "推理中")
+        );
         assert_eq!(super::thinking_view(""), "", "空增量必须为空串");
+        // TTY 形态锚定：dim 转义对（门控开启时 paint 的输出形态）
+        assert_eq!(super::paint(true, "2", "推理中"), "\x1b[2m推理中\x1b[0m");
     }
 
     /// M30 碴13：凭据文件写盘后权限必须收紧 0600（含 umask 非 600 环境）
@@ -2606,7 +2667,13 @@ mod tests {
                     "4096 token",
                     "5 分钟后"
                 );
-                (line.find(id).unwrap(), line.find("4096").unwrap())
+                // 迭代42 D1（2026-09-11）：列起点断言由字节位置改为显示宽
+                // 口径——PROCESSOR CJK 行 pad 后字节宽 28 ≠ 显示宽 21，
+                // 字节 find 起点必漂移（迭代38 引入潜伏），显示对齐才是目标
+                (
+                    super::display_width(&line[..line.find(id).unwrap()]),
+                    super::display_width(&line[..line.find("4096").unwrap()]),
+                )
             })
             .unzip();
         assert!(

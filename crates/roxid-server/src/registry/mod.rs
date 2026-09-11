@@ -462,6 +462,13 @@ impl OllamaRegistry {
             .unwrap_or(&layer.digest)
             .to_string();
         let digest = layer.digest.clone();
+        // 迭代42 D4（N-6 清偿 2026-09-11）：进度事件前缀统一——Progress
+        // 转发补目标文件名，对齐逐层 "pulling {file}" 事件形态（原裸
+        // "pulling" 与层事件两种前缀混杂，CLI 渲染层形态不一）
+        let file_label = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         // M32 碴9a：事件 total 取 downloader 探测的真实资源大小（tot），
         // 移除未使用的 layer.size 死代码绑定
         // M110（迭代33 碴3+碴12）：回调改阶段枚举——Progress 转进度事件、
@@ -469,7 +476,7 @@ impl OllamaRegistry {
         self.downloader
             .download(&url, dest, Some(&expected), move |ph| match ph {
                 DownloadPhase::Progress(done, tot) => on_event(PullEvent {
-                    status: Some("pulling".into()),
+                    status: Some(format!("pulling {file_label}")),
                     digest: Some(digest.clone()),
                     total: Some(tot),
                     completed: Some(done),

@@ -798,6 +798,21 @@ async fn write_native_final(
     ev["context"] = json!(tokens);
 }
 
+/// GGUF 训练长度（迭代43 M160/M161：扩窗目标封顶数据源，R1-A 裁决
+/// 2026-09-11 23:03）。show 的 M35 D13 同源读取；模型定位或 GGUF 解析
+/// 失败宽容 None（R1-A「GGUF 不可读时宽容不封顶」——仅超窗罕见路径调用）。
+///
+/// - 参数 models_root：模型仓库根目录
+/// - 参数 name：请求模型名
+/// - 返回：GGUF {arch}.context_length；不可得 None
+fn gguf_context_length(models_root: &std::path::Path, name: &str) -> Option<u64> {
+    let r = ModelRef::parse(name).ok()?;
+    let meta = repo::find_model(models_root, name).ok()?;
+    crate::registry::gguf::parse_metadata(&r.dir(models_root).join(&meta.files.model))
+        .ok()
+        .and_then(|g| g.context_length)
+}
+
 /// /api/chat：Ollama 聊天端点（全字段透传转换）
 pub async fn chat(
     State(st): State<Arc<AppState>>,
@@ -813,16 +828,21 @@ pub async fn chat(
     // 合并先于 want_ctx 计算——模型级 num_ctx 正确触发 D4c 重建；
     // find_model 失败按无预置处理不阻断
     let mut req = req;
-    if let Ok(meta) = repo::find_model(&st.models_root, &req.model) {
-        req.messages = apply_model_preset(req.messages, &meta.system, &meta.messages);
-        req.options = merge_model_parameters(&meta.parameters, req.options.take());
+    // 迭代43 M160：meta 保留 Option（generate 同构形态）——超窗扩窗封顶
+    // 需模型定位，原 if let 消费形态不保留句柄
+    let meta = repo::find_model(&st.models_root, &req.model).ok();
+    if let Some(m) = &meta {
+        req.messages = apply_model_preset(req.messages, &m.system, &m.messages);
+        req.options = merge_model_parameters(&m.parameters, req.options.take());
     }
     // D4c：请求级（含模型级合并后）options.num_ctx 不一致时按原版语义重建实例
     let want_ctx = crate::adapter::requested_num_ctx(req.options.as_ref());
     let want_rt = crate::adapter::requested_runtime(req.options.as_ref());
-    let lease = match st
+    // 迭代43 M160：lease 可变——超窗重建重放需整体替换；want_rt 首次传
+    // clone 保留原值（重放 acquire 复用，迭代43）
+    let mut lease = match st
         .scheduler
-        .acquire(&req.model, keep_alive, want_ctx, want_rt)
+        .acquire(&req.model, keep_alive, want_ctx, want_rt.clone())
         .await
     {
         Ok(r) => r,
@@ -830,11 +850,11 @@ pub async fn chat(
         Err(e) => return acquire_error_response(e),
     };
     // M28 碴6：acquire 耗时即 load_duration（复用实例≈0，冷加载为真实加载时长）
-    let load = request_start.elapsed();
-    let port = lease.port().await;
+    let mut load = request_start.elapsed();
+    let mut port = lease.port().await;
     let stream = req.stream.unwrap_or(true); // 原版默认流式
     let upstream_body = build_openai_chat_request(&req, stream);
-    let resp = match http()
+    let mut resp = match http()
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .json(&upstream_body)
         .send()
@@ -844,6 +864,46 @@ pub async fn chat(
         // M34 BUG-7：连接类失败转模型级文案（不暴露内部 URL/端口）
         Err(e) => return error_response(StatusCode::BAD_GATEWAY, upstream_failure_message(e)),
     };
+    // 迭代43 M160（2026-09-11 23:03 批准）：超窗自动扩窗重建重放——
+    // Q1=B 裁决（22:56）：400 且判型 exceed_context_size_error 时按
+    // n_prompt_tokens 扩窗（R1-A：+1024 余量、512 对齐、GGUF 训练长度封顶）、
+    // 经 acquire 的 D4c 重建链换新实例后重放同款请求体（零协议漂移）；
+    // R2：重试上限 1 次（二次失败落入下方统一透传，防循环）
+    if resp.status() == StatusCode::BAD_REQUEST {
+        let text = resp.text().await.unwrap_or_default();
+        match crate::adapter::parse_exceed_context_error(&text) {
+            Some(n_prompt) => {
+                let train_ctx = gguf_context_length(&st.models_root, &req.model);
+                let target = crate::adapter::expanded_ctx_target(n_prompt, train_ctx);
+                tracing::info!(
+                    model = %display_name, n_prompt_tokens = n_prompt, target_ctx = target,
+                    "超窗触发自动扩窗重建（迭代43 M160）"
+                );
+                lease = match st
+                    .scheduler
+                    .acquire(&req.model, keep_alive, Some(target), want_rt)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => return acquire_error_response(e),
+                };
+                load = request_start.elapsed(); // M28 碴6 口径：重建耗时并入 load_duration
+                port = lease.port().await;
+                resp = match http()
+                    .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                    .json(&upstream_body)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return error_response(StatusCode::BAD_GATEWAY, upstream_failure_message(e))
+                    }
+                };
+            }
+            None => return error_response(StatusCode::BAD_REQUEST, text),
+        }
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -915,9 +975,11 @@ pub async fn generate(
     // D4c：请求级（含模型级合并后）options.num_ctx 不一致时按原版语义重建实例
     let want_ctx = crate::adapter::requested_num_ctx(req.options.as_ref());
     let want_rt = crate::adapter::requested_runtime(req.options.as_ref());
-    let lease = match st
+    // 迭代43 M161：lease/load/port 可变——超窗重建重放需整体替换；want_rt
+    // 首次传 clone 保留原值（重放 acquire 复用，迭代43）
+    let mut lease = match st
         .scheduler
-        .acquire(&req.model, keep_alive, want_ctx, want_rt)
+        .acquire(&req.model, keep_alive, want_ctx, want_rt.clone())
         .await
     {
         Ok(r) => r,
@@ -925,8 +987,8 @@ pub async fn generate(
         Err(e) => return acquire_error_response(e),
     };
     // M28 碴6：acquire 耗时即 load_duration
-    let load = request_start.elapsed();
-    let port = lease.port().await;
+    let mut load = request_start.elapsed();
+    let mut port = lease.port().await;
     let stream = req.stream.unwrap_or(true);
     let raw = req.raw.unwrap_or(false);
 
@@ -960,19 +1022,19 @@ pub async fn generate(
         None
     };
 
-    let (url, body, chat_mode) = match &native {
-        Some(NativeChannel::Infill) => (
-            format!("http://127.0.0.1:{port}/infill"),
-            build_native_infill_request(&req, stream),
-            false,
-        ),
+    // 迭代43 M161：path 与 port 分离——超窗重建后端口变化，url 按新 port
+    // 重排（重放复用同款 body，零协议漂移）
+    let (path, body, chat_mode) = match &native {
+        Some(NativeChannel::Infill) => {
+            ("/infill", build_native_infill_request(&req, stream), false)
+        }
         Some(NativeChannel::Completion { prompt_tokens }) => (
-            format!("http://127.0.0.1:{port}/completion"),
+            "/completion",
             build_native_completion_request(&req, prompt_tokens.clone(), stream),
             false,
         ),
         None if raw => (
-            format!("http://127.0.0.1:{port}/v1/completions"),
+            "/v1/completions",
             build_openai_completion_request(&req, stream),
             false,
         ),
@@ -1015,19 +1077,49 @@ pub async fn generate(
                 top_logprobs: req.top_logprobs,
             };
             let body = build_openai_chat_request(&chat_req, stream);
-            (
-                format!("http://127.0.0.1:{port}/v1/chat/completions"),
-                body,
-                true,
-            )
+            ("/v1/chat/completions", body, true)
         }
     };
-
-    let resp = match http().post(&url).json(&body).send().await {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let mut resp = match http().post(&url).json(&body).send().await {
         Ok(r) => r,
         // M34 BUG-7：连接类失败转模型级文案（不暴露内部 URL/端口）
         Err(e) => return error_response(StatusCode::BAD_GATEWAY, upstream_failure_message(e)),
     };
+    // 迭代43 M161（2026-09-11 23:03 批准）：超窗自动扩窗重建重放——与
+    // chat（M160）同款：Q1=B 裁决（22:56）；三通道（infill/completion/
+    // chat 模板）统一按 n_prompt_tokens 扩窗重建后重放；R2 重试上限 1 次
+    if resp.status() == StatusCode::BAD_REQUEST {
+        let text = resp.text().await.unwrap_or_default();
+        match crate::adapter::parse_exceed_context_error(&text) {
+            Some(n_prompt) => {
+                let train_ctx = gguf_context_length(&st.models_root, &req.model);
+                let target = crate::adapter::expanded_ctx_target(n_prompt, train_ctx);
+                tracing::info!(
+                    model = %display_name, n_prompt_tokens = n_prompt, target_ctx = target,
+                    "超窗触发自动扩窗重建（迭代43 M161）"
+                );
+                lease = match st
+                    .scheduler
+                    .acquire(&req.model, keep_alive, Some(target), want_rt)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => return acquire_error_response(e),
+                };
+                load = request_start.elapsed(); // M28 碴6 口径：重建耗时并入 load_duration
+                port = lease.port().await;
+                let url = format!("http://127.0.0.1:{port}{path}");
+                resp = match http().post(&url).json(&body).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return error_response(StatusCode::BAD_GATEWAY, upstream_failure_message(e))
+                    }
+                };
+            }
+            None => return error_response(StatusCode::BAD_REQUEST, text),
+        }
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -1384,6 +1476,10 @@ pub async fn pull(
     // M28 碴16（R4-A）：insecure 贯穿下载链（原实现读取即弃，
     // 注释声称跳过证书校验从未生效）——true 时按请求构造危险证书客户端
     let insecure = req["insecure"].as_bool().unwrap_or(false);
+    // 迭代44 M164（Q3-X 裁决 2026-09-11 23:36）：CLI 交互选定的投影器
+    // 文件名经可选 mmproj 字段传入（官方客户端不发送该字段——缺省 None
+    // 时单一变体自动选中、多变体经 hf.pull 报错引导 CLI 交互，Q2-B）
+    let mmproj_choice = req["mmproj"].as_str().map(str::to_string);
     // hf.co/{user}/{repo}[:tag] 语法走 HF 辅源（Q3 裁决）
     let use_hf = model.starts_with("hf.co/");
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -1472,10 +1568,16 @@ pub async fn pull(
                         Some((r, t)) => (r.to_string(), Some(t.to_string())),
                         None => (rest.to_string(), None),
                     };
-                    hf.pull(&repo, tag.as_deref(), &root, |ev| {
-                        send_progress_event(&tx, &ev, &mut dropped);
-                        update_gate_snapshot(&progress_gate, &ev);
-                    })
+                    hf.pull(
+                        &repo,
+                        tag.as_deref(),
+                        &root,
+                        mmproj_choice.as_deref(),
+                        |ev| {
+                            send_progress_event(&tx, &ev, &mut dropped);
+                            update_gate_snapshot(&progress_gate, &ev);
+                        },
+                    )
                     .await
                 } else {
                     registry

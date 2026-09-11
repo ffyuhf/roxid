@@ -31,6 +31,12 @@
 //! M31（迭代11 F1/F3）：落位改 models/HF/{user}/{repo}/{quant}/ 三级路径
 //! （废弃 -- 转义）、注册名改 hf.co/{user}/{repo}:{quant} 对齐原版
 //! （原因：存储三分离与 HF 直引需求变更）2026-09-06 22-52
+//! M163-M165（迭代44）：多模态投影器（mmproj）拉取——文件名子串识别、
+//! pick_file 排除投影器（tag=fp16 误选存量缺陷清偿）、多变体决策
+//! （单一自动；多变体经 CLI 交互选择、/api/pull 可选 mmproj 字段传入
+//! ——Q3-X 裁决；非交互报错引导——Q2-B 裁决）、同管线下载落位
+//! mmproj.gguf 与 projection 摘要键（用户裁决 R1-A/R2/R3-A
+//! 2026-09-11 23:22-23:36）2026-09-11 23-40
 
 use std::path::Path;
 use std::sync::Arc;
@@ -127,6 +133,19 @@ fn quant_segment_matches(segment: &str, tag: &str) -> bool {
     segment == tag || (segment.starts_with(tag) && segment[tag.len()..].starts_with('_'))
 }
 
+/// 判断文件是否为多模态投影器（mmproj）。
+/// 迭代44 M163（R1-A 裁决 2026-09-11 23:28）：文件名（尾段）小写含
+/// "mmproj" 子串——覆盖 mmproj-fp16.gguf / mmproj-model.gguf /
+/// Qwen2.5-VL-mmproj-FP16.gguf 等全部主流命名形态（llama.cpp 生态专用词，
+/// 误纳概率可忽略）。
+fn is_mmproj_file(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+        .contains("mmproj")
+}
+
 /// ETag 值 → sha256 hex（HF LFS 语义）：剥引号与 sha256: 前缀后
 /// 恰 64 个 hex 字符才有效；旧文件 md5（32hex）等形态返回 None。
 fn etag_to_sha256(etag: &str) -> Option<String> {
@@ -215,8 +234,17 @@ impl HuggingFaceSource {
             return Ok(vec![]);
         }
         if !resp.status().is_success() {
+            // 迭代42 D6（N-8 清偿 2026-09-11）：鉴权失败（401/403）追加
+            // 引导——镜像站（hf-mirror 等）或私有仓库要求 token，指引用户
+            // signin 配置凭据或改走代理镜像；其余状态码文案形态不变
+            let hint = match resp.status() {
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                    "（可运行 roxid signin 配置 HuggingFace token，或设置 ROXID_HF_PROXY 使用镜像）"
+                }
+                _ => "",
+            };
             return Err(RoxidError::RegistryRequest(format!(
-                "HTTP {}：{url}",
+                "HTTP {}{hint}：{url}",
                 resp.status()
             )));
         }
@@ -242,20 +270,80 @@ impl HuggingFaceSource {
     /// 按 tag 选择文件（M28 碴5：量化词边界匹配——tag 命中文件名尾段量化词的
     /// 全等或「tag + 下划线边界」；"Q4_K_M" 不再误中 "IQ4_K_M"）；
     /// 缺省 tag 优先 Q4_K_M，其次取列表第一个（语义不变）。
+    /// 迭代44 M163：主模型候选排除 mmproj 投影器文件——原实现按量化词
+    /// 匹配不区分文件角色，tag=fp16 时 mmproj-fp16.gguf 量化段全等命中
+    /// 被误选为主模型（加载即崩的存量缺陷）；排除后 repo 仅含投影器时
+    /// 正确返回 None（上层报「未找到 GGUF」）。
     fn pick_file<'a>(files: &'a [HfTreeFile], tag: Option<&str>) -> Option<&'a HfTreeFile> {
-        if files.is_empty() {
+        let candidates: Vec<&HfTreeFile> =
+            files.iter().filter(|f| !is_mmproj_file(&f.path)).collect();
+        if candidates.is_empty() {
             return None;
         }
         if let Some(tag) = tag {
             let needle = tag.to_ascii_lowercase();
-            return files
+            return candidates
                 .iter()
+                .copied()
                 .find(|f| quant_segment_matches(&quant_segment_lower(&f.path), &needle));
         }
-        files
+        candidates
             .iter()
+            .copied()
             .find(|f| quant_segment_matches(&quant_segment_lower(&f.path), "q4_k_m"))
-            .or_else(|| files.first())
+            .or_else(|| candidates.first().copied())
+    }
+
+    /// 列出 repo 内全部多模态投影器变体（迭代44 M163，R2 裁决
+    /// 2026-09-11 23:28：多变体经 CLI 编号列表供用户选择，含大小显示）。
+    /// fp16/f16 变体优先排序（CLI 交互默认项 = 列表首项；同组保持
+    /// tree 返回顺序）。
+    ///
+    /// - 参数 files：tree API 返回的 GGUF 文件列表
+    /// - 返回：投影器变体列表（fp16/f16 组在前）
+    pub fn mmproj_variants(files: &[HfTreeFile]) -> Vec<&HfTreeFile> {
+        let mut variants: Vec<&HfTreeFile> =
+            files.iter().filter(|f| is_mmproj_file(&f.path)).collect();
+        variants.sort_by_key(|f| {
+            let name = f.path.to_ascii_lowercase();
+            !(name.contains("fp16") || name.contains("f16"))
+        });
+        variants
+    }
+
+    /// 投影器下载目标决策（迭代44 M163，R2 + Q2-B 裁决 2026-09-11 23:28）：
+    /// - 无变体 → Ok(None)：无投影器，普通模型拉取行为零变化
+    /// - 单一变体 → Ok(Some(自动选中))
+    /// - 多变体 + choice 命中（按尾段文件名全等）→ Ok(Some(指定))
+    /// - 多变体 + choice 缺省/未命中 → Err：非交互场景报错引导 CLI 交互
+    ///
+    /// - 参数 repo：形如 user/model（错误文案引导命令用）
+    /// - 参数 files：tree API 返回的 GGUF 文件列表
+    /// - 参数 choice：CLI 交互选定的投影器文件名（None 表示未指定）
+    /// - 返回：投影器目标条目；多变体无法决策时 Err（错误文案）
+    fn resolve_mmproj_target<'a>(
+        repo: &str,
+        files: &'a [HfTreeFile],
+        choice: Option<&str>,
+    ) -> Result<Option<&'a HfTreeFile>, String> {
+        let variants = Self::mmproj_variants(files);
+        match variants.len() {
+            0 => Ok(None),
+            1 => Ok(Some(variants[0])),
+            n => {
+                let Some(name) = choice else {
+                    return Err(format!(
+                        "hf.co/{repo} 含 {n} 个多模态投影器（mmproj）变体，当前场景无法交互选择：\
+                         请在终端运行 roxid pull hf.co/{repo} 完成选择"
+                    ));
+                };
+                variants
+                    .into_iter()
+                    .find(|f| f.path.rsplit('/').next() == Some(name))
+                    .map(Some)
+                    .ok_or_else(|| format!("指定的多模态投影器（mmproj）不存在：{name}"))
+            }
+        }
     }
 
     /// 无匹配 GGUF 的报错文案（迭代18 BUG-14）：人类可读、无 Debug 泄漏。
@@ -276,6 +364,9 @@ impl HuggingFaceSource {
     /// - 参数 repo：user/model 仓库路径
     /// - 参数 tag：量化变体（None → Q4_K_M 优先）
     /// - 参数 models_root：模型仓库根目录
+    /// - 参数 mmproj_choice：CLI 交互选定的投影器文件名（迭代44 M163，
+    ///   Q3-X 裁决 2026-09-11 23:36——经 /api/pull 可选 mmproj 字段传入；
+    ///   None 时单一变体自动选中、多变体报错引导 CLI 交互）
     /// - 参数 on_event：进度事件回调
     /// - 返回：落位后的模型引用（{dir_name}:{quant}）
     pub async fn pull(
@@ -283,6 +374,7 @@ impl HuggingFaceSource {
         repo: &str,
         tag: Option<&str>,
         models_root: &Path,
+        mmproj_choice: Option<&str>,
         mut on_event: impl FnMut(PullEvent) + Send,
     ) -> RoxidResult<ModelRef> {
         on_event(PullEvent::status(format!("pulling hf.co/{repo} GGUF 列表")));
@@ -299,6 +391,11 @@ impl HuggingFaceSource {
             .unwrap_or(&picked.path)
             .to_string();
         let quant = Self::quant_of(&file_name);
+
+        // 迭代44 M163：投影器决策——主模型下载前完成选择判定（R2/Q2-B
+        // 裁决 2026-09-11 23:28），避免大文件下载后才发现无法选择
+        let mmproj_target = Self::resolve_mmproj_target(repo, &files, mmproj_choice)
+            .map_err(RoxidError::RegistryRequest)?;
 
         // 迭代11 F1/F3：注册名 hf.co/{user}/{repo}:{quant}（quant_of 产物
         // 仅含字母数字/点/下划线/连字符，parse 必过）；落位 HF 三级路径
@@ -337,9 +434,11 @@ impl HuggingFaceSource {
             } else {
                 // M110（迭代33）：回调改阶段枚举——Progress 转进度事件、
                 // Verifying/Retrying 转状态事件（对齐主源事件形态）
-                let mut progress = |ph: DownloadPhase| match ph {
+                // 迭代42 D4（N-6 清偿 2026-09-11）：Progress 前缀补文件名，
+                // 对齐上方层事件 "pulling {file_name}" 形态（主源同步修改）
+                let progress = |ph: DownloadPhase| match ph {
                     DownloadPhase::Progress(done, tot) => on_event(PullEvent {
-                        status: Some("pulling".into()),
+                        status: Some(format!("pulling {file_name}")),
                         digest: expected.as_deref().map(|s| format!("sha256:{s}")),
                         total: Some(tot),
                         completed: Some(done),
@@ -361,6 +460,58 @@ impl HuggingFaceSource {
                     )
                     .await?;
             }
+        }
+
+        // 迭代44 M165：投影器下载落位（同管线：dest_gate 互斥 + 就位
+        // 快路径 + ChunkedDownloader + ETag sha256 校验 + 阶段事件——
+        // 事件文案 "pulling mmproj.gguf" 对齐主源 PROJECTION 层形态）
+        let mut mmproj_file: Option<String> = None;
+        let mut mmproj_digest: Option<String> = None;
+        if let Some(mm) = mmproj_target {
+            let mm_file = "mmproj.gguf";
+            let mm_dest = dir.join(mm_file);
+            on_event(PullEvent {
+                status: Some(format!("pulling {mm_file}")),
+                digest: None,
+                total: Some(mm.size),
+                completed: Some(0),
+                error: None,
+            });
+            let mm_url = hf_url(&format!("/{repo}/resolve/main/{}", mm.path));
+            let mm_expected = self.resolve_etag_sha256(&mm_url).await;
+            {
+                let gate = dest_gate(&mm_dest);
+                let _guard = gate.lock().await;
+                if dest_already_complete(&mm_dest, mm.size) {
+                    tracing::info!("HF 投影器已就位（快路径跳过下载）：{}", mm_dest.display());
+                } else {
+                    let mm_progress = |ph: DownloadPhase| match ph {
+                        DownloadPhase::Progress(done, tot) => on_event(PullEvent {
+                            status: Some(format!("pulling {mm_file}")),
+                            digest: mm_expected.as_deref().map(|s| format!("sha256:{s}")),
+                            total: Some(tot),
+                            completed: Some(done),
+                            error: None,
+                        }),
+                        DownloadPhase::Verifying => {
+                            on_event(PullEvent::status("verifying sha256 digest"))
+                        }
+                        DownloadPhase::Retrying(n, max) => on_event(PullEvent::status(format!(
+                            "retrying download (attempt {n}/{max})"
+                        ))),
+                    };
+                    self.downloader
+                        .download(
+                            &mm_url,
+                            &mm_dest,
+                            mm_expected.as_deref(), // 流式 sha256 校验（与主模型同语义）
+                            mm_progress,
+                        )
+                        .await?;
+                }
+            }
+            mmproj_file = Some(mm_file.to_string());
+            mmproj_digest = mm_expected.map(|sha| format!("sha256:{sha}"));
         }
 
         on_event(PullEvent::status("reading gguf header"));
@@ -393,18 +544,23 @@ impl HuggingFaceSource {
             template: None,
             parameters: Default::default(),
             messages: vec![],
-            // M20：ETag sha256（可得时）作为 model 层摘要索引
-            layer_digests: expected
-                .map(|sha| {
-                    let mut m = std::collections::BTreeMap::new();
+            // M20：ETag sha256（可得时）作为 model 层摘要索引；
+            // 迭代44 M165：补 projection 层摘要键（对齐主源 /api/blobs 语义）
+            layer_digests: {
+                let mut m = std::collections::BTreeMap::new();
+                if let Some(sha) = &expected {
                     m.insert("model".to_string(), format!("sha256:{sha}"));
-                    m
-                })
-                .unwrap_or_default(),
+                }
+                if let Some(d) = &mmproj_digest {
+                    m.insert("projection".to_string(), d.clone());
+                }
+                m
+            },
             adapters: vec![],
+            // 迭代44 M165：投影器落位登记（SpawnSpec→--mmproj 自动接通）
             files: ModelFiles {
                 model: "model.gguf".into(),
-                mmproj: None,
+                mmproj: mmproj_file,
             },
             digest: String::new(),
             license: String::new(), // HF 直拉无 license 层
@@ -547,6 +703,103 @@ mod tests {
             .path
             .contains("Q2_K"));
         assert!(HuggingFaceSource::pick_file(&files, Some("nope")).is_none());
+    }
+
+    /// 迭代44 M163：mmproj 识别——尾段子串命中、大小写不敏感、中缀形态覆盖
+    #[test]
+    fn mmproj_file_identification() {
+        assert!(is_mmproj_file("GGUF/mmproj-fp16.gguf"));
+        assert!(is_mmproj_file("mmproj-model.gguf"));
+        assert!(
+            is_mmproj_file("Qwen2.5-VL-mmproj-FP16.gguf"),
+            "中缀形态命中"
+        );
+        assert!(is_mmproj_file("MMProj-F16.gguf"), "大小写不敏感");
+        assert!(!is_mmproj_file("GGUF/m-Q4_K_M.gguf"));
+        assert!(!is_mmproj_file("GGUF/model.gguf"));
+    }
+
+    /// 迭代44 M163：pick_file 排除投影器——tag=fp16 不再误选 mmproj-fp16.gguf
+    ///（存量缺陷：量化段全等命中投影器，主模型位加载投影器即崩）
+    #[test]
+    fn pick_file_excludes_mmproj() {
+        let mk = |name: &str| HfTreeFile {
+            path: format!("GGUF/{name}"),
+            size: 1,
+        };
+        let files = vec![mk("mmproj-fp16.gguf"), mk("m-Q4_K_M.gguf")];
+        assert_eq!(
+            HuggingFaceSource::pick_file(&files, None).unwrap().path,
+            "GGUF/m-Q4_K_M.gguf",
+            "缺省选择不得命中投影器"
+        );
+        assert!(
+            HuggingFaceSource::pick_file(&files, Some("fp16")).is_none(),
+            "tag=fp16 的投影器量化段全等场景必须无匹配"
+        );
+        let only_proj = vec![mk("mmproj-fp16.gguf")];
+        assert!(
+            HuggingFaceSource::pick_file(&only_proj, None).is_none(),
+            "仅含投影器时正确报无候选（上层 ModelNotFound）"
+        );
+    }
+
+    /// 迭代44 M163：变体列表 fp16/f16 优先排序（CLI 交互默认项 = 首项）
+    #[test]
+    fn mmproj_variants_fp16_first() {
+        let mk = |name: &str, size: u64| HfTreeFile {
+            path: format!("GGUF/{name}"),
+            size,
+        };
+        let files = vec![
+            mk("mmproj-q8_0.gguf", 100),
+            mk("mmproj-fp16.gguf", 200),
+            mk("m-Q4_K_M.gguf", 300),
+            mk("mmproj-f16.gguf", 250),
+        ];
+        let variants = HuggingFaceSource::mmproj_variants(&files);
+        assert_eq!(variants.len(), 3, "主模型不得混入变体列表");
+        assert_eq!(variants[0].path, "GGUF/mmproj-fp16.gguf", "fp16 组优先");
+        assert_eq!(
+            variants[1].path, "GGUF/mmproj-f16.gguf",
+            "f16 同组次席（tree 序保持）"
+        );
+        assert_eq!(variants[2].path, "GGUF/mmproj-q8_0.gguf");
+    }
+
+    /// 迭代44 M163：投影器决策树——无/单一/多变体三态（R2 + Q2-B 裁决）
+    #[test]
+    fn resolve_mmproj_decision_tree() {
+        let mk = |name: &str| HfTreeFile {
+            path: format!("GGUF/{name}"),
+            size: 1,
+        };
+        // 无变体 → None（普通模型行为零变化）
+        let plain = vec![mk("m-Q4_K_M.gguf")];
+        assert!(
+            HuggingFaceSource::resolve_mmproj_target("u/m", &plain, None)
+                .unwrap()
+                .is_none()
+        );
+        // 单一变体 → 自动选中（choice 缺省）
+        let single = vec![mk("m-Q4_K_M.gguf"), mk("mmproj-fp16.gguf")];
+        let t = HuggingFaceSource::resolve_mmproj_target("u/m", &single, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.path, "GGUF/mmproj-fp16.gguf");
+        // 多变体 + 缺省 → Err 引导 CLI 交互（Q2-B 裁决）
+        let multi = vec![mk("m.gguf"), mk("mmproj-fp16.gguf"), mk("mmproj-q8_0.gguf")];
+        let err = HuggingFaceSource::resolve_mmproj_target("u/m", &multi, None).unwrap_err();
+        assert!(err.contains("roxid pull"), "错误文案必须含引导命令：{err}");
+        // 多变体 + 指定命中 → 选中指定
+        let t = HuggingFaceSource::resolve_mmproj_target("u/m", &multi, Some("mmproj-q8_0.gguf"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.path, "GGUF/mmproj-q8_0.gguf");
+        // 多变体 + 指定未命中 → Err
+        assert!(
+            HuggingFaceSource::resolve_mmproj_target("u/m", &multi, Some("nope.gguf")).is_err()
+        );
     }
 
     /// M28 碴5：量化词边界——IQ 前缀变体排在首位时不得被 "Q4_K_M" 误选
@@ -731,6 +984,7 @@ mod tests {
                 "bartowski/Qwen2.5-0.5B-Instruct-GGUF",
                 Some("IQ2_M"),
                 &root,
+                None, // 迭代44 M163：无投影器仓库，mmproj_choice 缺省
                 |_| events += 1,
             )
             .await

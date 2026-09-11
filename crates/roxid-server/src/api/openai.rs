@@ -16,6 +16,10 @@
 //! 2026-09-05 12-50
 //! M34 BUG-2（迭代14）：POST 提取器换 LenientJson（不校验 Content-Type，
 //! 对齐官方直读 body 行为；官方文档示例即裸 curl -d）2026-09-07 19-25
+//! 迭代42 D7（O-2 清偿）：响应 model 字段改写为规范化模型名（原透传
+//! llama-server 的 --model 实参即本地 GGUF 绝对路径，OpenAI 契约应为
+//! 模型标识符且兼有路径暴露面）——SSE 逐事件行缓冲改写、非流式整体
+//! 改写，relay_response 保持纯透传供 llamacpp 层共用 2026-09-11 21-10
 
 use std::sync::Arc;
 
@@ -80,7 +84,12 @@ async fn proxy_json(st: &Arc<AppState>, path: &str, body: Value) -> Response {
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    relay_response(resp, lease).await
+    // 迭代42 D7（O-2）：改写目标 = 规范化全名（与 acquire 实例键同源
+    // 规则；parse 在 acquire 内已成功，此处必过）
+    let display_name = crate::repo::ModelRef::parse(&model)
+        .ok()
+        .map(|r| r.full_name());
+    relay_response_remodel(resp, lease, display_name).await
 }
 
 /// 上游响应转客户端响应：状态/类型头透传，body 流式直通。
@@ -109,6 +118,122 @@ pub(crate) async fn relay_response(resp: reqwest::Response, lease: RunnerLease) 
         .header("content-type", content_type)
         .body(body)
         .unwrap()
+}
+
+/// 迭代42 D7（O-2 清偿 2026-09-11）：直通响应 model 字段改写。
+///
+/// llama-server 响应的 model 为 --model 实参（本地 GGUF 绝对路径，
+/// 兼有本机路径信息暴露），OpenAI 契约为模型标识符（官方 Ollama 返回
+/// 规范化模型名）。SSE 逐事件行缓冲改写（跨 chunk 边界安全，流式
+/// 语义保留）；非流式 JSON 缓冲整体改写；非 JSON 或无 model 键响应
+/// 原样透传。
+///
+/// - 参数 resp：上游响应
+/// - 参数 lease：本次请求的实例租约（SSE 路径移入流闭包随流释放，M27 语义）
+/// - 参数 display_name：改写目标模型名（规范化全名；None 时纯透传）
+/// - 返回：可直接返回给客户端的 axum Response
+pub(crate) async fn relay_response_remodel(
+    resp: reqwest::Response,
+    lease: RunnerLease,
+    display_name: Option<String>,
+) -> Response {
+    let Some(name) = display_name else {
+        return relay_response(resp, lease).await;
+    };
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    if content_type.contains("text/event-stream") {
+        // SSE：行缓冲逐事件改写——残余不完整行留缓冲等下一 chunk，
+        // 事件分隔（空行）与非 data 行天然按行原样透出
+        let mut pending: Vec<u8> = Vec::new();
+        let stream = resp.bytes_stream().map(move |chunk| {
+            let _ = &lease; // 闭包持有租约：流结束/丢弃时 Drop 释放
+            match chunk {
+                Ok(bytes) => {
+                    pending.extend_from_slice(&bytes);
+                    let mut out = Vec::new();
+                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=pos).collect();
+                        out.extend_from_slice(&rewrite_sse_line(&line, &name));
+                    }
+                    Ok(out)
+                }
+                Err(e) => Err(e),
+            }
+        });
+        return Response::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+    // 非流式：整体缓冲后改写（无 model 键或非 JSON 时原样透传）
+    match resp.bytes().await {
+        Ok(bytes) => {
+            let body = rewrite_json_model(&bytes, &name).unwrap_or(bytes.to_vec());
+            Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap()
+        }
+        Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+/// SSE 单行改写：`data: ` 前缀 JSON 的 model 字符串键（顶层与 response
+/// 对象嵌套，覆盖 chat chunk 与 /v1/responses 事件两形态）替换为目标名；
+/// [DONE] 哨兵、非 data 行、非 JSON data 行原样。
+fn rewrite_sse_line(line: &[u8], name: &str) -> Vec<u8> {
+    let s = String::from_utf8_lossy(line);
+    if let Some(payload) = s.strip_prefix("data: ") {
+        if let Ok(mut v) = serde_json::from_str::<Value>(payload.trim_end()) {
+            if rewrite_model_value(&mut v, name) {
+                return format!("data: {v}\n").into_bytes();
+            }
+        }
+    }
+    line.to_vec()
+}
+
+/// 就地改写 model 字符串键（顶层 + response 对象嵌套一层）；
+/// 发生改写返回 true，非对象形态返回 false。
+fn rewrite_model_value(v: &mut Value, name: &str) -> bool {
+    let Some(obj) = v.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(m) = obj.get_mut("model") {
+        if m.is_string() {
+            *m = json!(name);
+            changed = true;
+        }
+    }
+    if let Some(inner) = obj.get_mut("response").and_then(|r| r.as_object_mut()) {
+        if let Some(m) = inner.get_mut("model") {
+            if m.is_string() {
+                *m = json!(name);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// 非流式 JSON 整体改写；无 model 键或解析/序列化失败返回 None
+///（调用方原样透传）。
+fn rewrite_json_model(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
+    let mut v: Value = serde_json::from_slice(bytes).ok()?;
+    if rewrite_model_value(&mut v, name) {
+        serde_json::to_vec(&v).ok()
+    } else {
+        None
+    }
 }
 
 /// JSON 错误响应（M18 起供 llamacpp 直通层共用）
@@ -173,4 +298,53 @@ pub async fn models(State(st): State<Arc<AppState>>) -> Response {
         })
         .collect();
     Json(json!({"object": "list", "data": list})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 迭代42 D7（O-2）：SSE 行改写——model 键替换、[DONE] 与非 data 行
+    /// 原样、response 嵌套形态覆盖、非 JSON data 行透传
+    #[test]
+    fn sse_model_rewrite_forms() {
+        let line = b"data: {\"model\":\"/home/u/.roxid/m.gguf\",\"choices\":[]}\n";
+        let out = rewrite_sse_line(line, "smollm:135m");
+        // 语义断言（serde_json 默认 BTreeMap 键序，不锚定字面键序）
+        let payload = String::from_utf8_lossy(&out);
+        let json_part = payload.strip_prefix("data: ").expect("data 前缀必须保持");
+        let v: Value = serde_json::from_str(json_part.trim_end()).unwrap();
+        assert_eq!(v["model"], "smollm:135m", "model 键必须已改写");
+        assert_eq!(v["choices"], json!([]), "其余键原样");
+        // [DONE] 哨兵原样
+        assert_eq!(rewrite_sse_line(b"data: [DONE]\n", "m"), b"data: [DONE]\n");
+        // 非 data 行原样
+        assert_eq!(rewrite_sse_line(b"event: ping\n", "m"), b"event: ping\n");
+        // /v1/responses 嵌套形态（model 在 response 对象内）
+        let nested =
+            b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"/abs/path\"}}\n";
+        let out = rewrite_sse_line(nested, "qwen3:0.6b");
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("\"model\":\"qwen3:0.6b\""));
+        // 非 JSON data 行原样
+        assert_eq!(
+            rewrite_sse_line(b"data: not-json\n", "m"),
+            b"data: not-json\n"
+        );
+    }
+
+    /// 迭代42 D7（O-2）：非流式 JSON 改写与透传边界
+    #[test]
+    fn json_model_rewrite_forms() {
+        let body = b"{\"model\":\"/abs/m.gguf\",\"object\":\"chat.completion\"}";
+        let out = rewrite_json_model(body, "smollm:135m").unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("\"model\":\"smollm:135m\""));
+        // 无 model 键：None（调用方原样透传信号）
+        assert!(rewrite_json_model(b"{\"object\":\"list\"}", "m").is_none());
+        // 非 JSON：None
+        assert!(rewrite_json_model(b"<html>err</html>", "m").is_none());
+        // model 非字符串（数值）：不改写，None
+        assert!(rewrite_json_model(b"{\"model\":123}", "m").is_none());
+    }
 }

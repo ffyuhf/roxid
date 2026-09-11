@@ -106,6 +106,10 @@ pub struct SpawnSpec {
     /// None 表示未设置——不干预 llama-server 默认行为，--fit 自动分载生效）。
     /// 同时作为实例重建比较键（请求级 runtime 变化触发重建，对齐 D4c）
     pub runtime_flags: Option<String>,
+    /// 模型元数据 RUNTIME 指令串（迭代42 D2，N-1 清偿 2026-09-11）：
+    /// 实例的「默认形态」基准——与 runtime_flags 组合区分「模型自带指令」
+    /// 与「请求级临时覆盖」，复用判定据此隔离覆盖实例（R1-A 裁决）
+    pub model_runtime: Option<String>,
 }
 
 /// 构造 llama-server 完整参数列表（纯函数，便于单测断言）。
@@ -202,6 +206,8 @@ pub struct Runner {
     /// 生效的 RUNTIME 启动参数原始串（M39：请求级 runtime 与实例不一致时
     /// 触发重建的比较键；测试替身为 None）
     runtime_flags: Option<String>,
+    /// 模型级 RUNTIME 默认串（迭代42 D2）：复用判定的「未被覆盖」基准
+    model_runtime: Option<String>,
     /// 实际使用的 llama-server 二进制路径（M54b：resolve 链应然路径与实例
     /// 记录不一致时触发重建的比较键——runtime use 切换默认版本的生效点；
     /// 测试替身为空路径，比对方按「不可比对」放行）
@@ -254,6 +260,7 @@ impl Runner {
         runner.wait_until_healthy().await?;
         runner.ctx_per_slot = spec.ctx_size.max(512); // D4c：记录实例每 slot 窗口（重建比较键）
         runner.runtime_flags = spec.runtime_flags.clone(); // M39：RUNTIME 重建比较键
+        runner.model_runtime = spec.model_runtime.clone(); // 迭代42 D2：默认形态基准
         runner.llama_server_bin = spec.llama_server_bin.clone(); // M54b：后端版本重建比较键
         runner.size = size;
         Ok(runner)
@@ -345,6 +352,7 @@ impl Runner {
             pid: child.id(),
             ctx_per_slot: 0,
             runtime_flags: None, // M39：替身无 RUNTIME（真实实例经 spawn_llama_server 记录）
+            model_runtime: None, // 迭代42 D2：替身无默认串（真实实例经 spawn_llama_server 记录）
             llama_server_bin: PathBuf::new(), // M54b：替身空路径（比对时视为不可比对放行）
             child,
             expires_at: Instant::now() + keep_alive,
@@ -422,6 +430,13 @@ impl Runner {
     /// - 返回：拉起时生效的 RUNTIME 原始串
     pub fn runtime_flags(&self) -> Option<&str> {
         self.runtime_flags.as_deref()
+    }
+
+    /// 模型级 RUNTIME 默认串（迭代42 D2，N-1 清偿）——复用判定基准。
+    ///
+    /// - 返回：模型元数据 RUNTIME 指令串（未被请求覆盖时的生效串）
+    pub fn model_runtime(&self) -> Option<&str> {
+        self.model_runtime.as_deref()
     }
 
     /// 实例实际使用的 llama-server 二进制路径（M54b：runtime use 切换默认
@@ -662,7 +677,15 @@ fn spawn_log_forwarder<R>(
     tokio::spawn(async move {
         let mut lines = BufReader::new(stream).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!("[llama-server:{stream_name}] {line}");
+            // 迭代42 D3（N-5 清偿，R2-A 裁决 2026-09-11 21:00）：stderr
+            // 提级 info——GPU 分载（--fit）详情与异常诊断默认终端可见
+            //（原全量 debug 不可见，排查两眼一抹黑）；stdout 推理内容流
+            // 维持 debug（噪音大，无诊断价值）
+            if stream_name == "stderr" {
+                tracing::info!("[llama-server:{stream_name}] {line}");
+            } else {
+                tracing::debug!("[llama-server:{stream_name}] {line}");
+            }
             if let Some(t) = &tail {
                 if let Ok(mut q) = t.lock() {
                     if q.len() == STDERR_TAIL_LINES {
@@ -944,6 +967,7 @@ mod tests {
     fn spawn_args_parallel_and_total_ctx() {
         let spec = SpawnSpec {
             runtime_flags: None, // M39：本用例不覆盖 RUNTIME（追加段另测）
+            model_runtime: None, // 迭代42 D2：本用例无模型默认串
             llama_server_bin: PathBuf::from("/bin/llama-server"),
             gguf: PathBuf::from("/models/m.gguf"),
             mmproj: None,
@@ -1008,6 +1032,7 @@ mod tests {
             ctx_size: 2048,
             parallel: 4,
             runtime_flags: Some(r#"-ngl 30 --override-tensor "exps=CPU" --no-mmap"#.into()),
+            model_runtime: None, // 迭代42 D2：请求级覆盖场景（默认串不参与 spawn_args）
         };
         let args = spawn_args(&spec, 32141, "m:latest");
         // 追加段必须位于末尾（llama.cpp 后写覆盖先写——用户可覆盖 -c/--parallel）

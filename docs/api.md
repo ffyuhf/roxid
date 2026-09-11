@@ -130,6 +130,8 @@ curl http://127.0.0.1:11434/api/generate \
   -d '{"model": "llama3.2:3b", "prompt": "Hello", "stream": false}'
 ```
 
+> **Over-limit auto expansion** (iteration 43): when a request exceeds the running instance's context window (default 4096), roxid no longer forwards llama.cpp's 400 `exceed_context_size_error` — instead it rebuilds the instance with an expanded window and replays the request (target = actual tokens + 1024 margin, rounded up to a multiple of 512, capped at the GGUF trained context length; one retry, and the original error passes through if it fails again). An explicit `options.num_ctx` still takes precedence per the D4c rebuild semantics. Applies uniformly to `/api/chat` and `/api/generate` (including the raw, `context` continuation, and FIM channels).
+
 ### POST /api/chat
 
 Chat endpoint (message array; NDJSON streaming; `stream: true` by default).
@@ -202,6 +204,7 @@ Pull a model (NDJSON progress stream; concurrent duplicate pulls are deduplicate
 |---|---|---|---|
 | `model` | string | yes | model name (`hf.co/{user}/{repo}:{quant}` routes to the HF direct source) |
 | `insecure` | bool | no | skip TLS certificate verification when explicitly requested |
+| `mmproj` | string | no | roxid extension: the mmproj (vision projector) file name selected via CLI interaction — with multiple variants and no value set, the pull errors out with a hint to run `roxid pull` in a terminal; a single variant is downloaded automatically |
 
 Progress events: `{"status": "pulling manifest"}` → `{"status": "pulling xxx...", "digest": "...", "total": 6432345667, "completed": 123456789}` → `{"status": "success"}`; failure: `{"error": "..."}`.
 

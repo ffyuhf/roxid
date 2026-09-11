@@ -135,8 +135,11 @@ impl RunnerRegistry {
                 let mut guard = runner.lock().await;
                 let ok = want_ctx.map_or(true, |w| {
                     guard.ctx_per_slot() == 0 || guard.ctx_per_slot() == w
-                }) && runtime_matches(want_runtime.as_deref(), guard.runtime_flags())
-                    && !guard.is_process_dead()
+                }) && runtime_matches(
+                    want_runtime.as_deref(),
+                    guard.runtime_flags(),
+                    guard.model_runtime(),
+                ) && !guard.is_process_dead()
                     && llama_bin_matches(guard.llama_server_bin());
                 if ok {
                     guard.refresh_keep_alive(keep_alive);
@@ -165,8 +168,11 @@ impl RunnerRegistry {
                 let mut guard = runner.lock().await;
                 let ok = want_ctx.map_or(true, |w| {
                     guard.ctx_per_slot() == 0 || guard.ctx_per_slot() == w
-                }) && runtime_matches(want_runtime.as_deref(), guard.runtime_flags())
-                    && !guard.is_process_dead()
+                }) && runtime_matches(
+                    want_runtime.as_deref(),
+                    guard.runtime_flags(),
+                    guard.model_runtime(),
+                ) && !guard.is_process_dead()
                     && llama_bin_matches(guard.llama_server_bin());
                 if ok {
                     guard.refresh_keep_alive(keep_alive);
@@ -353,15 +359,24 @@ async fn runner_model_name(arc: &Arc<Mutex<Runner>>) -> String {
     arc.lock().await.model_name.clone()
 }
 
-/// M39：runtime 重建比较——请求未指定（None）恒命中（复用现有实例）；
-/// 指定时须与实例生效串逐字一致，不一致触发重建
+/// M39 + 迭代42 D2（N-1 清偿，R1-A 裁决 2026-09-11 21:00）：runtime
+/// 重建比较——请求未指定（None）时仅复用「未被请求级覆盖」的实例
+///（effective == model_default，对齐 num_ctx 宽容语义：宽容属于实例侧
+/// 默认形态，非请求侧缺省）；指定时须与实例生效串逐字一致。
+/// 原 `None => true` 使缺省请求误用 --rope-* 类临时覆盖实例（语义性
+/// flag 行为传染面）；模型自带 RUNTIME 指令属默认形态，不受影响。
 ///
 /// - 参数 want：请求级 RUNTIME 串
-/// - 参数 effective：实例生效 RUNTIME 串
+/// - 参数 effective：实例生效 RUNTIME 串（模型默认或请求覆盖）
+/// - 参数 model_default：模型元数据 RUNTIME 指令串（默认形态基准）
 /// - 返回：true 表示可复用
-fn runtime_matches(want: Option<&str>, effective: Option<&str>) -> bool {
+fn runtime_matches(
+    want: Option<&str>,
+    effective: Option<&str>,
+    model_default: Option<&str>,
+) -> bool {
     match want {
-        None => true,
+        None => effective == model_default,
         Some(w) => effective == Some(w),
     }
 }
@@ -428,6 +443,9 @@ fn spawn_spec_from_meta(
         parallel,
         // M39：RUNTIME 指令透传（spawn_args 内 shell 风格分词追加）
         runtime_flags: meta.runtime.clone(),
+        // 迭代42 D2（N-1）：默认形态基准（请求级覆盖发生在 acquire 层，
+        // 仅改 runtime_flags，本字段恒为模型指令串）
+        model_runtime: meta.runtime.clone(),
     }
 }
 
@@ -480,6 +498,38 @@ fn rfc3339_after(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 迭代42 D2（N-1，R1-A 裁决）：runtime 复用判定三参语义——缺省请求
+    /// 仅复用未被请求级覆盖的实例；带串请求精确匹配；模型指令属默认形态
+    #[test]
+    fn runtime_matches_strict_isolation_semantics() {
+        // 双缺省：复用（既有语义）
+        assert!(runtime_matches(None, None, None));
+        // 模型自带指令（未被覆盖）：缺省请求可复用（默认形态，非传染面）
+        assert!(runtime_matches(
+            None,
+            Some("--threads 2"),
+            Some("--threads 2")
+        ));
+        // 请求级覆盖实例：缺省请求不复用（碴面——原 None => true 误放行）
+        assert!(!runtime_matches(None, Some("--rope-scaling 0.5"), None));
+        assert!(!runtime_matches(
+            None,
+            Some("--rope-scaling 0.5"),
+            Some("--threads 2")
+        ));
+        // 带串请求：同串复用、异串重建（既有语义）
+        assert!(runtime_matches(
+            Some("--rope-scaling 0.5"),
+            Some("--rope-scaling 0.5"),
+            None
+        ));
+        assert!(!runtime_matches(Some("-ngl 30"), Some("-ngl 99"), None));
+        // 带串请求不复用干净实例（既有语义）
+        assert!(!runtime_matches(Some("-ngl 30"), None, None));
+        // 覆盖串恰等于模型默认：缺省请求复用无行为差异（串相同）
+        assert!(runtime_matches(None, Some("-ngl 30"), Some("-ngl 30")));
+    }
     use std::process::Stdio;
     use tokio::process::Command;
 

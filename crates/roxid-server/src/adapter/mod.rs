@@ -191,6 +191,46 @@ pub fn requested_runtime(options: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 判型并解析 llama-server 超窗错误体（迭代43 M160/M161：自动扩窗重建依据）。
+/// 错误体形态（b10883 实证，用户报告 2026-09-11 22:50）：
+/// `{"error":{"code":400,"message":"request (N tokens) exceeds ...","type":"exceed_context_size_error","n_prompt_tokens":N,"n_ctx":M}}`
+/// 调用方须先确认 HTTP 状态为 400（本函数只判 body）。
+///
+/// - 参数 body：上游错误响应体文本
+/// - 返回：超窗错误时返回 n_prompt_tokens；非超窗错误或字段缺失 None
+pub fn parse_exceed_context_error(body: &str) -> Option<u64> {
+    let err = serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("error")?
+        .clone();
+    if err.get("type").and_then(Value::as_str) != Some("exceed_context_size_error") {
+        return None;
+    }
+    err.get("n_prompt_tokens").and_then(Value::as_u64)
+}
+
+/// 扩窗目标值计算（迭代43 R1-A 裁决 2026-09-11 23:03）：
+/// 目标 = n_prompt_tokens + 1024 生成余量，向上对齐 512 倍数；
+/// GGUF 训练长度封顶（官方 effectiveContext 语义，/ollama/ollama
+/// server/sched.go 实证 2026-09-11 22:53）；GGUF 不可读（None）宽容不封顶；
+/// 下限 512 与 [requested_num_ctx] 同构（防发出不可用窗口）。
+///
+/// - 参数 n_prompt_tokens：超窗错误体携带的实际 prompt token 数
+/// - 参数 train_ctx：GGUF {arch}.context_length（不可读传 None）
+/// - 返回：重建实例的每 slot 目标窗口
+pub fn expanded_ctx_target(n_prompt_tokens: u64, train_ctx: Option<u64>) -> u32 {
+    const GEN_MARGIN: u64 = 1024;
+    const ALIGN: u64 = 512;
+    const FLOOR: u64 = 512;
+    let raw = n_prompt_tokens.saturating_add(GEN_MARGIN);
+    let aligned = raw.div_ceil(ALIGN).saturating_mul(ALIGN);
+    let capped = match train_ctx {
+        Some(train) => aligned.min(train.max(FLOOR)),
+        None => aligned,
+    };
+    capped.clamp(FLOOR, u32::MAX as u64) as u32
+}
+
 /// options + format + think → llama-server chat 请求的参数补丁。
 /// 返回可直接 merge 进 OpenAI 请求 JSON 的字段集合。
 ///
@@ -654,6 +694,13 @@ pub fn openai_chunk_to_ollama_chat_events(model: &str, chunk: &Value) -> Vec<Val
         if let Some(content) = delta["content"].as_str() {
             msg["content"] = json!(content);
         }
+        // 迭代42 D8（O-3 清偿 2026-09-11）：空增量补空串——官方流式事件
+        // message.content 恒为字符串（含 role-only 首 chunk）；原缺键形态
+        // 与官方 "" 不符（generate 侧 unwrap_or_default 已是 ""，chat 侧
+        // 补齐同口径；usage-only 空 choices 包不在此路径，终包合并不动）
+        if msg.get("content").is_none() {
+            msg["content"] = json!("");
+        }
         if let Some(rc) = delta["reasoning_content"].as_str() {
             msg["thinking"] = json!(rc);
         }
@@ -1017,6 +1064,37 @@ mod tests {
         );
         assert_eq!(requested_num_ctx(Some(&json!({}))), None);
         assert_eq!(requested_num_ctx(None), None);
+    }
+
+    /// 迭代43 M162：超窗错误体判型解析与扩窗目标值（R1-A 裁决 2026-09-11 23:03：
+    /// +1024 余量、512 对齐、GGUF 训练长度封顶、512 下限）
+    #[test]
+    fn exceed_context_error_parsing_and_expansion() {
+        // 用户报告原始形态（2026-09-11 22:50，b10883 实证）
+        let body = r#"{"error":{"code":400,"message":"request (6676 tokens) exceeds the available context size (4096 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":6676,"n_ctx":4096}}"#;
+        assert_eq!(parse_exceed_context_error(body), Some(6676));
+        // 非超窗错误体 / type 不匹配 / 非 JSON：None（不触发扩窗）
+        assert_eq!(
+            parse_exceed_context_error(r#"{"error":"model not found"}"#),
+            None
+        );
+        assert_eq!(
+            parse_exceed_context_error(r#"{"error":{"type":"api_error","n_prompt_tokens":10}}"#),
+            None
+        );
+        assert_eq!(parse_exceed_context_error("not json"), None);
+        // R1-A：6676 + 1024 = 7700 → 向上对齐 512 → 8192；无封顶
+        assert_eq!(expanded_ctx_target(6676, None), 8192);
+        // 恰好对齐边界：5120 + 1024 = 6144（512 的整数倍，不再上取）
+        assert_eq!(expanded_ctx_target(5120, None), 6144);
+        // 封顶命中：训练长度 4096 < 计算值 8192 → 4096
+        assert_eq!(expanded_ctx_target(6676, Some(4096)), 4096);
+        // 封顶高于计算值：不放大（封顶是上界不是目标）
+        assert_eq!(expanded_ctx_target(100, Some(65536)), 1536);
+        // 封顶低于下限：训练长度 100 → 下限 512（不发出不可用窗口）
+        assert_eq!(expanded_ctx_target(6676, Some(100)), 512);
+        // 极小输入下限保护：0 + 1024 = 1024 已对齐
+        assert_eq!(expanded_ctx_target(0, None), 1024);
     }
 
     /// 流式 chunk → chat NDJSON（含末包统计）

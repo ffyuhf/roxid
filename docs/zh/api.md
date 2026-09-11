@@ -130,6 +130,8 @@ curl http://127.0.0.1:11434/api/generate \
   -d '{"model": "llama3.2:3b", "prompt": "你好", "stream": false}'
 ```
 
+> **超窗自动扩窗**（迭代43）：请求超过实例上下文窗口（默认 4096）时，roxid 不再透出 llama.cpp 的 400 `exceed_context_size_error`，而是按实际 token 数扩窗重建实例后重放（目标 = 实际 token 数 + 1024 余量，向上对齐 512 倍数，GGUF 训练长度封顶；重试 1 次，仍失败则透传原始错误）。显式传入 `options.num_ctx` 时仍按 D4c 语义以请求值为准。`/api/chat` 与 `/api/generate`（含 raw、`context` 续传、FIM 通道）一致生效。
+
 ### POST /api/chat
 
 对话端点（多轮消息数组；NDJSON 流式，默认 `stream: true`）。
@@ -202,6 +204,7 @@ curl http://127.0.0.1:11434/api/create -d '{"model": "m2", "from": "FROM llama3.
 |---|---|---|---|
 | `model` | string | 是 | 模型名（`hf.co/{user}/{repo}:{quant}` 形态走 HF 直引源） |
 | `insecure` | bool | 否 | 显式请求时跳过 TLS 证书校验 |
+| `mmproj` | string | 否 | roxid 扩展：CLI 交互选定的多模态投影器（mmproj）文件名——多变体且未传时拉取报错并引导在终端运行 `roxid pull` 选择；单一变体自动下载 |
 
 进度事件：`{"status": "pulling manifest"}` → `{"status": "pulling xxx…", "digest": "...", "total": 6432345667, "completed": 123456789}` → `{"status": "success"}`；失败：`{"error": "..."}`。
 

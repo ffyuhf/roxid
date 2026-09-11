@@ -1117,7 +1117,15 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
     /// ROXID_GH_PROXY=... cargo test -p roxid-server runtime -- --ignored --nocapture
     #[tokio::test]
     #[ignore = "真实网络下载，验收时手动执行"]
+    #[allow(clippy::await_holding_lock)]
     async fn ensure_llama_server_downloads_and_caches() {
+        // 迭代42 D11（注记B 清偿 2026-09-11）：--include-ignored 全并行时
+        // 与读 ROXID_HOME env 的常规测试（gh_proxy_prefix_falls_back_to_
+        // config_file 等）互扰——env 全局态须持锁串行（同文件既有模式；
+        // 锁跨 await 持有为该测试族既定语义）
+        let _guard = crate::config::ROXID_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         std::env::set_var("ROXID_HOME", "/tmp/roxid-rt-e2e");
         let path = ensure_llama_server("ubuntu-x64").await.unwrap();
         assert!(path.is_file(), "llama-server 未落位：{path:?}");

@@ -500,6 +500,7 @@ async fn hf_pull_coder_for_infill() {
             "bartowski/Qwen2.5-Coder-0.5B-GGUF",
             Some("IQ3_M"),
             &root,
+            None, // 迭代44 M163：无投影器仓库，mmproj_choice 缺省
             |_| {},
         )
         .await
