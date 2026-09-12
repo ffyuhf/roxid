@@ -150,7 +150,7 @@ curl http://127.0.0.1:11434/api/generate \
 
 流式中断：后端中途死亡时以可读的 `{"error":"上游中断：…"}` 行收尾（可得时附 `stderr_tail` 实例 stderr 尾部行）——传输层始终正常终止。
 
-模型加载行为：提供相同服务的模型（文本生成 / 向量 / TTS，按 GGUF 架构动态归组）同类互斥——加载新模型时立即卸载同类空闲实例（在途请求绝不中断；异类实例不受影响）。生成类模型自动附带投机解码启动（内嵌 MTP 头的模型为 `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2`，其余为 `--spec-type ngram-mod`）；在 RUNTIME / 请求 `options.runtime` 中设置含 `--spec-type` 或 `-md` 的参数即可手动接管。
+模型加载行为：提供相同服务的模型（文本生成 / 向量 / TTS，按 GGUF 架构动态归组）同类互斥——加载新模型时立即卸载同类空闲实例（在途请求绝不中断；异类实例不受影响）。生成类模型自动附带投机解码启动，并补齐使 llama-server 真正构建投机上下文的配套参数：内嵌 MTP 头的模型为 `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 3`，其余为 `--spec-type ngram-mod`；两者均附带按架构分档的 `--spec-ngram-mod-n-match/-n-min/-n-max`（MoE 24/48/64 官方推荐值；dense 16/24/32）。每次拉起后 roxid 会探测 `/props` 并在日志中报告投机解码实际激活状态（`speculative: true/false`）；在 RUNTIME / 请求 `options.runtime` 中设置含 `--spec-type` 或 `-md` 的参数即可手动接管。
 
 流式响应（NDJSON 每行）：
 

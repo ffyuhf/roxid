@@ -604,6 +604,10 @@ fn spawn_spec_from_meta(
                 std::env::var(crate::scheduler::ENV_NUM_PARALLEL_FALLBACK).ok(),
             )
         });
+    // 迭代51 M196 + 迭代56 M209：GGUF header 一次解析贯通 MTP 头与 MoE
+    // 双判定（复用同次 IO，读 header 失败宽容 false——投机注入降级
+    // ngram-mod dense 档不阻断加载）2026-09-13 01-14
+    let gguf_meta = crate::registry::gguf::parse_metadata(&dir.join(&meta.files.model));
     SpawnSpec {
         llama_server_bin: bin.to_path_buf(),
         gguf: dir.join(&meta.files.model),
@@ -618,12 +622,12 @@ fn spawn_spec_from_meta(
         model_runtime: meta.runtime.clone(),
         // 迭代51 M193：服务类别（M194 同类换载判定键，词根规则单一事实源）
         service_class: super::service_class(&meta.family),
-        // 迭代51 M196：GGUF 内嵌 MTP 头检测（llama.cpp auto-detect 同款
-        // 标志 nextn.eh_proj；读 header 失败宽容 false——投机注入降级
-        // ngram-mod 不阻断加载）
-        has_mtp: crate::registry::gguf::parse_metadata(&dir.join(&meta.files.model))
-            .map(|g| g.has_mtp)
-            .unwrap_or(false),
+        // 迭代51 M196：MTP 头检测（llama.cpp auto-detect 同款标志
+        // nextn.eh_proj）
+        has_mtp: gguf_meta.as_ref().map(|g| g.has_mtp).unwrap_or(false),
+        // 迭代56 M209：MoE 检测（llama.cpp fit.cpp LAYER_FRACTION_MOE
+        // 同款标志 ffn_*_exps tensor）——ngram 投机参数分档依据
+        is_moe: gguf_meta.map(|g| g.is_moe).unwrap_or(false),
     }
 }
 

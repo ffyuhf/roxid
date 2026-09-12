@@ -61,6 +61,11 @@ pub struct GgufMetadata {
     /// common/speculative.cpp auto-detect 同款判定标志；MTP 投机解码
     /// 自动注入 --spec-type draft-mtp 的依据）
     pub has_mtp: bool,
+    /// MoE 架构（迭代56 M209：tensor 名含 ffn_ 前缀 + exps 段——llama.cpp
+    /// common/fit.cpp LAYER_FRACTION_MOE 正则 blk.N.ffn_(up|down|gate_up|
+    /// gate)_(ch|)exps 同款判定标志，三源码实证；ngram 投机参数
+    /// MoE/dense 分档注入的依据）
+    pub is_moe: bool,
 }
 
 /// GGUF kv 区流式读取器（BufReader 包装：定宽读取 + 按字节跳过）
@@ -283,6 +288,13 @@ pub fn parse_metadata(path: &Path) -> RoxidResult<GgufMetadata> {
         // draft-mtp）；子串匹配覆盖任意 block 序号与权重变体命名
         if name.contains("nextn.eh_proj") {
             meta.has_mtp = true;
+        }
+        // 迭代56 M209：MoE 判定——tensor 名含 ffn_ 前缀且含 exps 段
+        //（ffn_gate_exps/ffn_down_exps/ffn_up_exps/ffn_gate_up_exps/
+        // ffn_*_chexps 官方模式族，fit.cpp LAYER_FRACTION_MOE 正则同款；
+        // 子串双命中防误判——非 MoE tensor 无此组合）2026-09-13 01-13
+        if name.contains("ffn_") && name.contains("exps") {
+            meta.is_moe = true;
         }
         let n_dims = reader.read_u32()? as usize;
         let mut elements: u64 = 1;
@@ -512,6 +524,68 @@ mod tests {
             parsed.unwrap()
         };
         assert!(!meta.has_mtp, "无 MTP tensor 须判非 MTP 模型");
+        assert!(!meta.is_moe, "dense（无 exps tensor）须判非 MoE");
+    }
+
+    /// 迭代56 M209：MoE 检测——tensor 名含 ffn_ 前缀 + exps 段判真
+    ///（ffn_gate_exps/ffn_*_chexps 官方模式族）；dense FFN tensor 判假。
+    /// 来源：llama.cpp common/fit.cpp LAYER_FRACTION_MOE 正则 + fit-params
+    /// 真实运行输出 + arg.cpp LLM_FFN_EXPS_REGEX 三源码实证
+    ///（迭代56 计划书 1.2 A5，2026-09-13）。
+    #[test]
+    fn moe_tensor_detection() {
+        // MoE 形态：qwen3moe blk.N.ffn_gate_exps.weight tensor
+        let b = GgufBuilder::v3()
+            .str_kv(KEY_ARCHITECTURE, "qwen3moe")
+            .tensor("token_embd.weight", &[1024, 128])
+            .tensor("blk.0.ffn_gate_exps.weight", &[1024, 4])
+            .tensor_count(2);
+        let meta = {
+            let mut buf = b.buf.clone();
+            buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // kv_count=1
+            let path = std::env::temp_dir().join("roxid-gguf-moe.gguf");
+            std::fs::write(&path, &buf).unwrap();
+            let parsed = parse_metadata(&path);
+            std::fs::remove_file(&path).ok();
+            parsed.unwrap()
+        };
+        assert!(meta.is_moe, "ffn_gate_exps tensor 在位须判 MoE");
+        assert_eq!(meta.architecture.as_deref(), Some("qwen3moe"));
+
+        // chexps 变体（fit.cpp 正则 (ch|)exps 分支）同样判真
+        let b = GgufBuilder::v3()
+            .str_kv(KEY_ARCHITECTURE, "qwen3moe")
+            .tensor("blk.1.ffn_gate_chexps.weight", &[1024, 4])
+            .tensor_count(1);
+        let meta = {
+            let mut buf = b.buf.clone();
+            buf[16..24].copy_from_slice(&1u64.to_le_bytes());
+            let path = std::env::temp_dir().join("roxid-gguf-chexps.gguf");
+            std::fs::write(&path, &buf).unwrap();
+            let parsed = parse_metadata(&path);
+            std::fs::remove_file(&path).ok();
+            parsed.unwrap()
+        };
+        assert!(meta.is_moe, "ffn_gate_chexps 变体须判 MoE");
+
+        // Qwen3.5 dense 形态（qwen35.cpp 实证：FFN 为 SwiGLU 三件套，
+        // 无 exps tensor）判假
+        let b = GgufBuilder::v3()
+            .str_kv(KEY_ARCHITECTURE, "qwen35")
+            .tensor("blk.0.ffn_gate.weight", &[1024, 2816])
+            .tensor("blk.0.ffn_down.weight", &[2816, 1024])
+            .tensor("blk.0.ffn_up.weight", &[1024, 2816])
+            .tensor_count(3);
+        let meta = {
+            let mut buf = b.buf.clone();
+            buf[16..24].copy_from_slice(&1u64.to_le_bytes());
+            let path = std::env::temp_dir().join("roxid-gguf-dense.gguf");
+            std::fs::write(&path, &buf).unwrap();
+            let parsed = parse_metadata(&path);
+            std::fs::remove_file(&path).ok();
+            parsed.unwrap()
+        };
+        assert!(!meta.is_moe, "dense SwiGLU FFN 须判非 MoE");
     }
 
     /// 坏 magic 必须报错

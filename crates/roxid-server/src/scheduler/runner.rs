@@ -129,6 +129,10 @@ pub struct SpawnSpec {
     /// 对齐 llama.cpp common/speculative.cpp auto-detect 判定标志）；
     /// 投机参数组合选择的依据；读 GGUF 失败宽容 false
     pub has_mtp: bool,
+    /// GGUF 为 MoE 架构（迭代56 M209：tensor 名含 ffn_ 前缀 + exps 段，
+    /// 对齐 llama.cpp common/fit.cpp LAYER_FRACTION_MOE 判定标志）；
+    /// ngram 投机参数 MoE/dense 分档的依据；读 GGUF 失败宽容 false
+    pub is_moe: bool,
 }
 
 /// 构造 llama-server 完整参数列表（纯函数，便于单测断言）。
@@ -193,11 +197,33 @@ pub fn spawn_args(spec: &SpawnSpec, port: u16, alias: &str) -> Vec<String> {
     if spec.service_class == super::ServiceClass::Generation && !user_takes_over_spec {
         args.push("--spec-type".into());
         if spec.has_mtp {
+            // M209（迭代56 Q1 裁决 2026-09-13 00:59）：n-max 2→3——官方
+            // 默认值（docs/speculative.md 参数表 + common/arg.cpp 双源实证）
             args.push("draft-mtp,ngram-mod".into());
             args.push("--spec-draft-n-max".into());
-            args.push("2".into());
+            args.push("3".into());
         } else {
             args.push("ngram-mod".into());
+        }
+        // M209（迭代56 Q2 裁决 2026-09-13 00:59）：ngram-mod 配套参数
+        // 补齐——官方推荐命令为类型+参数同传（docs/speculative.md 十轮
+        // 验证五现）；MoE/dense 分档（is_moe 来源 A5：fit.cpp/fit-params/
+        // arg.cpp LLM_FFN_EXPS_REGEX 三源码实证）：MoE 用官方推荐值
+        // 24/48/64（官方注释「MoEs require long drafts」）；dense 缩小
+        // draft 长度 16/24/32（官方注释「dense models: can reduce
+        // n-min/n-max」，具体值经迭代56 计划书批准，RUNTIME 可覆盖）
+        let (n_match, n_min, n_max) = if spec.is_moe {
+            ("24", "48", "64")
+        } else {
+            ("16", "24", "32")
+        };
+        for (flag, val) in [
+            ("--spec-ngram-mod-n-match", n_match),
+            ("--spec-ngram-mod-n-min", n_min),
+            ("--spec-ngram-mod-n-max", n_max),
+        ] {
+            args.push(flag.into());
+            args.push(val.into());
         }
     }
     if let Some(mmproj) = &spec.mmproj {
@@ -215,6 +241,19 @@ pub fn spawn_args(spec: &SpawnSpec, port: u16, alias: &str) -> Vec<String> {
         args.extend(tokenize_flags(rt));
     }
     args
+}
+
+/// M210（迭代56）：/props 响应分类——读 default_generation_settings.
+/// speculative 布尔（官方 server README slots/props 响应契约，四轮验证：
+/// 00:56 slots 示例、01:04 /props APIDOC 规范段 + JSON 详述段）。
+///
+/// - 参数 props：/props 端点反序列化的 JSON 值
+/// - 返回：Some(true)=已激活 / Some(false)=未激活 / None=字段缺失
+///   （旧版运行时无该字段，宽容不告警）
+fn speculative_status_from_props(props: &serde_json::Value) -> Option<bool> {
+    props
+        .pointer("/default_generation_settings/speculative")
+        .and_then(|v| v.as_bool())
 }
 
 /// shell 风格分词（M39）：空白分隔 + 双/单引号保留含空格单值——
@@ -319,6 +358,12 @@ impl Runner {
         let mut runner = Self::spawn_with(name, port, keep_alive, &mut cmd).await?;
         // 等待 /health 就绪后再交付（进程即退或超时在此暴露）
         runner.wait_until_healthy().await?;
+        // M210（迭代56 Q3 裁决 2026-09-13 00:59）：生成类就绪后探测投机
+        // 激活状态（best-effort 一次 GET，失败不影响交付）——argv 合法
+        // 但投机未激活自此终端可见
+        if spec.service_class == super::ServiceClass::Generation {
+            runner.probe_speculative_activation().await;
+        }
         runner.ctx_per_slot = spec.ctx_size.max(512); // D4c：记录实例每 slot 窗口（重建比较键）
         runner.runtime_flags = spec.runtime_flags.clone(); // M39：RUNTIME 重建比较键
         runner.model_runtime = spec.model_runtime.clone(); // 迭代42 D2：默认形态基准
@@ -461,6 +506,42 @@ impl Runner {
                 )));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+    }
+
+    /// M210（迭代56）：/props 投机激活探测——health 就绪后一次 GET
+    /// `http://127.0.0.1:{port}/props`，读 default_generation_settings.
+    /// speculative（官方 server README 契约，四轮验证）：true → info；
+    /// false → warn（附 RUNTIME 逃生口）；端点不存在/请求失败/解析失败
+    /// （旧版运行时）→ debug 不 warn 不阻断。2026-09-13 01-15
+    async fn probe_speculative_activation(&self) {
+        let url = format!("http://127.0.0.1:{}/props", self.port);
+        let Ok(resp) = self.http.get(&url).send().await else {
+            tracing::debug!(
+                "[llama-server:props] 探测失败（旧版运行时或未就绪）：{}",
+                self.model_name
+            );
+            return;
+        };
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            tracing::debug!("[llama-server:props] 响应解析失败：{}", self.model_name);
+            return;
+        };
+        match speculative_status_from_props(&json) {
+            Some(true) => tracing::info!(
+                "[llama-server:props] 投机解码已激活（model={}）",
+                self.model_name
+            ),
+            Some(false) => tracing::warn!(
+                "[llama-server:props] 投机解码未激活（model={}）——argv 含 --spec-type \
+                 但 /props 报 false；可用 RUNTIME 显式 --spec-type none 覆盖或 \
+                 runtime use 切新版排查",
+                self.model_name
+            ),
+            None => tracing::debug!(
+                "[llama-server:props] speculative 字段缺失（旧版运行时）：{}",
+                self.model_name
+            ),
         }
     }
 
@@ -1078,6 +1159,7 @@ mod tests {
             // 迭代51 M196：默认生成类 + 无 MTP（注入段断言见注入矩阵用例）
             service_class: crate::scheduler::ServiceClass::Generation,
             has_mtp: false,
+            is_moe: false, // 迭代56 M209 补齐（本用例不涉投机档位断言）
         };
         let args = spawn_args(&spec, 32141, "m:latest");
         let idx = |k: &str| args.iter().position(|a| a == k).unwrap();
@@ -1141,6 +1223,7 @@ mod tests {
             model_runtime: None, // 迭代42 D2：请求级覆盖场景（默认串不参与 spawn_args）
             service_class: crate::scheduler::ServiceClass::Generation, // 迭代51 M196 补齐
             has_mtp: false,
+            is_moe: false, // 迭代56 M209 补齐
         };
         let args = spawn_args(&spec, 32141, "m:latest");
         // 追加段必须位于末尾（llama.cpp 后写覆盖先写——用户可覆盖 -c/--parallel；
@@ -1171,26 +1254,43 @@ mod tests {
             model_runtime: None,
             service_class: crate::scheduler::ServiceClass::Generation,
             has_mtp: false,
+            is_moe: false, // 迭代56 M209：默认 dense 档（MoE 档位见下方分档断言）
         };
         let idx = |args: &[String], k: &str| args.iter().position(|a| a == k).unwrap();
 
-        // 无 MTP 生成类：ngram-mod，无 draft-mtp 段；
-        // M199 勘误：幻觉参数 --spec-autotune 必须绝迹于 argv
+        // 无 MTP 生成类（dense 档）：ngram-mod + 配套参数 16/24/32
+        //（M209 补齐激活参数；M199 勘误：幻觉参数 --spec-autotune 绝迹）
         let args = spawn_args(&base(), 1, "m:latest");
         assert_eq!(args[idx(&args, "--spec-type") + 1], "ngram-mod");
+        assert_eq!(args[idx(&args, "--spec-ngram-mod-n-match") + 1], "16");
+        assert_eq!(args[idx(&args, "--spec-ngram-mod-n-min") + 1], "24");
+        assert_eq!(args[idx(&args, "--spec-ngram-mod-n-max") + 1], "32");
         assert!(!args.contains(&"--spec-autotune".to_string()));
         assert!(!args.contains(&"draft-mtp".to_string()));
         assert!(!args.contains(&"--spec-draft-n-max".to_string()));
 
-        // 有 MTP：draft-mtp,ngram-mod 并存 + n-max 2（M199 勘误：无 autotune）
+        // 无 MTP 生成类（MoE 档）：ngram-mod + 官方推荐值 24/48/64
+        //（Q2 裁决：MoE/dense 分档，A5 tensor 判定贯通）
+        let mut moe = base();
+        moe.is_moe = true;
+        let args = spawn_args(&moe, 1, "m:latest");
+        assert_eq!(args[idx(&args, "--spec-type") + 1], "ngram-mod");
+        assert_eq!(args[idx(&args, "--spec-ngram-mod-n-match") + 1], "24");
+        assert_eq!(args[idx(&args, "--spec-ngram-mod-n-min") + 1], "48");
+        assert_eq!(args[idx(&args, "--spec-ngram-mod-n-max") + 1], "64");
+
+        // 有 MTP（dense 档）：draft-mtp,ngram-mod 并存 + n-max 3
+        //（M209 Q1 裁决：2→3 官方默认值；M199 勘误：无 autotune）
         let mut mtp = base();
         mtp.has_mtp = true;
         let args = spawn_args(&mtp, 1, "m:latest");
         assert_eq!(args[idx(&args, "--spec-type") + 1], "draft-mtp,ngram-mod");
-        assert_eq!(args[idx(&args, "--spec-draft-n-max") + 1], "2");
+        assert_eq!(args[idx(&args, "--spec-draft-n-max") + 1], "3");
+        assert_eq!(args[idx(&args, "--spec-ngram-mod-n-min") + 1], "24");
         assert!(!args.contains(&"--spec-autotune".to_string()));
 
-        // RUNTIME 显式 --spec-type：自动段整段跳过（用户接管）
+        // RUNTIME 显式 --spec-type：自动段整段跳过（用户接管——
+        // ngram 配套参数一并消失，仅用户参数生效）
         let mut takeover = base();
         takeover.runtime_flags = Some("--spec-type none".into());
         let args = spawn_args(&takeover, 1, "m:latest");
@@ -1201,20 +1301,62 @@ mod tests {
         );
         assert_eq!(args[idx(&args, "--spec-type") + 1], "none", "用户值生效");
         assert!(!args.contains(&"--spec-autotune".to_string()));
+        assert!(
+            !args.contains(&"--spec-ngram-mod-n-match".to_string()),
+            "接管时自动 ngram 参数不注入"
+        );
 
-        // RUNTIME 显式 -md（draft 模型接管）：同样跳过
+        // RUNTIME 显式 -md（draft 模型接管）：同样整段跳过
         let mut draft = base();
         draft.runtime_flags = Some("-md /draft.gguf".into());
-        assert!(!spawn_args(&draft, 1, "m:latest").contains(&"--spec-autotune".to_string()));
+        let draft_args = spawn_args(&draft, 1, "m:latest");
+        assert!(!draft_args.contains(&"--spec-autotune".to_string()));
+        assert!(!draft_args.contains(&"--spec-ngram-mod-n-match".to_string()));
 
-        // embedding / TTS 类：零投机注入
+        // embedding / TTS 类：零投机注入（类型与配套参数一并无）
         let mut embed = base();
         embed.service_class = crate::scheduler::ServiceClass::Embedding;
         let args = spawn_args(&embed, 1, "m:latest");
         assert!(!args.contains(&"--spec-type".to_string()));
         assert!(!args.contains(&"--spec-autotune".to_string()));
+        assert!(!args.contains(&"--spec-ngram-mod-n-match".to_string()));
         let mut tts = base();
         tts.service_class = crate::scheduler::ServiceClass::Tts;
         assert!(!spawn_args(&tts, 1, "m:latest").contains(&"--spec-type".to_string()));
+    }
+
+    /// M210（迭代56）：/props 响应分类三态——Some(true)/Some(false)/
+    /// None（字段缺失=旧版运行时宽容路径）。字段契约：官方 server
+    /// README /props 响应 default_generation_settings.speculative
+    ///（四轮验证，迭代56 计划书 1.2 A3）。
+    #[test]
+    fn speculative_status_classification() {
+        let activated: serde_json::Value = serde_json::json!({
+            "default_generation_settings": { "speculative": true },
+            "total_slots": 4
+        });
+        assert_eq!(speculative_status_from_props(&activated), Some(true));
+
+        let inactive: serde_json::Value = serde_json::json!({
+            "default_generation_settings": { "speculative": false },
+            "total_slots": 4
+        });
+        assert_eq!(speculative_status_from_props(&inactive), Some(false));
+
+        let legacy: serde_json::Value =
+            serde_json::json!({ "default_generation_settings": {}, "total_slots": 1 });
+        assert_eq!(speculative_status_from_props(&legacy), None);
+    }
+
+    /// M210（迭代56）：替身进程（端口 1 无 HTTP 服务）探测——请求失败
+    /// 路径必须安静返回（debug 级）不 panic 不阻断拉起交付。
+    #[tokio::test]
+    async fn probe_speculative_on_stub_is_tolerant() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("300").stdout(Stdio::null()).stderr(Stdio::null());
+        let runner = Runner::spawn_with("stub:probe", 1, Duration::from_secs(60), &mut cmd)
+            .await
+            .expect("替身拉起");
+        runner.probe_speculative_activation().await;
     }
 }
