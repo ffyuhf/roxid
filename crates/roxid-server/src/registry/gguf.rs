@@ -57,6 +57,10 @@ pub struct GgufMetadata {
     pub context_length: Option<u64>,
     /// 参数元素总数（tensor info 区 ne 累加；M35 D13 general.parameter_count）
     pub parameter_count: Option<u64>,
+    /// 内嵌 MTP 头在位（迭代51 M196：tensor 名含 nextn.eh_proj——llama.cpp
+    /// common/speculative.cpp auto-detect 同款判定标志；MTP 投机解码
+    /// 自动注入 --spec-type draft-mtp 的依据）
+    pub has_mtp: bool,
 }
 
 /// GGUF kv 区流式读取器（BufReader 包装：定宽读取 + 按字节跳过）
@@ -273,7 +277,13 @@ pub fn parse_metadata(path: &Path) -> RoxidResult<GgufMetadata> {
     // 必读否则后续项错位)；v1 的 ne 为 u32（v2/v3 为 u64）。tensor 数据区
     //（对齐 padding 之后）零读取
     for _ in 0.._tensor_count {
-        let _name = reader.read_string(version)?;
+        let name = reader.read_string(version)?;
+        // 迭代51 M196：MTP 头判定——对齐 llama.cpp speculative.cpp
+        // auto-detect（blk.{N}.nextn.eh_proj.weight tensor 存在即支持
+        // draft-mtp）；子串匹配覆盖任意 block 序号与权重变体命名
+        if name.contains("nextn.eh_proj") {
+            meta.has_mtp = true;
+        }
         let n_dims = reader.read_u32()? as usize;
         let mut elements: u64 = 1;
         for _ in 0..n_dims {
@@ -464,6 +474,46 @@ mod tests {
         assert_eq!(meta.architecture.as_deref(), Some("llama"));
     }
 
+    /// 迭代51 M196：MTP 头检测——tensor 名含 nextn.eh_proj 判真；
+    /// 无该 tensor 的常规模型判假。来源：llama.cpp speculative.cpp
+    /// auto-detect 同款标志（用户需求 R3 2026-09-12 17:56）。
+    #[test]
+    fn mtp_tensor_detection() {
+        // 含 MTP 头：GLM-4.5 形态 blk.N.nextn.eh_proj.weight tensor
+        let b = GgufBuilder::v3()
+            .str_kv(KEY_ARCHITECTURE, "glm4")
+            .tensor("blk.59.nextn.eh_proj.weight", &[4096])
+            .tensor("token_embd.weight", &[4096, 151936])
+            .tensor_count(2);
+        let meta = {
+            let mut buf = b.buf.clone();
+            buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // kv_count=1
+            let path = std::env::temp_dir().join("roxid-gguf-mtp.gguf");
+            std::fs::write(&path, &buf).unwrap();
+            let parsed = parse_metadata(&path);
+            std::fs::remove_file(&path).ok();
+            parsed.unwrap()
+        };
+        assert!(meta.has_mtp, "nextn.eh_proj tensor 在位须判 MTP");
+        assert_eq!(meta.architecture.as_deref(), Some("glm4"));
+
+        // 常规模型：零 MTP tensor 判假
+        let b = GgufBuilder::v3()
+            .str_kv(KEY_ARCHITECTURE, "qwen3")
+            .tensor("token_embd.weight", &[1024, 128])
+            .tensor_count(1);
+        let meta = {
+            let mut buf = b.buf.clone();
+            buf[16..24].copy_from_slice(&1u64.to_le_bytes());
+            let path = std::env::temp_dir().join("roxid-gguf-nomtp.gguf");
+            std::fs::write(&path, &buf).unwrap();
+            let parsed = parse_metadata(&path);
+            std::fs::remove_file(&path).ok();
+            parsed.unwrap()
+        };
+        assert!(!meta.has_mtp, "无 MTP tensor 须判非 MTP 模型");
+    }
+
     /// 坏 magic 必须报错
     #[test]
     fn bad_magic_errors() {
@@ -475,7 +525,7 @@ mod tests {
     /// 旧 key general.size 兼容
     #[test]
     fn legacy_size_key_accepted() {
-        let mut b = GgufBuilder::v3().str_kv(KEY_SIZE_LEGACY, "8B");
+        let b = GgufBuilder::v3().str_kv(KEY_SIZE_LEGACY, "8B");
         let meta = {
             let mut buf = b.buf.clone();
             buf[16..24].copy_from_slice(&1u64.to_le_bytes());

@@ -634,6 +634,141 @@ fn tool_call_arguments_to_ollama(raw: &Value) -> Value {
     }
 }
 
+/// 流式 JSON 顶层对象前缀解析（迭代51 M195）：返回累积串中「已完整
+/// 落定」的顶层键值——值含嵌套对象/数组时整体闭合才落定，字符串内的
+/// `,`/`}`/`{` 与转义引号正确跳过。非法形态（非 `{` 起头）返回 None。
+/// 语义对齐官方 ollama json.Accumulator 的增量发射行为（Q3-B 裁决
+/// 2026-09-12 18:03：严格复刻官方增量语义）。
+///
+/// 实现：顶层边界扫描（深度计数）定位「闭合 `}`」或「深度 1 逗号」，
+/// 截断补 `}` 后交 serde_json 严格解析——借 serde 正确性免去手写
+/// 转义/嵌套全量状态机，扫描器只承担边界判定单一职责。
+///
+/// - 参数 s：跨片累积的 arguments 原始串
+/// - 返回：Some(已落定键值集)；None 表示非对象形态（畸形）
+fn parse_complete_prefix(s: &str) -> Option<serde_json::Map<String, Value>> {
+    let t = s.trim_start();
+    if !t.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    // 空对象已开启：未遇任何边界时返回空集（`{` 起头即合法前缀）
+    let mut last_complete = serde_json::Map::new();
+    for (i, c) in t.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && c == '}' {
+                    // 顶层闭合：整段即完整对象（后续多余字符宽容忽略）
+                    if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&t[..=i]) {
+                        last_complete = m;
+                    }
+                    return Some(last_complete);
+                }
+            }
+            // 深度 1 逗号 = 顶层键值分隔符落定：截断补 } 解析已落定前缀
+            ',' if depth == 1 => {
+                let candidate = format!("{}}}", &t[..i]);
+                if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&candidate) {
+                    last_complete = m;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(last_complete)
+}
+
+/// 单个 tool_call 的跨片累积桶（M195）
+#[derive(Default)]
+struct ArgsBucket {
+    /// 已累积的 arguments 原始串（各分片顺序拼接）
+    accumulated: String,
+    /// 已发出的顶层键值快照（增量 diff 基准）
+    emitted: serde_json::Map<String, Value>,
+}
+
+/// M195（迭代51，Q3-B 裁决 2026-09-12 18:03）：流式 tool_calls
+/// arguments 跨片重组状态机——清偿架构挂账29-②（流式分片字符串形态
+/// 致 Python SDK `'str' object has no attribute 'items'`）。按 tool_call
+/// index/name 分桶累积字符串分片，每个事件点输出「新落定键值」的增量
+/// 对象（官方增量合并语义）；无新落定输出空对象 `{}`（SDK 端 dict 合并
+/// 零副作用，形态恒定）；非对象畸形形态宽容回退本片原值（M187 兼容
+/// 路径不产生二次伤害）。
+pub struct ToolCallArgsAccumulator {
+    /// 定位键（`#index` 优先，无 index 用 function.name）→ 累积桶
+    buckets: std::collections::HashMap<String, ArgsBucket>,
+}
+
+impl ToolCallArgsAccumulator {
+    /// 构造空状态机（每条 SSE 流一个实例，随流生命周期创建销毁）。
+    pub fn new() -> Self {
+        Self {
+            buckets: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 摄入一个 tool_call 分片，返回该事件应输出的 arguments 值。
+    ///
+    /// - 参数 idx：OpenAI tool_calls[].index（llama-server 恒携带；
+    ///   缺位时回退 name 定位）
+    /// - 参数 name：function.name（index 缺位时的定位键）
+    /// - 参数 raw：本片 arguments 原值（字符串分片或罕见单片完整对象——
+    ///   对象统一序列化并入累积，保持桶状态一致性）
+    /// - 返回：增量对象（新落定键值，无新落定为空对象）/ 空分片空对象 /
+    ///   畸形回退本片原值
+    pub fn ingest(&mut self, idx: Option<u64>, name: &str, raw: &Value) -> Value {
+        let key = match idx {
+            Some(i) => format!("#{i}"),
+            None => name.to_string(),
+        };
+        let bucket = self.buckets.entry(key).or_default();
+        match raw {
+            Value::String(s) => bucket.accumulated.push_str(s),
+            other => bucket.accumulated.push_str(&other.to_string()),
+        }
+        // 空累积（首片空串常见）：空对象保持 dict 形态恒定，不回退字符串
+        if bucket.accumulated.trim().is_empty() {
+            return json!({});
+        }
+        match parse_complete_prefix(&bucket.accumulated) {
+            Some(complete) => {
+                // 增量 = 新键或值变化键（JSON 重复键后值覆盖语义）；
+                // 借用迭代产增量后再整体 move 为新基准快照
+                let mut delta = serde_json::Map::new();
+                for (k, v) in complete.iter() {
+                    if bucket.emitted.get(k) != Some(v) {
+                        delta.insert(k.clone(), v.clone());
+                    }
+                }
+                bucket.emitted = complete;
+                Value::Object(delta)
+            }
+            None => raw.clone(), // 非对象畸形：M187 兼容回退
+        }
+    }
+}
+
+impl Default for ToolCallArgsAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// OpenAI 非流式 chat 响应 → Ollama /api/chat 响应。
 ///
 /// - 参数 model：模型名
@@ -828,6 +963,85 @@ pub fn openai_completion_response_to_ollama(model: &str, openai: &Value) -> Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M195（迭代51）：流式 JSON 前缀解析矩阵——部分串落定边界、字符串
+    /// 内分隔符跳过、嵌套整体落定、非对象畸形判 None。
+    /// 来源：Q3-B 裁决 2026-09-12 18:03（严格复刻官方增量语义）。
+    #[test]
+    fn tool_args_prefix_parse_matrix() {
+        let keys = |m: Option<serde_json::Map<String, Value>>| {
+            m.map(|m| m.keys().cloned().collect::<Vec<_>>())
+        };
+        // 半个 key：空集（无落定）
+        assert_eq!(keys(parse_complete_prefix(r#"{"a"#)), Some(vec![]));
+        // key 完整 value 未闭合：空集
+        assert_eq!(keys(parse_complete_prefix(r#"{"a":"v"#)), Some(vec![]));
+        // 首键值落定（无跟随逗号确认，保守空集——确认符语义）
+        assert_eq!(keys(parse_complete_prefix(r#"{"a":1"#)), Some(vec![]));
+        // 逗号确认：首键落定
+        assert_eq!(
+            keys(parse_complete_prefix(r#"{"a":1,"b":"x"#)),
+            Some(vec!["a".to_string()])
+        );
+        // 顶层闭合：全部落定
+        assert_eq!(
+            keys(parse_complete_prefix(r#"{"a":1,"b":"x"}"#)),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // 字符串内的 , } { 与转义引号跳过
+        assert_eq!(
+            keys(parse_complete_prefix(r#"{"a":"x,y}z{\"k":1""#)),
+            Some(vec![])
+        );
+        assert_eq!(
+            keys(parse_complete_prefix(r#"{"a":"x,y}b","c":2"#)),
+            Some(vec!["a".to_string()])
+        );
+        // 嵌套对象/数组：整体闭合才落定（外层确认符驱动）
+        assert_eq!(
+            keys(parse_complete_prefix(r#"{"a":{"x":1},"b":[1,2]"#)),
+            Some(vec!["a".to_string()])
+        );
+        // 非对象形态：None（畸形回退依据）
+        assert_eq!(keys(parse_complete_prefix("not json")), None);
+        assert_eq!(keys(parse_complete_prefix("")), None);
+        assert_eq!(keys(parse_complete_prefix(r#"[1,2]"#)), None);
+        // 空对象流：空集（合法前缀）
+        assert_eq!(keys(parse_complete_prefix("{")), Some(vec![]));
+    }
+
+    /// M195（迭代51）：跨片重组增量序列——分片逐事件累积，输出对象形态
+    /// 增量（新落定键值）；空分片空对象；畸形回退字符串；多 index 分桶
+    /// 互不串扰。锚定用户报错场景：全程 dict 形态无 `'str' object` 风险。
+    #[test]
+    fn tool_args_accumulator_streaming_reassembly() {
+        let mut acc = ToolCallArgsAccumulator::new();
+        // 典型分片序列：{"city":"T → ok → yo","unit":1}（分片边界不落在
+        // 引号上——raw string 内容以 " 结尾会被定界符吞掉，实测词法陷阱）
+        let e1 = acc.ingest(Some(0), "get_weather", &json!(""));
+        assert_eq!(e1, json!({}), "空分片空对象（形态恒定）");
+        let e2 = acc.ingest(Some(0), "get_weather", &json!(r#"{"city":"T"#));
+        assert_eq!(e2, json!({}), "字符串值未闭合无落定");
+        let e3 = acc.ingest(Some(0), "get_weather", &json!("ok"));
+        assert_eq!(e3, json!({}), "仍未闭合继续无落定");
+        let e4 = acc.ingest(Some(0), "get_weather", &json!(r#"yo","unit":1}"#));
+        // 顶层闭合：两键同片落定，一次性增量发射
+        assert_eq!(e4, json!({"city": "Tokyo", "unit": 1}));
+
+        // 另一 tool_call（index 1）并行分片：互不串扰
+        let o1 = acc.ingest(Some(1), "get_time", &json!(r#"{"tz":"+8"#));
+        assert_eq!(o1, json!({}));
+        let o2 = acc.ingest(Some(1), "get_time", &json!(r#""}"#));
+        assert_eq!(o2, json!({"tz": "+8"}));
+
+        // 畸形流（模型输出非 JSON 文本）：回退本片原值（M187 兼容）
+        let bad = acc.ingest(Some(2), "broken", &json!("not-json"));
+        assert_eq!(bad, json!("not-json"));
+
+        // 无 index：name 定位（老形态兼容）
+        let n1 = acc.ingest(None, "by_name", &json!(r#"{"k":"v"},"#));
+        assert_eq!(n1, json!({"k": "v"}));
+    }
 
     /// keep_alive 全形态解析
     #[test]

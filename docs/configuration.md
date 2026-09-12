@@ -28,6 +28,7 @@ hf = "https://hf-mirror.com/"      # HuggingFace mirror base (replaces the offic
 [runtime]                    # llama.cpp backend
 llama_url = "https://example.com/llama.tar.gz"  # manual backend source link (recorded by setup --llama-url); optional
 default_version = "b10700"   # default backend version (written by runtime use / runtime update; "manual" selects the manual copy); optional
+default_variant = "ubuntu-cuda-12.4-x64"  # default variant directory name (written by runtime use <tag> <keyword>; disk fact, no hardcoding); optional
 tag_complete_limit = 10      # candidate count for `runtime install` tag completion (edit manually; clamped to 1..=100); optional
 ```
 
@@ -38,6 +39,7 @@ tag_complete_limit = 10      # candidate count for `runtime install` tag complet
 | `[proxy].hf` | string? | unset | mirror base, same semantics as `ROXID_HF_PROXY` | setup wizard |
 | `[runtime].llama_url` | string? | unset | tar.gz or bare-binary link; `https://github.com/...` URLs are auto-prefixed with the configured GitHub proxy at download time (the recorded value stays as entered) | `setup --llama-url` |
 | `[runtime].default_version` | string? | unset | `b\d+` tag or `"manual"` | `runtime use` / `runtime update` |
+| `[runtime].default_variant` | string? | unset | installed variant directory name of that tag (e.g. `ubuntu-cuda-12.4-x64`); takes priority when it coexists with `default_version` and the directory exists, otherwise falls back to auto detection | `runtime use <tag> <variant>` |
 | `[runtime].tag_complete_limit` | usize? | unset (falls back to 10) | candidate count for the `runtime install` tag-position completion; clamped to 1..=100 (per_page ceiling) | manual edit |
 
 ## Environment variables
@@ -70,7 +72,7 @@ tag_complete_limit = 10      # candidate count for `runtime install` tag complet
 
 | Domain | Precedence (high → low) |
 |---|---|
-| Backend version | `ROXID_LLAMA_SERVER` (env) → manual (artifact installed via `runtime.llama_url`) → `default_version` (config) → online latest-release auto-download |
+| Backend version | `ROXID_LLAMA_SERVER` (env) → manual (artifact installed via `runtime.llama_url`) → `default_version` + `default_variant` (config; the use-selected variant takes priority) → online latest-release auto-download |
 | GitHub proxy | `ROXID_GH_PROXY` (env) → `[proxy].gh` (config) → direct |
 | HF mirror | `ROXID_HF_PROXY` (env) → `HF_ENDPOINT` (env) → `[proxy].hf` (config) → official |
 | Server address (CLI) | `ROXID_HOST` (env) → `OLLAMA_HOST` (env) → default `127.0.0.1:11434` (`serve --addr` affects only the server's listen address; the two are independent) |

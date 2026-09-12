@@ -146,7 +146,9 @@ Request fields:
 
 Message roles: `system` / `user` / `assistant` / `tool`; assistant thinking is passed back via `thinking` to preserve multi-turn context.
 
-Tool calling: the backend is launched with `--jinja` (models' embedded chat templates are used). In non-stream responses `tool_calls[].function.arguments` is returned as an object; in streams, argument fragments arrive as string pieces for client-side accumulation.
+Tool calling: the backend is launched with `--jinja` (models' embedded chat templates are used). In both non-stream responses and stream events, `tool_calls[].function.arguments` is always an object — streamed fragments are reassembled server-side into incremental key/value objects (merge semantics aligned with official Ollama; final event carries the complete object).
+
+Model loading behavior: models providing the same kind of service (text generation / embedding / TTS, classified dynamically from the GGUF architecture) are mutually exclusive — loading one unloads idle same-class instances immediately (in-flight requests are never interrupted; other classes are untouched). Generation-class models are automatically launched with speculative decoding (`--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2` for models with embedded MTP heads, `--spec-type ngram-mod` otherwise, plus `--spec-autotune`); set `runtime` flags containing `--spec-type` or `-md` in RUNTIME / request `options.runtime` to take over manually.
 
 Streaming response (each NDJSON line):
 

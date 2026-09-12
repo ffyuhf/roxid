@@ -284,8 +284,16 @@ enum RuntimeCmd {
     },
     /// Update to the latest llama.cpp prerelease and set it as default
     Update,
-    /// Set the default runtime version (tag or "manual")
-    Use { tag: String },
+    /// Set the default runtime version (tag or "manual"), optionally
+    /// selecting a variant within that tag
+    Use {
+        /// 版本 tag（b\d+ 形态或 manual）
+        tag: String,
+        /// 变体（迭代50 M191，用户裁决链 15:47/15:55/15:58）：短词
+        /// cuda/vulkan/cpu 或完整变体目录名——在该 tag 已装变体目录中
+        /// 匹配（磁盘事实零硬编码）；省略时维持整 tag 切换并重置回自动探测
+        variant: Option<String>,
+    },
     /// Remove an installed runtime version
     Rm { tag: String },
 }
@@ -571,7 +579,9 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
             }
             // M99（迭代31）：变体名含宿主架构片段（Q1 动态探测 2026-09-10
             // 18:15）；未知架构显式报错引导手动链，不再误下 x64 包
-            let variant = match rt::detect_backend().asset_variant() {
+            // 迭代50 M189：变体来源改 effective_variant——config
+            // default_variant（use 写入）优先，缺省回退探测（未配置零变化）
+            let variant = match rt::effective_variant() {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{e}");
@@ -579,7 +589,7 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
                 }
             };
             println!(
-                "探测后端变体：{variant}（宿主 {}；GPU → vulkan / 无 GPU → cpu）",
+                "生效后端变体：{variant}（宿主 {}；use 可选变体，缺省 GPU → vulkan / 无 GPU → cpu）",
                 rt::host_arch_fragment().unwrap_or("未知")
             );
             // M105（迭代32 碴6a）：下载进度可见（量纲/速度/剩余时间）
@@ -612,8 +622,9 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
         // serve 兜底链的仅告警——缓存已就位，重跑走「已装未设默认」
         // 分支收敛，无半途态）
         RuntimeCmd::Update => {
-            // 变体探测（对齐 Install 分支：未知架构显式报错引导手动链）
-            let variant = match rt::detect_backend().asset_variant() {
+            // 变体解析（对齐 Install 分支：迭代50 M189 effective_variant——
+            // use 写入的 default_variant 优先，缺省回退探测；未知架构报错）
+            let variant = match rt::effective_variant() {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{e}");
@@ -640,7 +651,7 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
             }
             if !installed {
                 println!(
-                    "探测后端变体：{variant}（宿主 {}；GPU → vulkan / 无 GPU → cpu）",
+                    "生效后端变体：{variant}（宿主 {}；use 可选变体，缺省 GPU → vulkan / 无 GPU → cpu）",
                     rt::host_arch_fragment().unwrap_or("未知")
                 );
                 // M105 既有进度链复用（量纲/速度/剩余时间）
@@ -670,8 +681,12 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
                 }
             }
         }
-        RuntimeCmd::Use { tag } => {
+        RuntimeCmd::Use { tag, variant } => {
             if tag == "manual" {
+                if let Some(v) = &variant {
+                    eprintln!("manual 版本无变体维度（不支持 {v}）");
+                    return 1;
+                }
                 if !rt::manual_server_path().is_file() {
                     eprintln!("manual 版本未安装（先 roxid setup --llama-url <url> 安装）");
                     return 1;
@@ -683,11 +698,31 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
                 eprintln!("版本 {tag} 未安装（先 roxid runtime install {tag}）");
                 return 1;
             }
+            // 迭代50 M191（用户裁决链 15:47/15:55/15:58）：变体词在该 tag
+            // 已装变体目录中匹配（磁盘事实零硬编码）——完整目录名精确命中
+            // 优先，短词 cuda/vulkan/cpu 按命名惯例匹配；多命中/零命中
+            // 报错含候选清单（M36 use 已装校验语义同构延伸）
+            let matched_variant = match (&variant, tag != "manual") {
+                (Some(keyword), true) => match rt::resolve_variant_keyword(&tag, keyword) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 1;
+                    }
+                },
+                _ => None,
+            };
             let mut cfg = roxid_server::config::load_persist_config();
             cfg.runtime.default_version = Some(tag.clone());
+            // 不带变体参数时重置回自动探测（避免与旧 default_variant 失配残留）；
+            // 带变体写匹配到的真实目录名（单命令原子写两字段，消除失配窗口）
+            cfg.runtime.default_variant = matched_variant.clone();
             match roxid_server::config::save_persist_config(&cfg) {
                 Ok(()) => {
-                    println!("默认后端版本已设为 {tag}");
+                    match &matched_variant {
+                        Some(v) => println!("默认后端版本已设为 {tag}（变体 {v}）"),
+                        None => println!("默认后端版本已设为 {tag}"),
+                    }
                     0
                 }
                 Err(e) => {

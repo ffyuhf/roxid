@@ -40,7 +40,12 @@
 //! 新请求等待）2026-09-12 01-55；
 //! M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：显存/内存不足判型 +
 //! 空闲实例 LRU 自动卸载腾位重试（对齐 ollama 语义；在途实例受
-//! M27 保护绝不卸载）2026-09-12 01-55
+//! M27 保护绝不卸载）2026-09-12 01-55；
+//! M193+M194（迭代51 Q1-A/Q2 裁决 2026-09-12 18:03）：服务类别判定
+//! 贯通（spawn_spec_from_meta 填 service_class/has_mtp）+ 同类互斥
+//! 主动换载——加载新实例前卸载同服务类别的其他空闲实例（同步等退出：
+//! 腾显存是加载前置，区别于 M169 后台化），在途/异类零触碰
+//! 2026-09-12 18-21
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -52,7 +57,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::error::{RoxidError, RoxidResult};
 use crate::repo::{self, ModelMeta, ModelRef};
-use crate::runtime::{detect_backend, ensure_llama_server};
+use crate::runtime::{effective_variant, ensure_llama_server};
 use crate::scheduler::{alloc_port, Runner, RunnerLease, SpawnSpec};
 
 /// 默认 keep_alive（与原版 Ollama 一致：5 分钟）
@@ -215,9 +220,24 @@ impl RunnerRegistry {
         //    与 /api/ps、stop 的注册表访问）
         let r = ModelRef::parse(name)?;
         let meta = repo::find_model(&self.models_root, &full)?;
+        // 迭代51 M194（Q1-A 裁决 2026-09-12 18:03「同类空闲立即卸载」）：
+        // 同类互斥主动换载——加载前卸载同服务类别的其他空闲实例（同步等
+        // 退出：腾显存是加载的前置条件，区别于 M169 重建停机后台化）；
+        // 在途同类零触碰（M27 保护，其请求结束后按 keep_alive 驻留至下次
+        // 同类请求）；异类（embedding/TTS vs 生成）实例零触碰
+        let class = super::service_class(&meta.family);
+        for victim in self.evict_same_class_idle(&full, class).await {
+            let name = victim.lock().await.model_name.clone();
+            tracing::info!("同类换载：卸载空闲实例 {name}（服务类别 {class:?}）腾位");
+            if let Err(e) = victim.lock().await.shutdown_mut().await {
+                tracing::warn!("同类换载卸载实例失败：{e}");
+            }
+        }
         // M99（迭代31）：变体名含宿主架构片段——未知架构在此报 5xx
         //（文案引导手动链逃生口），arm64 宿主不再误下 ubuntu-x64 包
-        let variant = detect_backend().asset_variant()?;
+        // 迭代50 M189：变体来源改 effective_variant——config default_variant
+        //（use <tag> <词> 写入的真实目录名）优先，缺省回退探测（零变化）
+        let variant = effective_variant()?;
         let bin = ensure_llama_server(&variant).await?;
         let mut spec = spawn_spec_from_meta(&bin, &self.models_root, &r, &meta);
         if let Some(w) = want_ctx {
@@ -428,6 +448,45 @@ impl RunnerRegistry {
         writers.remove(&key)
     }
 
+    /// 迭代51 M194（Q1-A 裁决 2026-09-12 18:03）：同类互斥主动换载——
+    /// 移除与新加载请求同服务类别的全部空闲实例（写锁内挑选 remove，
+    /// 锁外由调用方同步等待退出以释放显存）；在途实例（M27 保护）与
+    /// 异类实例零触碰；加载目标自身排除。
+    ///
+    /// - 参数 loading_full：正在加载的模型全名（不得自卸）
+    /// - 参数 class：新请求的服务类别（M193 service_class 单一事实源）
+    /// - 返回：被移出注册表的同类空闲实例句柄列表（调用方逐个等待退出）
+    async fn evict_same_class_idle(
+        &self,
+        loading_full: &str,
+        class: super::ServiceClass,
+    ) -> Vec<Arc<Mutex<Runner>>> {
+        let mut writers = self.runners.write().await;
+        let mut victims = Vec::new();
+        let mut keys = Vec::new();
+        for (k, r) in writers.iter() {
+            if k == loading_full {
+                continue; // 加载目标自身排除
+            }
+            let same_class = {
+                let guard = r.lock().await;
+                if guard.in_flight() > 0 {
+                    continue; // M27 在途保护：推理中的实例绝不卸载
+                }
+                guard.service_class() == class
+            };
+            if same_class {
+                keys.push(k.clone());
+            }
+        }
+        for k in keys {
+            if let Some(r) = writers.remove(&k) {
+                victims.push(r);
+            }
+        }
+        victims
+    }
+
     /// 测试辅助：直接注入替身实例（绕过仓库查找与真实拉起）
     #[cfg(test)]
     pub(crate) async fn inject(&self, runner: Runner) -> Arc<Mutex<Runner>> {
@@ -502,8 +561,9 @@ fn is_resource_exhausted(err_text: &str) -> bool {
 fn llama_bin_matches(instance_bin: &std::path::Path) -> bool {
     // M99（迭代31）：asset_variant 未知架构 → resolve 不可得同样保守放行
     //（加载路径 ensure 完整链承担显式报错）
-    let Some(expected) = detect_backend()
-        .asset_variant()
+    // 迭代50 M189：变体来源改 effective_variant——use 切换变体后应然路径
+    // 变化触发重建（M54 切换即时生效语义自然覆盖）
+    let Some(expected) = crate::runtime::effective_variant()
         .ok()
         .and_then(|v| crate::runtime::resolve_llama_server_path(&v))
     else {
@@ -556,6 +616,14 @@ fn spawn_spec_from_meta(
         // 迭代42 D2（N-1）：默认形态基准（请求级覆盖发生在 acquire 层，
         // 仅改 runtime_flags，本字段恒为模型指令串）
         model_runtime: meta.runtime.clone(),
+        // 迭代51 M193：服务类别（M194 同类换载判定键，词根规则单一事实源）
+        service_class: super::service_class(&meta.family),
+        // 迭代51 M196：GGUF 内嵌 MTP 头检测（llama.cpp auto-detect 同款
+        // 标志 nextn.eh_proj；读 header 失败宽容 false——投机注入降级
+        // ngram-mod 不阻断加载）
+        has_mtp: crate::registry::gguf::parse_metadata(&dir.join(&meta.files.model))
+            .map(|g| g.has_mtp)
+            .unwrap_or(false),
     }
 }
 
@@ -730,6 +798,58 @@ mod tests {
         // 清理余下替身
         a_older.lock().await.shutdown_mut().await.unwrap();
         a_busy.lock().await.shutdown_mut().await.unwrap();
+    }
+
+    /// 迭代51 M194：同类互斥换载作用域——同类空闲命中卸载、异类保留、
+    /// 在途同类跳过（M27 保护）、加载目标自身排除。
+    /// 来源：Q1-A 裁决 2026-09-12 18:03「同类空闲立即卸载」。
+    #[tokio::test]
+    async fn evict_same_class_idle_scopes_to_class_and_idleness() {
+        use crate::scheduler::ServiceClass;
+        async fn inject_stub(
+            reg: &Arc<RunnerRegistry>,
+            model: &str,
+            class: ServiceClass,
+        ) -> Arc<Mutex<Runner>> {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("300").stdout(Stdio::null()).stderr(Stdio::null());
+            let mut runner = Runner::spawn_with(model, 0, Duration::from_secs(300), &mut cmd)
+                .await
+                .unwrap();
+            runner.override_service_class_for_test(class);
+            reg.inject(runner).await
+        }
+        let reg = Arc::new(RunnerRegistry::new(
+            std::env::temp_dir().join("roxid-reg-sameclass"),
+        ));
+        // 四替身：同类空闲 / 异类空闲(embedding) / 同类在途 / 加载目标自身
+        inject_stub(&reg, "stub:gen", ServiceClass::Generation).await;
+        inject_stub(&reg, "stub:embed", ServiceClass::Embedding).await;
+        let gen_busy = inject_stub(&reg, "stub:genbusy", ServiceClass::Generation).await;
+        gen_busy.lock().await.enter_request(); // 在途（同类但不卸，M27 保护）
+        let self_idle = inject_stub(&reg, "stub:self", ServiceClass::Generation).await;
+
+        let victims = reg
+            .evict_same_class_idle("stub:self", ServiceClass::Generation)
+            .await;
+        // 仅同类空闲 gen 被移出：异类/在途/自身全保留
+        assert_eq!(victims.len(), 1, "仅同类空闲实例命中");
+        assert_eq!(victims[0].lock().await.model_name, "stub:gen");
+        for v in &victims {
+            v.lock().await.shutdown_mut().await.unwrap(); // 清理受害者替身
+        }
+
+        // embedding 视角：加载 embedding 模型时仅 embedding 空闲被卸
+        let v2 = reg
+            .evict_same_class_idle("stub:loading", ServiceClass::Embedding)
+            .await;
+        assert_eq!(v2.len(), 1);
+        assert_eq!(v2[0].lock().await.model_name, "stub:embed");
+        v2[0].lock().await.shutdown_mut().await.unwrap();
+
+        // 清理余下替身（在途与自身）
+        gen_busy.lock().await.shutdown_mut().await.unwrap();
+        self_idle.lock().await.shutdown_mut().await.unwrap();
     }
 
     /// stop：注入实例 → 停止 → 再停报不存在

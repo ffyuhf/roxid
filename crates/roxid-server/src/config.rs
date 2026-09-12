@@ -21,6 +21,10 @@
 //! 用户手改 config.toml 生效，无 CLI 写入命令）；顺带修正本段两条
 //! 「b10605 锁定链」失真注释（迭代46 起兜底链为在线最新版，注释漏更）
 //! 2026-09-12 04-32
+//! M190（迭代50，用户裁决链 15:47/15:55/15:58）：RuntimeSection 增加
+//! default_variant——`roxid runtime use <tag> <词>` 的变体持久化落地
+//!（存真实变体目录名，use 时从该 tag 已装变体目录匹配取得，磁盘事实
+//! 零硬编码）2026-09-12 16-20
 
 use std::path::PathBuf;
 
@@ -108,6 +112,14 @@ pub struct RuntimeSection {
     /// 特殊值 "manual" 表示默认走手动版本目录。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_version: Option<String>,
+    /// 默认变体目录名（迭代50 M190，用户裁决链 2026-09-12 15:47/15:55/15:58）：
+    /// `roxid runtime use <tag> <词>` 写入的真实变体目录名（如
+    /// ubuntu-cuda-12.4-x64——use 时从该 tag 已装变体目录匹配取得，
+    /// 磁盘事实零硬编码，代码不含任何变体字符串）；effective_variant()
+    /// 在其与 default_version 同时在位时优先使用；None 表示未设置
+    ///（自动探测 vulkan/cpu，存量用户零感知）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_variant: Option<String>,
     /// runtime install tag 补全候选数量（迭代48 M181，Q4-A 裁决
     /// 2026-09-12 04:25）：`__complete` 在 install 值位联网查 GitHub
     /// Releases 时返回的最新预发布 tag 数；None 表示未配置（回退
@@ -265,10 +277,12 @@ mod tests {
                 hf: Some("https://hf.example.com".into()),
             },
             // M31：runtime 段一并往返（迭代11 F2）；M36：default_version
-            // 一并往返；M181：tag_complete_limit 一并往返
+            // 一并往返；M181：tag_complete_limit 一并往返；
+            // M190（迭代50）：default_variant 一并往返
             runtime: RuntimeSection {
                 llama_url: Some("https://example.dev/llama-custom.tar.gz".into()),
                 default_version: Some("b10700".into()),
+                default_variant: Some("ubuntu-cuda-12.4-x64".into()),
                 tag_complete_limit: Some(12),
             },
         };
@@ -292,6 +306,11 @@ mod tests {
             load_persist_config().runtime.tag_complete_limit,
             Some(12),
             "M181：runtime.tag_complete_limit 必须完整往返"
+        );
+        assert_eq!(
+            load_persist_config().runtime.default_variant.as_deref(),
+            Some("ubuntu-cuda-12.4-x64"),
+            "M190：runtime.default_variant 必须完整往返"
         );
         assert_eq!(
             load_persist_config().proxy.hf.as_deref(),

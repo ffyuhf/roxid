@@ -254,7 +254,7 @@ llama.cpp backend multi-version management (local operations, no serve required)
 roxid runtime list
 roxid runtime install <tag> | --url <url>
 roxid runtime update
-roxid runtime use <tag | manual>
+roxid runtime use <tag | manual> [variant]
 roxid runtime rm <tag>
 ```
 
@@ -263,7 +263,7 @@ roxid runtime rm <tag>
 | `list` | — | List installed versions (default marked `[默认]`) plus manual; includes the resolution order |
 | `install` | `<tag>` (form `b\d+`, e.g. `b10700`) or `--url <url>` (mutually exclusive) | Download by official tag (variant auto-detected per host CPU arch `x64`/`arm64` + GPU → vulkan / otherwise cpu); `--url` installs as the manual version; Tab completion at the tag position offers the latest GitHub prerelease tags (10 by default, configurable via `[runtime].tag_complete_limit`; 2s query timeout, silent zero candidates on failure) |
 | `update` | — | Query GitHub Releases for the latest prerelease: download it with visible progress and set it as default when missing; print "already up to date" when installed and default; otherwise only re-point the default (no re-download) |
-| `use` | `<tag>` or `manual` | Set and persist the default version; the first request after switching tears down the old instance and starts the new version |
+| `use` | `<tag>` or `manual`, optional second argument `<variant>` | Set and persist the default version; with `<variant>` it picks a variant within that tag — keyword `cuda`/`vulkan`/`cpu` or a full variant directory name (e.g. `ubuntu-cuda-12.4-x64`), matched against the installed variant directories of that tag (see `runtime list`; self-built CUDA packages work as-is with `use <tag> cuda`, no renaming needed); omitting it resets to automatic detection; the first request after switching tears down the old instance and starts the new one |
 | `rm` | `<tag>` | Remove an installed version; the current default must be switched away first |
 
 ```sh
@@ -271,12 +271,13 @@ roxid runtime list
 roxid runtime install b10700
 roxid runtime update
 roxid runtime install --url https://example.com/llama-server.tar.gz
+roxid runtime use b10917 cuda
 roxid runtime use manual
 ```
 
 ## completion family
 
-Shell completion management (bash / zsh / fish; static candidates plus dynamic value candidates — model names and `runtime use`/`rm` tags are read directly from local `~/.roxid`, zero network, zero latency; the `runtime install` tag position queries GitHub Releases online — 2s timeout, silent zero candidates on failure — with the candidate count configurable via `[runtime].tag_complete_limit`, default 10).
+Shell completion management (bash / zsh / fish; static candidates plus dynamic value candidates — model names and `runtime use`/`rm` tags are read directly from local `~/.roxid`, zero network, zero latency; the `use` variant position completes the keywords `cuda`/`vulkan`/`cpu` plus installed variant directory names of that tag; the `runtime install` tag position queries GitHub Releases online — 2s timeout, silent zero candidates on failure — with the candidate count configurable via `[runtime].tag_complete_limit`, default 10).
 
 ```text
 roxid completion bash | zsh | fish    # print the shim script (for eval / piping)

@@ -146,7 +146,9 @@ curl http://127.0.0.1:11434/api/generate \
 
 消息 role：`system` / `user` / `assistant` / `tool`；assistant 思考内容经 `thinking` 字段回传保持多轮上下文。
 
-工具调用：后端以 `--jinja` 启动（使用各模型内嵌对话模板）。非流式响应的 `tool_calls[].function.arguments` 为对象形态；流式增量中参数分片为字符串，由客户端累积。
+工具调用：后端以 `--jinja` 启动（使用各模型内嵌对话模板）。非流式响应与流式事件的 `tool_calls[].function.arguments` 恒为对象形态——流式分片由服务端跨片重组为增量键值对象（合并语义对齐官方 Ollama；终态事件携带完整对象）。
+
+模型加载行为：提供相同服务的模型（文本生成 / 向量 / TTS，按 GGUF 架构动态归组）同类互斥——加载新模型时立即卸载同类空闲实例（在途请求绝不中断；异类实例不受影响）。生成类模型自动附带投机解码启动（内嵌 MTP 头的模型为 `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2`，其余为 `--spec-type ngram-mod`，均附 `--spec-autotune`）；在 RUNTIME / 请求 `options.runtime` 中设置含 `--spec-type` 或 `-md` 的参数即可手动接管。
 
 流式响应（NDJSON 每行）：
 

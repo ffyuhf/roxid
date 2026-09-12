@@ -43,6 +43,10 @@
 //! M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：expires_at() getter
 //! 公开——registry 空闲实例 LRU 卸载（evict_one_idle）按到期时刻
 //! 最早优先的比较键 2026-09-12 01-56
+//! M196（迭代51 Q4-A/Q5-A/Q6-A 裁决 2026-09-12 18:03/18:11）：spawn_args
+//! 推理优化自动注入——生成类注入 --spec-type（MTP 头在位则
+//! draft-mtp,ngram-mod + n-max 2，否则 ngram-mod）+ --spec-autotune，
+//! RUNTIME 显式接管时整段跳过 2026-09-12 18-17
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -113,6 +117,14 @@ pub struct SpawnSpec {
     /// 实例的「默认形态」基准——与 runtime_flags 组合区分「模型自带指令」
     /// 与「请求级临时覆盖」，复用判定据此隔离覆盖实例（R1-A 裁决）
     pub model_runtime: Option<String>,
+    /// 服务类别（迭代51 M193）：同类互斥换载（M194）判定键；推理优化
+    /// 注入（M196）仅生成类启用。spawn_spec_from_meta 经 service_class()
+    /// 单一事实源填充
+    pub service_class: super::ServiceClass,
+    /// GGUF 内嵌 MTP 头在位（迭代51 M196：tensor 名含 nextn.eh_proj，
+    /// 对齐 llama.cpp common/speculative.cpp auto-detect 判定标志）；
+    /// 投机参数组合选择的依据；读 GGUF 失败宽容 false
+    pub has_mtp: bool,
 }
 
 /// 构造 llama-server 完整参数列表（纯函数，便于单测断言）。
@@ -152,6 +164,35 @@ pub fn spawn_args(spec: &SpawnSpec, port: u16, alias: &str) -> Vec<String> {
         // RUNTIME flags 追加段在其后，用户仍可后写覆盖（2026-09-12 07:04）
         "--jinja".into(),
     ];
+    // M196（迭代51，Q4-A/Q5-A/Q6-A 裁决 2026-09-12 18:03/18:11）：
+    // 推理优化自动注入——仅生成类；llama-server --spec-type 默认 none，
+    // 不注入则 MTP/ngram 加速全部旁置。组合：MTP 头在位 →
+    // draft-mtp,ngram-mod 并存（逗号多选）+ --spec-draft-n-max 2
+    // （官方 PR #22673 推荐值）；否则 ngram-mod（官方 --spec-default 同款，
+    // 无 draft 模型依赖）；均附 --spec-autotune 自动调优 tokens/sec。
+    // RUNTIME 显式含 spec 类参数（--spec-type/-md/--spec-draft-model）时
+    // 整段跳过——用户接管；注入段位于 RUNTIME 追加段之前，后写覆盖
+    // 语义保持用户最终控制权。embedding/TTS 类零注入（投机仅对生成有意义）
+    let user_takes_over_spec = match spec.runtime_flags.as_deref() {
+        Some(rt) => tokenize_flags(rt).iter().any(|t| {
+            t == "--spec-type"
+                || t == "-md"
+                || t == "--spec-draft-model"
+                || t.starts_with("--spec-type=")
+        }),
+        None => false,
+    };
+    if spec.service_class == super::ServiceClass::Generation && !user_takes_over_spec {
+        args.push("--spec-type".into());
+        if spec.has_mtp {
+            args.push("draft-mtp,ngram-mod".into());
+            args.push("--spec-draft-n-max".into());
+            args.push("2".into());
+        } else {
+            args.push("ngram-mod".into());
+        }
+        args.push("--spec-autotune".into());
+    }
     if let Some(mmproj) = &spec.mmproj {
         args.push("--mmproj".into());
         args.push(mmproj.display().to_string());
@@ -222,6 +263,9 @@ pub struct Runner {
     /// 记录不一致时触发重建的比较键——runtime use 切换默认版本的生效点；
     /// 测试替身为空路径，比对方按「不可比对」放行）
     llama_server_bin: PathBuf,
+    /// 服务类别（迭代51 M193）：同类互斥换载判定键（M194）；替身默认
+    /// 生成桶（Generation），真实实例经 spawn_llama_server 记录 spec 值
+    service_class: super::ServiceClass,
     /// 子进程句柄
     child: Child,
     /// keep_alive 到期时刻（绝对时间）；每次请求到达时刷新
@@ -272,6 +316,7 @@ impl Runner {
         runner.runtime_flags = spec.runtime_flags.clone(); // M39：RUNTIME 重建比较键
         runner.model_runtime = spec.model_runtime.clone(); // 迭代42 D2：默认形态基准
         runner.llama_server_bin = spec.llama_server_bin.clone(); // M54b：后端版本重建比较键
+        runner.service_class = spec.service_class; // 迭代51 M193：同类换载判定键
         runner.size = size;
         Ok(runner)
     }
@@ -364,6 +409,7 @@ impl Runner {
             runtime_flags: None, // M39：替身无 RUNTIME（真实实例经 spawn_llama_server 记录）
             model_runtime: None, // 迭代42 D2：替身无默认串（真实实例经 spawn_llama_server 记录）
             llama_server_bin: PathBuf::new(), // M54b：替身空路径（比对时视为不可比对放行）
+            service_class: super::ServiceClass::Generation, // 迭代51 M193：替身默认生成桶
             child,
             expires_at: Instant::now() + keep_alive,
             keep_alive,
@@ -510,6 +556,19 @@ impl Runner {
     pub(crate) fn leave_request(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
         self.expires_at = Instant::now() + self.keep_alive;
+    }
+
+    /// 服务类别（迭代51 M193：registry evict_same_class_idle 同类互斥
+    /// 换载的判定键）。
+    pub(crate) fn service_class(&self) -> super::ServiceClass {
+        self.service_class
+    }
+
+    /// 测试辅助：替身实例覆写服务类别（真实实例经 spawn_llama_server
+    /// 从 spec 记录，测试替身默认生成桶，构造异类/在途场景用）。
+    #[cfg(test)]
+    pub(crate) fn override_service_class_for_test(&mut self, class: super::ServiceClass) {
+        self.service_class = class;
     }
 
     /// keep_alive 到期时刻（M170：registry evict_one_idle 的 LRU 比较键——
@@ -992,6 +1051,9 @@ mod tests {
             lora: vec![],
             ctx_size: 2048,
             parallel: 4,
+            // 迭代51 M196：默认生成类 + 无 MTP（注入段断言见注入矩阵用例）
+            service_class: crate::scheduler::ServiceClass::Generation,
+            has_mtp: false,
         };
         let args = spawn_args(&spec, 32141, "m:latest");
         let idx = |k: &str| args.iter().position(|a| a == k).unwrap();
@@ -1053,9 +1115,12 @@ mod tests {
             parallel: 4,
             runtime_flags: Some(r#"-ngl 30 --override-tensor "exps=CPU" --no-mmap"#.into()),
             model_runtime: None, // 迭代42 D2：请求级覆盖场景（默认串不参与 spawn_args）
+            service_class: crate::scheduler::ServiceClass::Generation, // 迭代51 M196 补齐
+            has_mtp: false,
         };
         let args = spawn_args(&spec, 32141, "m:latest");
-        // 追加段必须位于末尾（llama.cpp 后写覆盖先写——用户可覆盖 -c/--parallel）
+        // 追加段必须位于末尾（llama.cpp 后写覆盖先写——用户可覆盖 -c/--parallel；
+        // M196 兼容：生成类注入段在其之前，尾部 5 token 仍为 RUNTIME 段）
         assert_eq!(
             args[args.len() - 5..],
             vec!["-ngl", "30", "--override-tensor", "exps=CPU", "--no-mmap"]
@@ -1064,5 +1129,67 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w[0] == "-m" && w[1] == "/models/m.gguf"));
+    }
+
+    /// M196（迭代51）：投机参数注入矩阵——无 MTP 生成类 / MTP 组合 /
+    /// RUNTIME 接管跳过 / embedding 与 TTS 零注入。
+    /// 来源：Q4-A/Q5-A/Q6-A 裁决 2026-09-12 18:03/18:11。
+    #[test]
+    fn spawn_args_speculative_injection_matrix() {
+        let base = || SpawnSpec {
+            llama_server_bin: PathBuf::from("/bin/llama-server"),
+            gguf: PathBuf::from("/models/m.gguf"),
+            mmproj: None,
+            lora: vec![],
+            ctx_size: 2048,
+            parallel: 4,
+            runtime_flags: None,
+            model_runtime: None,
+            service_class: crate::scheduler::ServiceClass::Generation,
+            has_mtp: false,
+        };
+        let idx = |args: &[String], k: &str| args.iter().position(|a| a == k).unwrap();
+
+        // 无 MTP 生成类：ngram-mod + autotune，无 draft-mtp 段
+        let args = spawn_args(&base(), 1, "m:latest");
+        assert_eq!(args[idx(&args, "--spec-type") + 1], "ngram-mod");
+        assert!(args.contains(&"--spec-autotune".to_string()));
+        assert!(!args.contains(&"draft-mtp".to_string()));
+        assert!(!args.contains(&"--spec-draft-n-max".to_string()));
+
+        // 有 MTP：draft-mtp,ngram-mod 并存 + n-max 2 + autotune
+        let mut mtp = base();
+        mtp.has_mtp = true;
+        let args = spawn_args(&mtp, 1, "m:latest");
+        assert_eq!(args[idx(&args, "--spec-type") + 1], "draft-mtp,ngram-mod");
+        assert_eq!(args[idx(&args, "--spec-draft-n-max") + 1], "2");
+        assert!(args.contains(&"--spec-autotune".to_string()));
+
+        // RUNTIME 显式 --spec-type：自动段整段跳过（用户接管）
+        let mut takeover = base();
+        takeover.runtime_flags = Some("--spec-type none".into());
+        let args = spawn_args(&takeover, 1, "m:latest");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--spec-type").count(),
+            1,
+            "仅用户那一份 --spec-type"
+        );
+        assert_eq!(args[idx(&args, "--spec-type") + 1], "none", "用户值生效");
+        assert!(!args.contains(&"--spec-autotune".to_string()));
+
+        // RUNTIME 显式 -md（draft 模型接管）：同样跳过
+        let mut draft = base();
+        draft.runtime_flags = Some("-md /draft.gguf".into());
+        assert!(!spawn_args(&draft, 1, "m:latest").contains(&"--spec-autotune".to_string()));
+
+        // embedding / TTS 类：零投机注入
+        let mut embed = base();
+        embed.service_class = crate::scheduler::ServiceClass::Embedding;
+        let args = spawn_args(&embed, 1, "m:latest");
+        assert!(!args.contains(&"--spec-type".to_string()));
+        assert!(!args.contains(&"--spec-autotune".to_string()));
+        let mut tts = base();
+        tts.service_class = crate::scheduler::ServiceClass::Tts;
+        assert!(!spawn_args(&tts, 1, "m:latest").contains(&"--spec-type".to_string()));
     }
 }

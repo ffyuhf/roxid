@@ -254,7 +254,7 @@ llama.cpp 后端多版本管理（本地操作，不经 serve）。运行时解�
 roxid runtime list
 roxid runtime install <tag> | --url <url>
 roxid runtime update
-roxid runtime use <tag | manual>
+roxid runtime use <tag | manual> [variant]
 roxid runtime rm <tag>
 ```
 
@@ -263,7 +263,7 @@ roxid runtime rm <tag>
 | `list` | — | 列出已装版本（标注 `[默认]`）与 manual；含解析优先级说明 |
 | `install` | `<tag>`（`b\d+` 形态，如 `b10700`）或 `--url <url>`（二选一） | 按官方 tag 下载（变体按宿主 CPU 架构 `x64`/`arm64` 自动匹配 + GPU → vulkan / 无 GPU → cpu）；`--url` 安装为 manual 版本；tag 位 Tab 补全候选为 GitHub 最新预发布版本（默认 10 个，经 `[runtime].tag_complete_limit` 可配；查询 2 秒超时，失败静默零候选） |
 | `update` | — | 查 GitHub Releases 最新预发布版本：未安装则下载（进度可见）并设为默认；已安装且已是默认则提示「已是最新」；已安装未设默认则仅补写默认（不重复下载） |
-| `use` | `<tag>` 或 `manual` | 设默认版本并持久化；切换后首个请求即卸旧实例、以新版本拉起 |
+| `use` | `<tag>` 或 `manual`，可选第二参数 `<variant>` | 设默认版本并持久化；带 `<variant>` 时在同版本下选择变体——短词 `cuda`/`vulkan`/`cpu` 或完整变体目录名（如 `ubuntu-cuda-12.4-x64`），在该 tag 已装变体目录中匹配（`runtime list` 可见，磁盘事实零硬编码；自编译 CUDA 包按原名落位后 `use <tag> cuda` 即可，无需改名）；不带变体参数时重置回自动探测；切换后首个请求即卸旧实例、以新配置拉起 |
 | `rm` | `<tag>` | 删除已装版本；默认版本需先切换后才能删除 |
 
 ```sh
@@ -271,12 +271,13 @@ roxid runtime list
 roxid runtime install b10700
 roxid runtime update
 roxid runtime install --url https://example.com/llama-server.tar.gz
+roxid runtime use b10917 cuda
 roxid runtime use manual
 ```
 
 ## completion 族
 
-shell 补全管理（bash / zsh / fish；静态候选 + 动态值候选——模型名与 `runtime use`/`rm` 的 tag 直读本地 `~/.roxid`，零网络零延迟；`runtime install` tag 位在线查 GitHub Releases——2 秒超时，失败静默零候选——候选数量经 `[runtime].tag_complete_limit` 可配，默认 10）。
+shell 补全管理（bash / zsh / fish；静态候选 + 动态值候选——模型名与 `runtime use`/`rm` 的 tag 直读本地 `~/.roxid`，零网络零延迟；`use` 变体位补全短词 `cuda`/`vulkan`/`cpu` 与该 tag 已装变体目录名；`runtime install` tag 位在线查 GitHub Releases——2 秒超时，失败静默零候选——候选数量经 `[runtime].tag_complete_limit` 可配，默认 10）。
 
 ```text
 roxid completion bash | zsh | fish    # 输出 shim 脚本（供 eval / 管道）

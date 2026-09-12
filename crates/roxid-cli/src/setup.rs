@@ -252,8 +252,10 @@ mod tests {
             runtime: roxid_server::config::RuntimeSection {
                 llama_url: Some("https://keep-llama.example/pkg.tar.gz".into()),
                 // M36：新增字段补 None（保持「已有段保留」断言语义不变）；
-                // M181（迭代48）：tag_complete_limit 同款补 None
+                // M181（迭代48）：tag_complete_limit 同款补 None；
+                // M190（迭代50）：default_variant 同款补 None
                 default_version: None,
+                default_variant: None,
                 tag_complete_limit: None,
             },
         };

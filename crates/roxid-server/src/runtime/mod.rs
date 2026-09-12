@@ -23,6 +23,10 @@
 //! M181（迭代48）：latest_llama_cpp_tags / pick_prerelease_tags 导出
 //! ——runtime update 子命令与 install tag 补全的共用数据源
 //! （Q2-A/Q3-B 裁决 2026-09-12 04:23/04:24）2026-09-12 04-32
+//! M189（迭代50）：variant_dirs_of / resolve_variant_keyword /
+//! effective_variant / VARIANT_KEYWORDS 导出——`roxid runtime use
+//! <tag> <词>` 变体选择链（用户裁决链 15:47/15:55/15:58，磁盘事实
+//! 零硬编码）2026-09-12 16-30
 
 mod backend;
 mod download;
@@ -35,9 +39,9 @@ pub use backend::{
     Backend,
 };
 pub use download::{
-    asset_url, ensure_llama_server, install_manual, install_version,
+    asset_url, effective_variant, ensure_llama_server, install_manual, install_version,
     installed_variant_arch_mismatch, is_valid_tag, latest_llama_cpp_tags, list_installed,
     manual_dir, manual_server_path, pick_prerelease_tags, remove_version,
-    resolve_llama_server_path, url_is_archive, variant_cache_dir, warn_installed_arch_mismatch,
-    ENV_LLAMA_SERVER_OVERRIDE,
+    resolve_llama_server_path, resolve_variant_keyword, url_is_archive, variant_cache_dir,
+    variant_dirs_of, warn_installed_arch_mismatch, ENV_LLAMA_SERVER_OVERRIDE, VARIANT_KEYWORDS,
 };

@@ -57,6 +57,10 @@
 //! latest_llama_cpp_tags 多 tag 查询（runtime update 与补全共用）+
 //! 查询核心抽取 fetch_releases_with_retry（重试语义逐字不变），
 //! config [runtime].tag_complete_limit 补全数量通道 2026-09-12 04-30
+//! M189（迭代50，用户裁决链 15:47/15:55/15:58）：use 变体选择——
+//! variant_dirs_of 单 tag 已装变体扫描 + resolve_variant_keyword
+//! 变体词匹配（磁盘事实零硬编码）+ effective_variant 生效解析
+//!（default_variant 优先、缺省回退探测）2026-09-12 16-25
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -619,6 +623,130 @@ pub fn remove_version(tag: &str) -> RoxidResult<()> {
     }
     tokio::task::block_in_place(|| std::fs::remove_dir_all(dir))
         .map_err(|e| RoxidError::RunnerFailure(format!("删除 {tag} 失败：{e}")))
+}
+
+/// 某 tag 下已装变体目录名清单（迭代50 M189）：扫描 {root}/{tag}/ 子目录，
+/// 过滤口径与 list_installed 同款（.installing 暂存与隐藏目录排除）——
+/// use 变体词匹配与补全候选的数据源（磁盘事实零硬编码）。
+///
+/// - 参数 tag：版本 tag
+/// - 返回：变体目录名列表（字典序；目录不存在为空）
+pub fn variant_dirs_of(tag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(subs) = std::fs::read_dir(llama_runtime_root().join(tag)) else {
+        return out;
+    };
+    for sub in subs.flatten() {
+        let name = sub.file_name().to_string_lossy().into_owned();
+        if sub.path().is_dir() && !name.starts_with('.') && !name.ends_with(".installing") {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// use 变体词合法短词集（迭代50 M189，用户裁决 2026-09-12 15:55
+/// 「roxid runtime use b10917 cuda」命令形态）：匹配语义见
+/// resolve_variant_keyword；导出供 CLI 补全候选单一事实源。
+pub const VARIANT_KEYWORDS: &[&str] = &["cuda", "vulkan", "cpu"];
+
+/// use 变体词解析（迭代50 M189，用户裁决链 15:47/15:55/15:58）：
+/// 词在该 tag 已装变体目录名（磁盘事实）中匹配，零硬编码——CUDA 版本号
+/// 等一切细节只存在于用户落位的目录名中（裁决 15:58「新增一个硬编码
+/// 有什么用」）：
+/// ① 完整目录名精确命中优先（多版本并存时的精确指定通道）；
+/// ② 短词按命名惯例匹配：cuda=目录名含 "cuda" 子串、vulkan=含
+///    "vulkan"、cpu=不含两者的 ubuntu-* 目录。
+///
+/// - 参数 tag：版本 tag
+/// - 参数 keyword：完整变体目录名或短词（VARIANT_KEYWORDS 成员）
+/// - 返回：Ok(真实变体目录名)；Err 非法词/多命中/零命中（文案含候选清单）
+pub fn resolve_variant_keyword(tag: &str, keyword: &str) -> RoxidResult<String> {
+    let dirs = variant_dirs_of(tag);
+    if dirs.iter().any(|d| d == keyword) {
+        return Ok(keyword.to_string());
+    }
+    let matches: Vec<&String> = match keyword {
+        "cuda" | "vulkan" => dirs.iter().filter(|d| d.contains(keyword)).collect(),
+        "cpu" => dirs
+            .iter()
+            .filter(|d| !d.contains("cuda") && !d.contains("vulkan"))
+            .collect(),
+        _ => {
+            return Err(RoxidError::RunnerFailure(format!(
+                "非法变体：{keyword}（期望 {} 或完整变体目录名）",
+                VARIANT_KEYWORDS.join(" / ")
+            )));
+        }
+    };
+    let joined = |list: &[&String]| {
+        list.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match matches.as_slice() {
+        [only] => Ok((*only).clone()),
+        [] => Err(RoxidError::RunnerFailure(format!(
+            "版本 {tag} 下没有匹配「{keyword}」的已装变体；已装：{}",
+            if dirs.is_empty() {
+                "（无）".to_string()
+            } else {
+                dirs.join(", ")
+            }
+        ))),
+        many => Err(RoxidError::RunnerFailure(format!(
+            "版本 {tag} 下有多个匹配「{keyword}」的已装变体：{}；请用完整目录名指定其一",
+            joined(many)
+        ))),
+    }
+}
+
+/// 变体目录名形态安全校验（迭代50 M189）：default_variant 直接拼接缓存
+/// 目录路径，防 config 手误写入路径穿越形态（is_valid_tag 同款防护思路）。
+fn is_safe_variant_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+}
+
+/// 生效变体解析（迭代50 M189，用户裁决链 15:47/15:55/15:58）：
+/// config [runtime].default_variant（use 写入的真实目录名）与
+/// default_version 同时在位且该目录 llama-server 在位时直接返回——
+/// 零拼接零映射；缺省 / 形态非法 / 不在位（warn）一律回退探测
+///（detect_backend().asset_variant()，未配置用户行为逐字节不变）。
+/// 调用面：scheduler acquire / 复用第四键 / CLI install / update。
+///
+/// - 返回：生效变体目录名
+pub fn effective_variant() -> RoxidResult<String> {
+    let cfg = crate::config::load_persist_config();
+    if let Some(variant) = cfg.runtime.default_variant {
+        if !is_safe_variant_name(&variant) {
+            tracing::warn!("默认变体 {variant} 形态非法，回退自动探测");
+        } else {
+            let in_place = cfg
+                .runtime
+                .default_version
+                .as_deref()
+                .filter(|t| is_valid_tag(t))
+                .map(|t| {
+                    variant_cache_dir(&variant, t)
+                        .join("llama-server")
+                        .is_file()
+                })
+                .unwrap_or(false);
+            if in_place {
+                return Ok(variant);
+            }
+            tracing::warn!(
+                "默认变体 {variant} 未在位（default_version 未设或目录缺失），回退自动探测"
+            );
+        }
+    }
+    super::backend::detect_backend().asset_variant()
 }
 
 /// serve 启动扫描已装变体架构健康度（M99，迭代31，Q4 第一项：用户裁决
@@ -1195,7 +1323,9 @@ mod tests {
             runtime: crate::config::RuntimeSection {
                 llama_url: None,
                 default_version: Some("b99999".into()),
-                // M181（迭代48）：新字段补 None（本测试只锚定 default_version 优先级）
+                // M181（迭代48）：新字段补 None（本测试只锚定 default_version 优先级）；
+                // M190（迭代50）：default_variant 同款补 None
+                default_variant: None,
                 tag_complete_limit: None,
             },
         })
@@ -1438,6 +1568,122 @@ HTTPServer(('127.0.0.1', {port}), H).serve_forever()
         assert!(
             resolve_llama_server_path("ubuntu-x64").is_some(),
             "非 ELF 宽容面必须照常命中"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("ROXID_HOME");
+    }
+
+    /// 迭代50 M189：use 变体词解析——完整目录名精确命中优先、短词
+    /// 子串/排除匹配、多命中/零命中/非法词报错文案含候选清单
+    ///（磁盘事实零硬编码，用户裁决链 15:47/15:55/15:58）
+    #[test]
+    fn resolve_variant_keyword_matrix() {
+        let _guard = crate::config::ROXID_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("roxid-var-kw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("ROXID_HOME", &dir);
+        for v in ["ubuntu-cuda-12.4-x64", "ubuntu-vulkan-x64", "ubuntu-x64"] {
+            std::fs::create_dir_all(llama_runtime_root().join("b99001").join(v)).unwrap();
+        }
+        // 完整目录名精确命中（多版本并存时的精确指定通道）
+        assert_eq!(
+            resolve_variant_keyword("b99001", "ubuntu-cuda-12.4-x64").unwrap(),
+            "ubuntu-cuda-12.4-x64"
+        );
+        // 短词匹配：cuda 子串 / vulkan 子串 / cpu 排除（不含 cuda 与 vulkan）
+        assert_eq!(
+            resolve_variant_keyword("b99001", "cuda").unwrap(),
+            "ubuntu-cuda-12.4-x64"
+        );
+        assert_eq!(
+            resolve_variant_keyword("b99001", "vulkan").unwrap(),
+            "ubuntu-vulkan-x64"
+        );
+        assert_eq!(
+            resolve_variant_keyword("b99001", "cpu").unwrap(),
+            "ubuntu-x64"
+        );
+        // 多命中：报错列出全部候选引导完整目录名（不隐式择新）
+        std::fs::create_dir_all(
+            llama_runtime_root()
+                .join("b99001")
+                .join("ubuntu-cuda-12.6-x64"),
+        )
+        .unwrap();
+        let err = resolve_variant_keyword("b99001", "cuda").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ubuntu-cuda-12.4-x64") && msg.contains("ubuntu-cuda-12.6-x64"));
+        // 零命中：报错列出该 tag 已装变体清单；非法词：报错期望形态
+        assert!(resolve_variant_keyword("b99002", "cuda")
+            .unwrap_err()
+            .to_string()
+            .contains("没有匹配"));
+        assert!(resolve_variant_keyword("b99001", "foo")
+            .unwrap_err()
+            .to_string()
+            .contains("非法变体"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("ROXID_HOME");
+    }
+
+    /// 迭代50 M189：生效变体解析——default_variant 与 default_version
+    /// 同时在位且目录在位时直用（原样返回真实目录名）；目录缺失/
+    /// 形态非法/缺省一律回退探测（未配置用户零变化锚定）
+    #[test]
+    fn effective_variant_priority_matrix() {
+        let _guard = crate::config::ROXID_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("roxid-eff-var-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("ROXID_HOME", &dir);
+        std::env::remove_var(ENV_LLAMA_SERVER_OVERRIDE);
+        // 未配置：回退探测（与 asset_variant 等价——未配置用户零变化锚定）
+        let probed = crate::runtime::detect_backend()
+            .asset_variant()
+            .expect("发布矩阵内宿主探测不应报错");
+        assert_eq!(effective_variant().unwrap(), probed);
+        // 在位：直用 default_variant（零拼接零映射——原样返回真实目录名）
+        let v = variant_cache_dir("ubuntu-cuda-12.4-x64", "b99003");
+        std::fs::create_dir_all(&v).unwrap();
+        std::fs::write(v.join("llama-server"), b"fake").unwrap();
+        crate::config::save_persist_config(&crate::config::PersistConfig {
+            runtime: crate::config::RuntimeSection {
+                default_version: Some("b99003".into()),
+                default_variant: Some("ubuntu-cuda-12.4-x64".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            effective_variant().unwrap(),
+            "ubuntu-cuda-12.4-x64",
+            "在位时必须直用 default_variant（use 写入的真实目录名）"
+        );
+        // 目录被删：warn 回退探测
+        std::fs::remove_dir_all(&v).unwrap();
+        assert_eq!(
+            effective_variant().unwrap(),
+            probed,
+            "目录不在位必须回退探测"
+        );
+        // 形态非法（路径穿越防护）：回退探测
+        crate::config::save_persist_config(&crate::config::PersistConfig {
+            runtime: crate::config::RuntimeSection {
+                default_version: Some("b99003".into()),
+                default_variant: Some("../evil".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            effective_variant().unwrap(),
+            probed,
+            "非法形态必须回退探测（路径穿越防护）"
         );
         std::fs::remove_dir_all(&dir).ok();
         std::env::remove_var("ROXID_HOME");

@@ -294,6 +294,7 @@ REPL 命令：/bye 退出、/clear 清空对话、Ctrl-D 退出。
   roxid runtime install b10700
   roxid runtime update
   roxid runtime use b10700
+  roxid runtime use b10700 cuda   # 同版本下选变体（迭代50）
   roxid runtime rm b10700"##,
             args: &[],
         },
@@ -347,13 +348,20 @@ config.toml [runtime].tag_complete_limit 可配；查询 2 秒超时，
     (
         "roxid runtime use",
         CmdHelp {
-            about: "设置默认运行时版本",
+            about: "设置默认运行时版本（可在同版本下选择变体）",
             after: r##"示例：
   roxid runtime use b10700
+  roxid runtime use b10700 cuda      # 短词：cuda / vulkan / cpu
+  roxid runtime use b10700 ubuntu-cuda-12.4-x64   # 完整变体目录名
   roxid runtime use manual
 
+变体词在该版本已装变体目录中匹配（runtime list 可见）；
+不带变体参数时重置回自动探测。
 切换后正在运行的实例按需重建。"##,
-            args: &[("tag", "版本 tag 或 \"manual\"")],
+            args: &[
+                ("tag", "版本 tag 或 \"manual\""),
+                ("variant", "可选变体：短词 cuda/vulkan/cpu 或完整变体目录名"),
+            ],
         },
     ),
     (
@@ -670,6 +678,7 @@ Examples:
   roxid runtime install b10700
   roxid runtime update
   roxid runtime use b10700
+  roxid runtime use b10700 cuda   # pick a variant within the tag
   roxid runtime rm b10700"##,
             args: &[],
         },
@@ -727,13 +736,24 @@ otherwise only re-points the default (no re-download)."##,
     (
         "roxid runtime use",
         CmdHelp {
-            about: "Set the default runtime version",
+            about: "Set the default runtime version (optionally picking a variant)",
             after: r##"Examples:
   roxid runtime use b10700
+  roxid runtime use b10700 cuda      # keyword: cuda / vulkan / cpu
+  roxid runtime use b10700 ubuntu-cuda-12.4-x64   # full variant dir name
   roxid runtime use manual
 
+The variant keyword is matched against installed variant
+directories of that tag (see runtime list); omitting it
+resets to automatic detection.
 Running instances are rebuilt on demand after the switch."##,
-            args: &[("tag", "Version tag or \"manual\"")],
+            args: &[
+                ("tag", "Version tag or \"manual\""),
+                (
+                    "variant",
+                    "Optional variant: cuda/vulkan/cpu or full dir name",
+                ),
+            ],
         },
     ),
     (

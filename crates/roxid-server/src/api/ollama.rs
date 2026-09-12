@@ -289,6 +289,9 @@ struct StreamState {
     model: String,
     /// 事件形态转换器
     convert: ChunkConverter,
+    /// 流式 tool_calls arguments 跨片重组状态机（迭代51 M195：挂账29-②
+    /// 清偿——chunk 原始层重写，convert 的 M187 映射对对象形态天然透传）
+    tool_args: crate::adapter::ToolCallArgsAccumulator,
     /// 实例租约（M27：随流 Drop 释放；仅持有不读取，豁免 dead_code 告警）
     #[allow(dead_code)]
     lease: RunnerLease,
@@ -324,6 +327,7 @@ fn sse_to_ndjson(
         buf: String::new(),
         model,
         convert,
+        tool_args: crate::adapter::ToolCallArgsAccumulator::new(),
         lease,
         request_start: extras.request_start,
         first_byte: extras.first_byte,
@@ -347,7 +351,26 @@ fn sse_to_ndjson(
                         if line == "[DONE]" {
                             continue;
                         }
-                        if let Ok(chunk) = serde_json::from_str::<Value>(line) {
+                        if let Ok(mut chunk) = serde_json::from_str::<Value>(line) {
+                            // M195（迭代51）：流式 tool_calls arguments 跨片
+                            // 重组——在 chunk 原始层重写（convert 前），分片
+                            // 字符串经状态机累积解析为增量对象；generate 通道
+                            // 无 tool_calls 天然 no-op；后续 M187 映射对重写后
+                            // 的对象形态直接透传（tool_call_arguments_to_ollama
+                            // 对非字符串原值克隆返回）
+                            if let Some(tcs) =
+                                chunk["choices"][0]["delta"]["tool_calls"].as_array_mut()
+                            {
+                                for tc in tcs.iter_mut() {
+                                    let idx = tc.get("index").and_then(Value::as_u64);
+                                    let name = tc["function"]["name"].as_str().unwrap_or_default();
+                                    tc["function"]["arguments"] = st.tool_args.ingest(
+                                        idx,
+                                        name,
+                                        &tc["function"]["arguments"],
+                                    );
+                                }
+                            }
                             for ev in (st.convert)(&st.model, &chunk) {
                                 // M28 碴8：累积 generate 文本增量（chat 事件无 response 字段天然跳过）
                                 if let Some(t) = ev["response"].as_str() {
@@ -1382,8 +1405,9 @@ pub async fn show(
     if meta.files.mmproj.is_some() {
         capabilities.push(json!("vision"));
     }
-    if is_embedding_family(&meta.family) {
-        // M28 碴9：家族集合判定（原 contains("embed") 漏判 bert 系）
+    if crate::scheduler::is_embedding_family(&meta.family) {
+        // M28 碴9：家族集合判定（迭代51 M193 迁入 scheduler 共享——与
+        // 同类换载单一事实源，原 api 层私有实现删除）
         capabilities.push(json!("embedding"));
     }
     Json(json!({
@@ -2116,22 +2140,6 @@ fn update_gate_snapshot(gate: &Arc<PullGate>, ev: &crate::registry::PullEvent) {
     }
 }
 
-/// 已知 embedding 模型家族判定（M28 碴9：原 contains("embed") 子串判定漏判
-/// bert 系——nomic-bert/jina-bert-v2 等 GGUF architecture 均为 bert 词根的
-/// embedding 模型；纯生成家族不含这些词根，无误报）。
-///
-/// - 参数 family：GGUF general.architecture 家族名
-/// - 返回：true 表示 embedding 模型
-fn is_embedding_family(family: &str) -> bool {
-    let f = family.to_ascii_lowercase();
-    f.contains("embed")
-        || f == "bert"
-        || f.starts_with("bert-")
-        || f.contains("-bert")
-        || f.starts_with("bge")
-        || f.contains("-bge")
-}
-
 /// blobs 响应体：1MB 分块直通（futures::stream::unfold，零额外依赖）。
 /// M28 碴15：读错误以 Err 项终结流——原实现 Err 静默当 EOF，流被截断但
 /// content-length 已声明全量，客户端挂起/半包；Err 项使 axum 中断连接，
@@ -2442,6 +2450,9 @@ mod tests {
     /// M28 碴9：embedding 家族判定（embed 子串 + bert/bge 词根边界）
     #[test]
     fn embedding_family_detection() {
+        // 迭代51 M193：判定迁入 scheduler 共享（service_class 单一事实源），
+        // 本用例锚定 capabilities 填充所依赖的共享行为面
+        use crate::scheduler::is_embedding_family;
         assert!(is_embedding_family("nomic-embed-text"));
         assert!(is_embedding_family("nomic-bert"), "bert 词根漏判修复");
         assert!(is_embedding_family("jina-bert-v2"));
@@ -2926,7 +2937,6 @@ HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     async fn show_official_shape_capabilities_parameters_model_info() {
         use crate::api::AppState;
         use crate::scheduler::RunnerRegistry;
-        use std::process::Stdio;
 
         let root = std::env::temp_dir().join(format!("roxid-show-m35-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
