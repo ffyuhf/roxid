@@ -146,7 +146,7 @@ Request fields:
 
 Message roles: `system` / `user` / `assistant` / `tool`; assistant thinking is passed back via `thinking` to preserve multi-turn context.
 
-Tool calling: the backend is launched with `--jinja` (models' embedded chat templates are used). In both non-stream responses and stream events, `tool_calls[].function.arguments` is always an object — streamed fragments are reassembled server-side into incremental key/value objects (merge semantics aligned with official Ollama; final event carries the complete object).
+Tool calling: the backend is launched with `--jinja` (models' embedded chat templates are used). In both non-stream responses and stream events, `tool_calls[].function.arguments` is always an object — streamed fragments are reassembled server-side and emitted once as a complete tool call (name + full arguments object) when the JSON closes, matching the official Ollama streaming form (official docs/api.md single-chunk complete tool_calls); intermediate fragment events carry no tool_calls.
 
 Stream interruption: if the backend dies mid-stream, the stream is closed with a readable `{"error":"上游中断：…"}` line (plus `stderr_tail` with the instance's last stderr lines when available) — the transport itself always terminates cleanly.
 

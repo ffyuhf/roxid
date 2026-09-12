@@ -292,8 +292,8 @@ struct StreamState {
     model: String,
     /// 事件形态转换器
     convert: ChunkConverter,
-    /// 流式 tool_calls arguments 跨片重组状态机（迭代51 M195：挂账29-②
-    /// 清偿——chunk 原始层重写，convert 的 M187 映射对对象形态天然透传）
+    /// 流式 tool_calls arguments 跨片重组状态机（迭代51 M195 建立，
+    /// 迭代55 M206 完整落定语义：未闭合剥除 / 闭合一次性完整下发）
     tool_args: crate::adapter::ToolCallArgsAccumulator,
     /// 实例租约（M27：随流 Drop 释放；仅持有不读取，豁免 dead_code 告警）
     #[allow(dead_code)]
@@ -328,41 +328,75 @@ fn next_sse_event(buf: &mut Vec<u8>) -> Option<String> {
 /// 索引链按 serde_json IndexMut 求值，流末 usage 包（include_usage 契约
 /// choices=[] 空数组）触发越界 panic，连接任务中止致响应截断与终包
 /// 丢失——open-webui TransferEncodingError 根因，2026-09-12 23-10）。
-/// 本函数全程 get_mut 安全读链：形态不符自然跳过，永不 panic。
+/// 迭代55 M206（2026-09-12 23-50，Q2-A/Q3-A 裁决 23:46）：下发形态改
+/// 官方完整语义——未闭合分片剥除该 tool_call（剥光则本 chunk 无
+/// tool_calls 下发，空事件保留照发）；完整闭合时原地组装单条完整
+/// tool_call（桶记录 name + 完整 arguments 对象，index/id 等既有字段
+/// 保留）；畸形形态本片原样透传（M187 兼容）。本函数全程 get_mut 安全
+/// 读链：形态不符自然跳过，永不 panic。
 ///
 /// - 参数 tool_args：跨片累积状态机（每流一个实例）
-/// - 参数 chunk：上游 SSE 事件 JSON（原地重写 arguments）
+/// - 参数 chunk：上游 SSE 事件 JSON（原地重写 tool_calls）
 fn rewrite_tool_call_arguments(
     tool_args: &mut crate::adapter::ToolCallArgsAccumulator,
     chunk: &mut Value,
 ) {
-    let Some(tcs) = chunk
+    let Some(delta) = chunk
         .get_mut("choices")
         .and_then(Value::as_array_mut)
         .and_then(|choices| choices.first_mut())
         .and_then(|choice| choice.get_mut("delta"))
-        .and_then(|delta| delta.get_mut("tool_calls"))
-        .and_then(Value::as_array_mut)
+        .and_then(Value::as_object_mut)
     else {
-        return; // usage-only（choices=[]）与无 tool_calls 包天然 no-op
+        return; // usage-only（choices=[]）与无 delta 包天然 no-op
     };
+    // 取出 tool_calls 独立处理（避免 delta 双重借用）；非数组形态放回
+    let Some(tcs_value) = delta.remove("tool_calls") else {
+        return; // 无 tool_calls 包天然 no-op
+    };
+    let mut tcs = match tcs_value {
+        Value::Array(a) => a,
+        other => {
+            delta.insert("tool_calls".to_string(), other);
+            return;
+        }
+    };
+    let mut kept: Vec<Value> = Vec::with_capacity(tcs.len());
     for tc in tcs.iter_mut() {
-        // tc/function 形态防御：非对象项跳过重写原样透传（M187 兼容
-        // 路径兜底），杜绝写索引在非对象非 Null 值上的 panic 面
+        // tc/function 形态防御：非对象项原样透传（M187 兼容路径兜底），
+        // 杜绝写索引在非对象非 Null 值上的 panic 面
         let Some(tc_obj) = tc.as_object_mut() else {
+            kept.push(tc.clone());
             continue;
         };
         let idx = tc_obj.get("index").and_then(Value::as_u64);
         let Some(function) = tc_obj.get_mut("function").and_then(Value::as_object_mut) else {
+            kept.push(tc.clone());
             continue;
         };
         let name = function
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let rewritten =
-            tool_args.ingest(idx, name, function.get("arguments").unwrap_or(&Value::Null));
-        function.insert("arguments".into(), rewritten);
+        match tool_args.ingest(idx, name, function.get("arguments").unwrap_or(&Value::Null)) {
+            // 未闭合：剥除本片（残缺条目不下发）
+            crate::adapter::ToolCallEmit::Suppress => {}
+            // 完整闭合：原地组装官方完整形态（name 桶记录 + 完整对象）
+            crate::adapter::ToolCallEmit::Emit {
+                name: full_name,
+                arguments,
+            } => {
+                function.insert("name".to_string(), json!(full_name));
+                function.insert("arguments".to_string(), arguments);
+                kept.push(tc.clone());
+            }
+            // 畸形：本片原样透传（M187 兼容）
+            crate::adapter::ToolCallEmit::Passthrough => kept.push(tc.clone()),
+        }
+    }
+    // Q3-A 裁决：全剥除时不回写 tool_calls 键（空事件保留照发）
+    if !kept.is_empty() {
+        delta.insert("tool_calls".to_string(), Value::Array(kept));
     }
 }
 
@@ -408,15 +442,13 @@ fn sse_to_ndjson(
                             continue;
                         }
                         if let Ok(mut chunk) = serde_json::from_str::<Value>(line) {
-                            // M195（迭代51）：流式 tool_calls arguments 跨片
-                            // 重组——在 chunk 原始层重写（convert 前），分片
-                            // 字符串经状态机累积解析为增量对象；generate 通道
-                            // 无 tool_calls 天然 no-op；后续 M187 映射对重写后
-                            // 的对象形态直接透传（tool_call_arguments_to_ollama
-                            // 对非字符串原值克隆返回）。
-                            // 迭代54 M201（2026-09-12 23-10）：重写段移入
-                            // rewrite_tool_call_arguments（原内联索引链的
-                            // IndexMut panic 面根因修复，见该函数注释）
+                            // M195（迭代51）→ 迭代55 M206：流式 tool_calls
+                            // 跨片重组——chunk 原始层重写（convert 前）：未
+                            // 闭合分片剥除、完整闭合一次性下发完整对象
+                            // （官方形态）；generate 通道无 tool_calls 天然
+                            // no-op。迭代54 M201（2026-09-12 23-10）：重写段
+                            // 移入 rewrite_tool_call_arguments（原内联索引链
+                            // 的 IndexMut panic 面根因修复，见该函数注释）
                             rewrite_tool_call_arguments(&mut st.tool_args, &mut chunk);
                             for ev in (st.convert)(&st.model, &chunk) {
                                 // M28 碴8：累积 generate 文本增量（chat 事件无 response 字段天然跳过）
@@ -2346,9 +2378,11 @@ mod tests {
         assert!(chunk.get("usage").is_some(), "usage 键保留");
     }
 
-    /// 迭代54 M201：完整工具调用流序列（role 首包 → 参数分片 → 终分片 →
-    /// usage-only 包）经 重写+convert+FinalEventBuffer 全链——终包正常
-    /// 产出（done:true + 完整参数 + usage 统计合并），不丢终态（原 panic
+    /// 迭代54 M201 建立 / 迭代55 M206 完整语义改写：完整工具调用流序列
+    /// （role 首包 → 参数分片 → 终分片+finish_reason → usage-only 包）
+    /// 经 重写+convert+FinalEventBuffer 全链——中间事件无 tool_calls 键
+    /// （残缺条目剥除），终包（done:true）携带恰一条完整 tool_calls
+    /// （name 组装 + 完整参数 + usage 统计合并），不丢终态（原 panic
     /// 恰发生在终包 flush 前，工具参数缺尾部即此碴）
     #[test]
     fn tool_stream_sequence_survives_final_usage_chunk() {
@@ -2365,13 +2399,26 @@ mod tests {
             // 流末 usage 包：choices=[] —— 原 IndexMut panic 触发点
             json!({"choices": [], "usage": {"prompt_tokens": 77, "completion_tokens": 42}}),
         ];
+        let mut tool_event_count = 0;
         for mut chunk in chunks {
             rewrite_tool_call_arguments(&mut acc, &mut chunk);
             let events = crate::adapter::openai_chunk_to_ollama_chat_events("m:latest", &chunk);
             for ev in events {
-                finals.push(ev);
+                if ev["message"]["tool_calls"].is_array() {
+                    tool_event_count += 1;
+                } else if !ev["done"].as_bool().unwrap_or(false) {
+                    assert!(
+                        ev["message"]["tool_calls"].is_null(),
+                        "中间事件不得携带 tool_calls 残缺条目"
+                    );
+                }
+                let _ = finals.push(ev);
             }
         }
+        assert_eq!(
+            tool_event_count, 1,
+            "全程恰一条 tool_calls 事件（{{}}×N 残缺根治）"
+        );
         let fin = finals
             .flush()
             .expect("终包必须产出（usage 包到达后合并 flush）");
@@ -2383,13 +2430,87 @@ mod tests {
         assert_eq!(fin["eval_count"], 42, "usage 统计并入终包");
         assert_eq!(fin["prompt_eval_count"], 77);
         assert_eq!(
+            fin["message"]["tool_calls"].as_array().unwrap().len(),
+            1,
+            "终包恰一条完整 tool_call"
+        );
+        assert_eq!(
+            fin["message"]["tool_calls"][0]["function"]["name"], "run_code",
+            "name 取首包桶记录（分片包 name 缺失场景）"
+        );
+        assert_eq!(
             fin["message"]["tool_calls"][0]["function"]["arguments"]["code"], "6515+15",
-            "终包携带最后分片重组后的完整参数值"
+            "终包携带完整重组参数值（一次落定，无增量前缀）"
+        );
+    }
+
+    /// 迭代55 M206（本案锚定，用户报告 2026-09-12 23:38）：长单键值多分片
+    /// 序列（open-webui math_calculator 场景，{}×N 前缀根治）——首包 name
+    /// 包 + 六个参数分片：中间事件 message 全程无 tool_calls 键，恰一条
+    /// 完整 tool_calls 事件（name 桶记录 + 完整 code 值一次落定），剥除后
+    /// 空事件 content:"" 保留（Q3-A 裁决：最小改动不跳事件）
+    #[test]
+    fn tool_stream_long_single_key_value_emits_single_complete_event() {
+        let mut acc = crate::adapter::ToolCallArgsAccumulator::new();
+        // 分片字面量用转义字符串（raw string 内容以 " 结尾会被定界符
+        // 吞掉——adapter 测试注释记载的词法陷阱）
+        let fragments = [
+            r#"{"#,
+            "\"code",
+            "\":\"",
+            "651516156156165156516*561561561561165",
+            "-65165156155+15/516165156146",
+            "\"}",
+        ];
+        let mut chunks: Vec<Value> = vec![
+            json!({"choices": [{"delta": {"role": "assistant", "tool_calls": [
+                {"index": 0, "function": {"name": "math_calculator", "arguments": ""}}]}}]}),
+        ];
+        for f in fragments {
+            chunks.push(json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": f}}]}}]}));
+        }
+        let mut total_events = 0;
+        let mut tool_event_count = 0;
+        let mut complete: Option<Value> = None;
+        for mut chunk in chunks {
+            rewrite_tool_call_arguments(&mut acc, &mut chunk);
+            for ev in crate::adapter::openai_chunk_to_ollama_chat_events("m:latest", &chunk) {
+                total_events += 1;
+                if ev["message"]["tool_calls"].is_array() {
+                    tool_event_count += 1;
+                    complete = Some(ev);
+                } else {
+                    assert!(
+                        ev["message"]["tool_calls"].is_null(),
+                        "中间事件不得携带 tool_calls 残缺条目"
+                    );
+                    assert_eq!(
+                        ev["message"]["content"], "",
+                        "剥除后空事件保留（Q3-A：content 空串照发）"
+                    );
+                }
+            }
+        }
+        assert_eq!(total_events, 7, "7 个 chunk 各产一事件（空事件保留）");
+        assert_eq!(
+            tool_event_count, 1,
+            "恰一条 tool_calls 事件（无 {{}}×N 前缀）"
+        );
+        let ev = complete.expect("完整事件必须产出");
+        assert_eq!(
+            ev["message"]["tool_calls"][0]["function"]["name"], "math_calculator",
+            "name 取首包桶记录"
+        );
+        assert_eq!(
+            ev["message"]["tool_calls"][0]["function"]["arguments"]["code"],
+            "651516156156165156516*561561561561165-65165156155+15/516165156146",
+            "完整参数值跨片重组（一次落定）"
         );
     }
 
     /// 迭代54 M201：畸形 tool_calls 项（字符串/数字、function 非对象）
-    /// 跳过重写原样透传，不 panic
+    /// 跳过重写原样透传，不 panic（迭代55 M206：合法项断言改完整对象）
     #[test]
     fn rewrite_skips_malformed_tool_call_items() {
         let mut acc = crate::adapter::ToolCallArgsAccumulator::new();
@@ -2411,7 +2532,11 @@ mod tests {
         assert_eq!(
             tcs[3]["function"]["arguments"],
             json!({"a": 1}),
-            "合法项正常重写为增量对象"
+            "合法项重写为完整对象（M206 官方形态）"
+        );
+        assert_eq!(
+            tcs[3]["function"]["name"], "ok",
+            "name 保留（本包携带场景）"
         );
     }
 

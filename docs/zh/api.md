@@ -146,7 +146,7 @@ curl http://127.0.0.1:11434/api/generate \
 
 消息 role：`system` / `user` / `assistant` / `tool`；assistant 思考内容经 `thinking` 字段回传保持多轮上下文。
 
-工具调用：后端以 `--jinja` 启动（使用各模型内嵌对话模板）。非流式响应与流式事件的 `tool_calls[].function.arguments` 恒为对象形态——流式分片由服务端跨片重组为增量键值对象（合并语义对齐官方 Ollama；终态事件携带完整对象）。
+工具调用：后端以 `--jinja` 启动（使用各模型内嵌对话模板）。非流式响应与流式事件的 `tool_calls[].function.arguments` 恒为对象形态——流式分片由服务端跨片重组，JSON 闭合时以单事件一次性下发完整工具调用（name + 完整 arguments 对象，对齐官方 Ollama 流式形态——官方 docs/api.md 单 chunk 完整 tool_calls）；中间分片事件不携带 tool_calls。
 
 流式中断：后端中途死亡时以可读的 `{"error":"上游中断：…"}` 行收尾（可得时附 `stderr_tail` 实例 stderr 尾部行）——传输层始终正常终止。
 
