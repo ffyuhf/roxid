@@ -158,12 +158,13 @@ fn format_upstream_error(text: &str) -> String {
 
 /// 上游请求失败错误整形（M34 BUG-7，R5-A 裁决：模型级语义文案——rm/stop
 /// 杀实例后在途请求收到连接类错误原文，含 llama-server 动态端口 URL，
-/// 既不可理解又暴露内部拓扑）。
+/// 既不可理解又暴露内部拓扑）。迭代54 M204 起 pub(crate)：/v1 直通层
+/// 断流整形共用（2026-09-12 23-18）。
 ///
 /// - 参数 e：reqwest 发送错误（按值接收——without_url 消费所有权）
 /// - 返回：连接/请求类失败转「模型实例已停止」模型级文案；其余保留
 ///   Display 并经 without_url 剥离内部 URL
-fn upstream_failure_message(mut e: reqwest::Error) -> String {
+pub(crate) fn upstream_failure_message(mut e: reqwest::Error) -> String {
     // is_decode：流中途 body 解码失败（连接被掐）——rm/stop 杀实例后
     // 在途流的典型形态（e2e 实测 2026-09-07 19:35）
     if e.is_connect() || e.is_request() || e.is_decode() {
@@ -283,8 +284,10 @@ struct StreamContext {
 struct StreamState {
     /// 上游字节流
     upstream: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    /// SSE 缓冲
-    buf: String,
+    /// SSE 字节缓冲（迭代54 M201，2026-09-12 23-10：原 String 逐片
+    /// from_utf8_lossy 在 TCP 分片切断多字节字符时产生替换符污染事件
+    /// 解析——字节缓冲推迟到完整事件边界统一转换）
+    buf: Vec<u8>,
     /// 回显模型名
     model: String,
     /// 事件形态转换器
@@ -309,6 +312,60 @@ struct StreamState {
     finals: FinalEventBuffer,
 }
 
+/// 从字节缓冲切出一个完整 SSE 事件（`\n\n` 分界；迭代54 M201）。
+///
+/// - 参数 buf：跨 chunk 字节缓冲（已消费部分在调用后 drain）
+/// - 返回：Some(事件原文含多行)；None=缓冲中暂无完整事件
+fn next_sse_event(buf: &mut Vec<u8>) -> Option<String> {
+    let pos = buf.windows(2).position(|w| w == b"\n\n")?;
+    let event = String::from_utf8_lossy(&buf[..pos]).into_owned();
+    buf.drain(..pos + 2);
+    Some(event)
+}
+
+/// M195 chunk 原始层重写：tool_calls arguments 跨片重组（迭代54 M201
+/// 抽取为独立纯函数——原内联 `chunk["choices"][0]...as_array_mut()`
+/// 索引链按 serde_json IndexMut 求值，流末 usage 包（include_usage 契约
+/// choices=[] 空数组）触发越界 panic，连接任务中止致响应截断与终包
+/// 丢失——open-webui TransferEncodingError 根因，2026-09-12 23-10）。
+/// 本函数全程 get_mut 安全读链：形态不符自然跳过，永不 panic。
+///
+/// - 参数 tool_args：跨片累积状态机（每流一个实例）
+/// - 参数 chunk：上游 SSE 事件 JSON（原地重写 arguments）
+fn rewrite_tool_call_arguments(
+    tool_args: &mut crate::adapter::ToolCallArgsAccumulator,
+    chunk: &mut Value,
+) {
+    let Some(tcs) = chunk
+        .get_mut("choices")
+        .and_then(Value::as_array_mut)
+        .and_then(|choices| choices.first_mut())
+        .and_then(|choice| choice.get_mut("delta"))
+        .and_then(|delta| delta.get_mut("tool_calls"))
+        .and_then(Value::as_array_mut)
+    else {
+        return; // usage-only（choices=[]）与无 tool_calls 包天然 no-op
+    };
+    for tc in tcs.iter_mut() {
+        // tc/function 形态防御：非对象项跳过重写原样透传（M187 兼容
+        // 路径兜底），杜绝写索引在非对象非 Null 值上的 panic 面
+        let Some(tc_obj) = tc.as_object_mut() else {
+            continue;
+        };
+        let idx = tc_obj.get("index").and_then(Value::as_u64);
+        let Some(function) = tc_obj.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let rewritten =
+            tool_args.ingest(idx, name, function.get("arguments").unwrap_or(&Value::Null));
+        function.insert("arguments".into(), rewritten);
+    }
+}
+
 /// llama-server SSE 流 → Ollama NDJSON 流（Body::from_stream 状态机）。
 /// 缓缓冲按 "\n\n" 切分 SSE 事件；"data: [DONE]" 结束；解析失败行跳过。
 /// M27（碴1）：租约移入流状态——流耗尽或 body 被客户端断开丢弃时 Drop，
@@ -324,7 +381,7 @@ fn sse_to_ndjson(
 ) -> Body {
     let state = StreamState {
         upstream: Box::pin(resp.bytes_stream()),
-        buf: String::new(),
+        buf: Vec::new(),
         model,
         convert,
         tool_args: crate::adapter::ToolCallArgsAccumulator::new(),
@@ -339,9 +396,8 @@ fn sse_to_ndjson(
     Body::from_stream(futures::stream::unfold(state, |mut st| {
         Box::pin(async move {
             loop {
-                if let Some(pos) = st.buf.find("\n\n") {
-                    let event = st.buf[..pos].to_string();
-                    st.buf.drain(..pos + 2);
+                // 迭代54 M201：完整事件边界统一 lossy 转换（跨片多字节安全）
+                if let Some(event) = next_sse_event(&mut st.buf) {
                     let lines: Vec<&str> = event
                         .lines()
                         .filter_map(|l| l.strip_prefix("data:").map(|d| d.trim()))
@@ -357,20 +413,11 @@ fn sse_to_ndjson(
                             // 字符串经状态机累积解析为增量对象；generate 通道
                             // 无 tool_calls 天然 no-op；后续 M187 映射对重写后
                             // 的对象形态直接透传（tool_call_arguments_to_ollama
-                            // 对非字符串原值克隆返回）
-                            if let Some(tcs) =
-                                chunk["choices"][0]["delta"]["tool_calls"].as_array_mut()
-                            {
-                                for tc in tcs.iter_mut() {
-                                    let idx = tc.get("index").and_then(Value::as_u64);
-                                    let name = tc["function"]["name"].as_str().unwrap_or_default();
-                                    tc["function"]["arguments"] = st.tool_args.ingest(
-                                        idx,
-                                        name,
-                                        &tc["function"]["arguments"],
-                                    );
-                                }
-                            }
+                            // 对非字符串原值克隆返回）。
+                            // 迭代54 M201（2026-09-12 23-10）：重写段移入
+                            // rewrite_tool_call_arguments（原内联索引链的
+                            // IndexMut panic 面根因修复，见该函数注释）
+                            rewrite_tool_call_arguments(&mut st.tool_args, &mut chunk);
                             for ev in (st.convert)(&st.model, &chunk) {
                                 // M28 碴8：累积 generate 文本增量（chat 事件无 response 字段天然跳过）
                                 if let Some(t) = ev["response"].as_str() {
@@ -400,14 +447,21 @@ fn sse_to_ndjson(
                     continue; // 空事件（注释/心跳）继续拉取
                 }
                 match st.upstream.next().await {
-                    Some(Ok(chunk)) => st.buf.push_str(&String::from_utf8_lossy(&chunk)),
+                    // 迭代54 M201：字节直积缓冲（lossy 推迟至事件边界）
+                    Some(Ok(chunk)) => st.buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
-                        // M34 BUG-7：流中断错误整形（模型级语义，剥离内部 URL/端口）
-                        let err = format!(
-                            "{{\"error\":\"上游中断：{}\"}}\n",
-                            upstream_failure_message(e)
-                        );
-                        return Some((Ok(Bytes::from(err)), st));
+                        // M34 BUG-7：流中断错误整形（模型级语义，剥离内部
+                        // URL/端口）。迭代54 M202（2026-09-12 23-18）：json!
+                        // 构造错误行并追加实例 stderr 尾部摘要（M97 环形
+                        // 缓存）——llama-server 运行中崩溃此前无诊断线索；
+                        // 空缓存不加键
+                        let mut err = json!({"error":
+                            format!("上游中断：{}", upstream_failure_message(e))});
+                        let tail = st.lease.stderr_tail().await;
+                        if !tail.is_empty() {
+                            err["stderr_tail"] = json!(tail);
+                        }
+                        return Some((Ok(Bytes::from(format!("{err}\n"))), st));
                     }
                     None => {
                         // M34 BUG-1：流结束 flush 暂存终包——全流恰好一个
@@ -635,8 +689,9 @@ fn native_completion_to_ollama(model: &str, v: &Value) -> Value {
 struct NativeStreamState {
     /// 上游字节流
     upstream: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    /// 行缓冲（跨 chunk 半行拼接）
-    buf: String,
+    /// 行字节缓冲（迭代54 M201 同款改造：跨 chunk 半行字节拼接，
+    /// 多字节字符跨片安全）
+    buf: Vec<u8>,
     /// 回显模型名
     model: String,
     /// 实例租约（M27：随流 Drop 释放）
@@ -675,7 +730,7 @@ fn native_ndjson_to_ollama(
 ) -> Body {
     let state = NativeStreamState {
         upstream: Box::pin(resp.bytes_stream()),
-        buf: String::new(),
+        buf: Vec::new(),
         model,
         lease,
         request_start,
@@ -690,8 +745,9 @@ fn native_ndjson_to_ollama(
     Body::from_stream(futures::stream::unfold(state, |mut st| {
         Box::pin(async move {
             loop {
-                while let Some(pos) = st.buf.find('\n') {
-                    let line = st.buf[..pos].trim().to_string();
+                // 迭代54 M201：字节缓冲行切分（同 sse_to_ndjson 跨片安全）
+                while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
+                    let line = String::from_utf8_lossy(&st.buf[..pos]).trim().to_string();
                     st.buf.drain(..pos + 1);
                     if line.is_empty() {
                         continue;
@@ -749,7 +805,8 @@ fn native_ndjson_to_ollama(
                     ));
                 }
                 match st.upstream.next().await {
-                    Some(Ok(chunk)) => st.buf.push_str(&String::from_utf8_lossy(&chunk)),
+                    // 迭代54 M201：字节直积缓冲（lossy 推迟至行边界）
+                    Some(Ok(chunk)) => st.buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
                         // M34 BUG-7 同款：流中断整形（模型级语义，剥离内部 URL）
                         let err = format!(
@@ -2270,6 +2327,108 @@ mod tests {
         assert_eq!(out["eval_count"], 2009, "后到统计键并入");
         assert_eq!(out["prompt_eval_count"], 26);
         assert!(buf.flush().is_none(), "flush 幂等（不重复产出）");
+    }
+
+    /// 迭代54 M201（根因回归锚定）：usage-only 空 choices 包（include_usage
+    /// 契约形态，llama-server 每流末必发）经重写函数不 panic 且原样——
+    /// 原内联 IndexMut 链对该形态越界 panic，致每个流式请求在流末截断
+    /// （TransferEncodingError、终包丢失）
+    #[test]
+    fn rewrite_skips_usage_only_empty_choices_chunk() {
+        let mut acc = crate::adapter::ToolCallArgsAccumulator::new();
+        let mut chunk = json!({"id": "x", "object": "chat.completion.chunk",
+            "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}});
+        rewrite_tool_call_arguments(&mut acc, &mut chunk);
+        assert!(
+            chunk["choices"].as_array().unwrap().is_empty(),
+            "usage 包必须原样（无 tool_calls 注入）"
+        );
+        assert!(chunk.get("usage").is_some(), "usage 键保留");
+    }
+
+    /// 迭代54 M201：完整工具调用流序列（role 首包 → 参数分片 → 终分片 →
+    /// usage-only 包）经 重写+convert+FinalEventBuffer 全链——终包正常
+    /// 产出（done:true + 完整参数 + usage 统计合并），不丢终态（原 panic
+    /// 恰发生在终包 flush 前，工具参数缺尾部即此碴）
+    #[test]
+    fn tool_stream_sequence_survives_final_usage_chunk() {
+        let mut acc = crate::adapter::ToolCallArgsAccumulator::new();
+        let mut finals = FinalEventBuffer::new();
+        let chunks = vec![
+            json!({"choices": [{"delta": {"role": "assistant", "tool_calls": [
+                {"index": 0, "function": {"name": "run_code", "arguments": ""}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "{\"code\":\"65"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "15+15\"}"}}]},
+                "finish_reason": "tool_calls"}]}),
+            // 流末 usage 包：choices=[] —— 原 IndexMut panic 触发点
+            json!({"choices": [], "usage": {"prompt_tokens": 77, "completion_tokens": 42}}),
+        ];
+        for mut chunk in chunks {
+            rewrite_tool_call_arguments(&mut acc, &mut chunk);
+            let events = crate::adapter::openai_chunk_to_ollama_chat_events("m:latest", &chunk);
+            for ev in events {
+                finals.push(ev);
+            }
+        }
+        let fin = finals
+            .flush()
+            .expect("终包必须产出（usage 包到达后合并 flush）");
+        assert!(fin["done"].as_bool().unwrap(), "终包 done:true");
+        assert_eq!(
+            fin["done_reason"], "tools",
+            "finish_reason=tool_calls 映射 tools"
+        );
+        assert_eq!(fin["eval_count"], 42, "usage 统计并入终包");
+        assert_eq!(fin["prompt_eval_count"], 77);
+        assert_eq!(
+            fin["message"]["tool_calls"][0]["function"]["arguments"]["code"], "6515+15",
+            "终包携带最后分片重组后的完整参数值"
+        );
+    }
+
+    /// 迭代54 M201：畸形 tool_calls 项（字符串/数字、function 非对象）
+    /// 跳过重写原样透传，不 panic
+    #[test]
+    fn rewrite_skips_malformed_tool_call_items() {
+        let mut acc = crate::adapter::ToolCallArgsAccumulator::new();
+        let mut chunk = json!({"choices": [{"delta": {"tool_calls": [
+            "not-an-object", 42,
+            {"index": 1, "function": "also-not-object"},
+            {"index": 2, "function": {"name": "ok", "arguments": "{\"a\":1}"}}]}}]});
+        rewrite_tool_call_arguments(&mut acc, &mut chunk);
+        let tcs = chunk["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tcs[0], json!("not-an-object"), "畸形字符串项原样");
+        assert_eq!(tcs[1], json!(42), "数字项原样");
+        assert_eq!(
+            tcs[2]["function"],
+            json!("also-not-object"),
+            "function 非对象原样"
+        );
+        assert_eq!(
+            tcs[3]["function"]["arguments"],
+            json!({"a": 1}),
+            "合法项正常重写为增量对象"
+        );
+    }
+
+    /// 迭代54 M201：多字节 UTF-8 字符跨 TCP 分片——字节缓冲在事件边界
+    /// 统一转换，无替换符（原 String 逐片 lossy 丢字符碴）
+    #[test]
+    fn sse_byte_buffer_reassembles_multibyte_across_chunks() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"data: {\"content\": \"\xe4\xbd"); // 「你」前两字节
+        buf.extend_from_slice(b"\xa0\xe5\xa5\xbd\"}\n\n"); // 尾字节 + 事件结束
+        let event = next_sse_event(&mut buf).expect("完整事件必须切出");
+        assert_eq!(
+            event, "data: {\"content\": \"你好\"}",
+            "多字节字符跨片正确重组（无替换符）"
+        );
+        assert!(buf.is_empty());
+        assert!(next_sse_event(&mut buf).is_none(), "残余无完整事件");
     }
 
     /// 迭代38 M135：/api/ps digest 补齐回退——顶层空 → model 层 sha256

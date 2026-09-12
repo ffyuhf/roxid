@@ -108,10 +108,22 @@ pub(crate) async fn relay_response(resp: reqwest::Response, lease: RunnerLease) 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    let stream = resp.bytes_stream().map(move |chunk| {
-        let _ = &lease; // 闭包持有租约：流结束/丢弃时 Drop 释放
-        chunk
-    });
+    // 迭代54 M204（2026-09-12 23-18）：上游中断不再 Err 裸透传（hyper
+    // 收到流错误直接截断响应体，客户端报 TransferEncodingError 且无任何
+    // 错误信息）——按 content-type 整形为错误帧后流正常终止
+    let is_sse = content_type.contains("text/event-stream");
+    let stream =
+        resp.bytes_stream()
+            .map(move |chunk| -> Result<axum::body::Bytes, std::io::Error> {
+                let _ = &lease; // 闭包持有租约：流结束/丢弃时 Drop 释放
+                match chunk {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Ok(upstream_interrupt_frame(
+                        crate::api::ollama::upstream_failure_message(e),
+                        is_sse,
+                    )),
+                }
+            });
     let body = Body::from_stream(stream);
     Response::builder()
         .status(status)
@@ -151,21 +163,31 @@ pub(crate) async fn relay_response_remodel(
         // SSE：行缓冲逐事件改写——残余不完整行留缓冲等下一 chunk，
         // 事件分隔（空行）与非 data 行天然按行原样透出
         let mut pending: Vec<u8> = Vec::new();
-        let stream = resp.bytes_stream().map(move |chunk| {
-            let _ = &lease; // 闭包持有租约：流结束/丢弃时 Drop 释放
-            match chunk {
-                Ok(bytes) => {
-                    pending.extend_from_slice(&bytes);
-                    let mut out = Vec::new();
-                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = pending.drain(..=pos).collect();
-                        out.extend_from_slice(&rewrite_sse_line(&line, &name));
+        let stream = resp
+            .bytes_stream()
+            .map(move |chunk| -> Result<Vec<u8>, std::io::Error> {
+                let _ = &lease; // 闭包持有租约：流结束/丢弃时 Drop 释放
+                match chunk {
+                    Ok(bytes) => {
+                        pending.extend_from_slice(&bytes);
+                        let mut out = Vec::new();
+                        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                            let line: Vec<u8> = pending.drain(..=pos).collect();
+                            out.extend_from_slice(&rewrite_sse_line(&line, &name));
+                        }
+                        Ok(out)
                     }
-                    Ok(out)
+                    Err(e) => {
+                        // 迭代54 M204：残余半行丢弃，错误帧 + [DONE] 正常终止
+                        // ——不再 Err 裸透传致传输层截断（TransferEncodingError）
+                        Ok(upstream_interrupt_frame(
+                            crate::api::ollama::upstream_failure_message(e),
+                            true,
+                        )
+                        .to_vec())
+                    }
                 }
-                Err(e) => Err(e),
-            }
-        });
+            });
         return Response::builder()
             .status(status)
             .header("content-type", content_type)
@@ -183,6 +205,22 @@ pub(crate) async fn relay_response_remodel(
                 .unwrap()
         }
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+/// 上游中断整形帧（迭代54 M204）：SSE 形态 `data: {"error":…}` + [DONE]
+/// （流正常终止，客户端不收传输层截断而非可读错误）；非 SSE 形态 JSON
+/// 错误体。json! 构造保证文案内引号正确转义。
+///
+/// - 参数 msg：模型级错误语义文案（已剥离内部 URL/端口）
+/// - 参数 sse：目标响应是否 text/event-stream
+/// - 返回：可写入响应体的字节
+fn upstream_interrupt_frame(msg: String, sse: bool) -> axum::body::Bytes {
+    let body = json!({"error": format!("上游中断：{msg}")});
+    if sse {
+        axum::body::Bytes::from(format!("data: {body}\n\ndata: [DONE]\n\n"))
+    } else {
+        axum::body::Bytes::from(body.to_string())
     }
 }
 
@@ -331,6 +369,28 @@ mod tests {
         assert_eq!(
             rewrite_sse_line(b"data: not-json\n", "m"),
             b"data: not-json\n"
+        );
+    }
+
+    /// 迭代54 M204：上游中断整形帧——SSE 错误帧 + [DONE] 正常终止；
+    /// 非 SSE JSON 错误体（原 Err 裸透传致传输层截断无错误信息）
+    #[test]
+    fn upstream_interrupt_frame_forms() {
+        let sse = upstream_interrupt_frame("实例已停止".into(), true);
+        let s = String::from_utf8(sse.to_vec()).unwrap();
+        assert!(
+            s.starts_with("data: {\"error\":\"上游中断：实例已停止\"}\n\n"),
+            "SSE 形态首帧为错误事件"
+        );
+        assert!(
+            s.ends_with("data: [DONE]\n\n"),
+            "SSE 必须以 [DONE] 正常终止"
+        );
+        let json = upstream_interrupt_frame("连接失败".into(), false);
+        let v: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            v["error"], "上游中断：连接失败",
+            "非 SSE 形态为 JSON 错误体"
         );
     }
 

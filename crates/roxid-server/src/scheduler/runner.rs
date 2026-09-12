@@ -441,12 +441,9 @@ impl Runner {
             }
             if self.is_process_dead() {
                 // M97：附带 stderr 尾部摘要——gemma4 案实证裸「启动即退出」
-                // 文案无法定位真实失败原因（锁内无 await，短临界区安全）
-                let tail = self
-                    .stderr_tail
-                    .lock()
-                    .map(|q| q.iter().cloned().collect::<Vec<_>>().join(" | "))
-                    .unwrap_or_default();
+                // 文案无法定位真实失败原因（读取复用 M202 快照方法，锁内
+                // 无 await 短临界区安全）
+                let tail = self.stderr_tail_snapshot();
                 return Err(RoxidError::RunnerFailure(if tail.is_empty() {
                     format!("llama-server 启动即退出：model={}", self.model_name)
                 } else {
@@ -465,6 +462,18 @@ impl Runner {
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
+    }
+
+    /// stderr 尾部摘要快照（迭代54 M202：M97 环形缓存的读取器——
+    /// " | " 连接，空缓存空串；std Mutex 锁内无 await 短临界区安全。
+    /// 2026-09-12 23-18）。
+    ///
+    /// - 返回：尾部 STDERR_TAIL_LINES 行拼接文本
+    pub(crate) fn stderr_tail_snapshot(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|q| q.iter().cloned().collect::<Vec<_>>().join(" | "))
+            .unwrap_or_default()
     }
 
     /// 子进程 PID（显存查询键；进程结束后为 None）。
@@ -666,6 +675,14 @@ impl RunnerLease {
     /// - 返回：127.0.0.1 端口号
     pub async fn port(&self) -> u16 {
         self.runner.lock().await.port
+    }
+
+    /// 实例 stderr 尾部摘要（迭代54 M202：流中断错误行携带——llama-server
+    /// 运行中崩溃（非启动即退出）此前无诊断线索。2026-09-12 23-18）。
+    ///
+    /// - 返回：尾部 STDERR_TAIL_LINES 行 " | " 拼接文本；无输出为空串
+    pub async fn stderr_tail(&self) -> String {
+        self.runner.lock().await.stderr_tail_snapshot()
     }
 }
 

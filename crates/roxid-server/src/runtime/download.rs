@@ -61,6 +61,10 @@
 //! variant_dirs_of 单 tag 已装变体扫描 + resolve_variant_keyword
 //! 变体词匹配（磁盘事实零硬编码）+ effective_variant 生效解析
 //!（default_variant 优先、缺省回退探测）2026-09-12 16-25
+//! M200（迭代53，用户确认 2026-09-12 21:36「不要改变任何功能，但是
+//! 要消除警告」）：install_manual/install_version 参数冗余 mut 删除
+//!（回调仅按值 move 至 download_all_with_progress，无原地调用；其内部
+//! mut 因 FnMut 多次调用保留）2026-09-12 21-37
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -511,7 +515,7 @@ fn apply_gh_proxy(url: &str) -> String {
 /// - 参数 on_progress：进度回调（已下载字节, 总量 Option——HTTP 头缺失
 ///   时 None；M105 迭代32 碴6a）
 /// - 返回：落位后的 llama-server 路径
-pub async fn install_manual<F>(url: &str, mut on_progress: F) -> RoxidResult<PathBuf>
+pub async fn install_manual<F>(url: &str, on_progress: F) -> RoxidResult<PathBuf>
 where
     F: FnMut(u64, Option<u64>),
 {
@@ -548,7 +552,7 @@ static INSTALL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 pub async fn install_version<F>(
     tag: &str,
     backend_variant: &str,
-    mut on_progress: F,
+    on_progress: F,
 ) -> RoxidResult<PathBuf>
 where
     F: FnMut(u64, Option<u64>),

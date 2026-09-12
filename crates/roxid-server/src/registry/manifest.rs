@@ -8,10 +8,18 @@
 //! - GET /v2/{repo}/blobs/sha256:{digest} → 307 重定向 R2 预签名 URL
 //!
 //! 修改历史：M5 新增 2026-08-24 19:14
+//!；M200（迭代53）结构体级豁免 non_snake_case——字段名逐字对齐协议键
+//! 禁改（用户确认 2026-09-12 21:36「不要改变任何功能，但是要消除警告」）
+//! 2026-09-12 21-37
 
 use serde::{Deserialize, Serialize};
 
 /// registry v2 manifest 顶层结构
+///
+/// schemaVersion/mediaType 逐字对齐 Ollama registry v2 JSON 协议键
+///（serde 反序列化契约，改名即破坏协议对齐），故结构体级豁免
+/// non_snake_case（来源：用户确认 2026-09-12 21:36，M200）
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Manifest {
     pub schemaVersion: u32,
@@ -23,6 +31,10 @@ pub struct Manifest {
 }
 
 /// manifest 中的层描述
+///
+/// mediaType 同 Manifest：协议键直译命名，结构体级豁免 non_snake_case
+///（来源：用户确认 2026-09-12 21:36，M200）
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LayerDescriptor {
     pub mediaType: String,
