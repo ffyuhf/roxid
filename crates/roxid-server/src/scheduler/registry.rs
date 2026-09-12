@@ -45,7 +45,14 @@
 //! 贯通（spawn_spec_from_meta 填 service_class/has_mtp）+ 同类互斥
 //! 主动换载——加载新实例前卸载同服务类别的其他空闲实例（同步等退出：
 //! 腾显存是加载前置，区别于 M169 后台化），在途/异类零触碰
-//! 2026-09-12 18-21
+//! 2026-09-12 18-21；
+//! M215（迭代57 根因裁决 Q1-A 03:37、参数裁决 Q-C 03:42）：重建路径
+//! 停机同步化回撤 M169 后台化——stale 恒为同模型旧实例（与新请求
+//! 竞争同一显存预算），llama-server --fit 默认按加载时刻空闲显存定档
+//! （roxid 不传 -ngl）→ 后台停机并行窗口内新实例 fit 投影被未释放
+//! 显存压低，GPU 层档位随竞速时序随机漂移（实机十五组速度 26.3~
+//! 68.4 tok/s 不可复现实证，迭代57 计划书 1.1）；修复=同步 kill+wait
+//! （5s 超时防御）+ 0.5s 显存回收缓冲 2026-09-13 03-42
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -202,18 +209,33 @@ impl RunnerRegistry {
                 stale = writers.remove(&full);
             }
         }
-        // 锁外停机（M169 迭代45 Q4-A 裁决 2026-09-12 01:44）：后台化——
-        // 旧实例 kill+wait 移入 tokio::spawn 与新实例加载完全并行，
-        // 重建不再等待旧进程退出与驱动显存回收滞后（原串行停机把该
-        // 时长全部计入新请求等待，用户实测模型切换过慢的根因）。
-        // 句柄已 remove 出表：stop/并发 acquire 不受影响；shutdown_mut
-        // 对已退出进程幂等（M26 前置）；同模型加载锁仍持有，无并发双拉
+        // 锁外停机（M169 迭代45 后台化 → M215 迭代57 同步化回撤，根因
+        // 裁决 Q1-A 2026-09-13 03:37、参数裁决 Q-C 03:42）：M169 的
+        // tokio::spawn 后台停机使新实例加载与旧实例显存释放并行竞速——
+        // stale 恒为同模型旧实例（与新请求同服务类别、竞争同一显存
+        // 预算），llama-server --fit 默认启用且按加载时刻空闲显存定档
+        // （roxid 不传 -ngl，层压缩是 fit 唯一可动通道）→ 竞速窗口内
+        // 新实例 fit 投影被未释放显存压低 → GPU 层档位随竞速时序随机
+        // 漂移（实机十五组速度 26.3~68.4 tok/s 不可复现实证，迭代57
+        // 计划书 1.1）。修复：同步 kill+wait（5s 超时防御，超时 warn
+        // 放行——卡死由后续加载自然暴露）+ 0.5s 显存回收缓冲（进程
+        // 退出后驱动异步释放显存，缓冲确保新实例 --fit 投影读到净
+        // 空余量）。句柄已 remove 出表：stop/并发 acquire 不受影响；
+        // shutdown_mut 对已退出进程幂等（M26 前置）；同模型加载锁仍
+        // 持有，无并发双拉 2026-09-13 03-42
         if let Some(old) = stale {
-            tokio::spawn(async move {
-                if let Err(e) = old.lock().await.shutdown_mut().await {
-                    tracing::warn!("后台卸载旧实例失败：{e}");
+            let mut old_guard = old.lock().await;
+            let shutdown = old_guard.shutdown_mut();
+            match tokio::time::timeout(Duration::from_secs(5), shutdown).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("重建前卸载旧实例失败：{e}"),
+                Err(_) => {
+                    tracing::warn!("重建前卸载旧实例超时（>5s）放行——显存不足时将由新实例加载暴露")
                 }
-            });
+            }
+            drop(old_guard);
+            // 显存回收缓冲（Q-C 裁决 0.5s）：fit 投影前的确定性等待
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         // 4) 全流程加载（全局锁外：读盘/探测/下载/健康等待不再阻塞其他模型
@@ -978,6 +1000,53 @@ mod tests {
             rd.acquire("stub:missing", Duration::from_secs(60), None, None),
         );
         assert!(ec.is_err() && ed.is_err(), "同模型并发串行后均须报错");
+    }
+
+    /// M215（迭代57 Q-C 裁决 2026-09-13 03:42）：重建停机同步化——同模型
+    /// 异 runtime 触发重建时，acquire 返回前旧实例进程已退出且 0.5s 显存
+    /// 回收缓冲已过（修复前 M169 tokio::spawn 后台停机：acquire 返回时
+    /// 旧进程大概率仍存活，与新实例加载竞速致 --fit 档位漂移——迭代57
+    /// 根因，计划书 1.1）。三断言：旧进程退出 + acquire 耗时 ≥500ms
+    /// （缓冲必经路径）+ ModelNotFound（停机后加载路径继续）
+    #[tokio::test]
+    async fn rebuild_shutdown_is_synchronous_with_vram_buffer() {
+        let reg = Arc::new(RunnerRegistry::new(
+            std::env::temp_dir().join("roxid-reg-m215"),
+        ));
+        // 存活替身（sleep 300s）：runtime=None 注入后以异串 runtime 触发重建
+        let mut cmd = Command::new("sleep");
+        cmd.arg("300").stdout(Stdio::null()).stderr(Stdio::null());
+        let runner = Runner::spawn_with("stub:m215", 0, Duration::from_secs(300), &mut cmd)
+            .await
+            .unwrap();
+        let arc = reg.inject(runner).await;
+
+        let start = std::time::Instant::now();
+        let result = reg
+            .acquire(
+                "stub:m215",
+                Duration::from_secs(60),
+                None,
+                Some("--ngl 1".into()),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        // 停机后加载路径继续：仓库无 stub:m215 → ModelNotFound（证明已走到停机之后）
+        assert!(
+            matches!(result, Err(RoxidError::ModelNotFound(_))),
+            "{result:?}"
+        );
+        // 同步停机：acquire 返回时旧进程必已退出（M169 后台化形态下不成立）
+        assert!(
+            arc.lock().await.is_process_dead(),
+            "旧实例必须在 acquire 返回前退出"
+        );
+        // 0.5s 显存回收缓冲为必经路径（Q-C 裁决）
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "缓冲未生效：{elapsed:?}"
+        );
     }
 
     /// M29 碴6：重建路径停机在全局写锁外执行——ctx 不一致触发重建不死锁
