@@ -146,6 +146,8 @@ curl http://127.0.0.1:11434/api/generate \
 
 消息 role：`system` / `user` / `assistant` / `tool`；assistant 思考内容经 `thinking` 字段回传保持多轮上下文。
 
+工具调用：后端以 `--jinja` 启动（使用各模型内嵌对话模板）。非流式响应的 `tool_calls[].function.arguments` 为对象形态；流式增量中参数分片为字符串，由客户端累积。
+
 流式响应（NDJSON 每行）：
 
 ```json

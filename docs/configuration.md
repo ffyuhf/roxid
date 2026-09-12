@@ -27,7 +27,8 @@ hf = "https://hf-mirror.com/"      # HuggingFace mirror base (replaces the offic
 
 [runtime]                    # llama.cpp backend
 llama_url = "https://example.com/llama.tar.gz"  # manual backend source link (recorded by setup --llama-url); optional
-default_version = "b10700"   # default backend version (written by runtime use; "manual" selects the manual copy); optional
+default_version = "b10700"   # default backend version (written by runtime use / runtime update; "manual" selects the manual copy); optional
+tag_complete_limit = 10      # candidate count for `runtime install` tag completion (edit manually; clamped to 1..=100); optional
 ```
 
 | Field | Type | Default | Constraints | Written by |
@@ -36,7 +37,8 @@ default_version = "b10700"   # default backend version (written by runtime use; 
 | `[proxy].gh` | string? | unset | URL prefix, same semantics as `ROXID_GH_PROXY` | setup wizard |
 | `[proxy].hf` | string? | unset | mirror base, same semantics as `ROXID_HF_PROXY` | setup wizard |
 | `[runtime].llama_url` | string? | unset | tar.gz or bare-binary link; `https://github.com/...` URLs are auto-prefixed with the configured GitHub proxy at download time (the recorded value stays as entered) | `setup --llama-url` |
-| `[runtime].default_version` | string? | unset | `b\d+` tag or `"manual"` | `runtime use` |
+| `[runtime].default_version` | string? | unset | `b\d+` tag or `"manual"` | `runtime use` / `runtime update` |
+| `[runtime].tag_complete_limit` | usize? | unset (falls back to 10) | candidate count for the `runtime install` tag-position completion; clamped to 1..=100 (per_page ceiling) | manual edit |
 
 ## Environment variables
 
@@ -46,7 +48,7 @@ default_version = "b10700"   # default backend version (written by runtime use; 
 |---|---|---|
 | `ROXID_GH_PROXY` | env > `[proxy].gh` > direct | GitHub proxy prefix (backend auto/manual downloads and other GitHub assets; manual-chain URLs starting with `https://github.com/` are auto-prefixed, other links are used verbatim) |
 | `ROXID_HF_PROXY` | env > `HF_ENDPOINT` > `[proxy].hf` > official | HuggingFace mirror base (replaces the official domain) |
-| `ROXID_LLAMA_SERVER` | **top of the backend chain**: env → manual → `default_version` → locked tag `b10605` | direct path to a llama-server binary (escape hatch for self-built CUDA versions; cannot be overridden by config) |
+| `ROXID_LLAMA_SERVER` | **top of the backend chain**: env → manual → `default_version` → online latest prerelease | direct path to a llama-server binary (escape hatch for self-built CUDA versions; cannot be overridden by config) |
 | `ROXID_HOME` | env > `~/.roxid` | roxid data root (config.toml / models / llama.cpp / auth.json all follow) |
 | `ROXID_ORIGINS` | env > `OLLAMA_ORIGINS` > default localhost set | allowed CORS origins (comma-separated, `*` wildcards) |
 | `OLLAMA_ORIGINS` | fallback slot above | Ollama-compatible alias |
@@ -68,7 +70,7 @@ default_version = "b10700"   # default backend version (written by runtime use; 
 
 | Domain | Precedence (high → low) |
 |---|---|
-| Backend version | `ROXID_LLAMA_SERVER` (env) → manual (artifact installed via `runtime.llama_url`) → `default_version` (config) → locked-tag auto-download |
+| Backend version | `ROXID_LLAMA_SERVER` (env) → manual (artifact installed via `runtime.llama_url`) → `default_version` (config) → online latest-release auto-download |
 | GitHub proxy | `ROXID_GH_PROXY` (env) → `[proxy].gh` (config) → direct |
 | HF mirror | `ROXID_HF_PROXY` (env) → `HF_ENDPOINT` (env) → `[proxy].hf` (config) → official |
 | Server address (CLI) | `ROXID_HOST` (env) → `OLLAMA_HOST` (env) → default `127.0.0.1:11434` (`serve --addr` affects only the server's listen address; the two are independent) |

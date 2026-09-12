@@ -144,6 +144,13 @@ pub fn spawn_args(spec: &SpawnSpec, port: u16, alias: &str) -> Vec<String> {
         // 规范化模型名（2026-09-10 21:22）
         "--alias".into(),
         alias.to_string(),
+        // M186（迭代49）：固定启用 --jinja——llama-server 改用 GGUF 内嵌
+        // 官方 Jinja 模板渲染工具调用。内建模板按家族硬编码（Qwen3 为
+        // JSON 风格），与 Qwen3.5 等新模型训练分布（XML 风格
+        // <function=...><parameter=...>）错位，模型输出残缺工具调用 →
+        // 上游 500「Failed to parse tool call arguments as JSON」。
+        // RUNTIME flags 追加段在其后，用户仍可后写覆盖（2026-09-12 07:04）
+        "--jinja".into(),
     ];
     if let Some(mmproj) = &spec.mmproj {
         args.push("--mmproj".into());
@@ -994,6 +1001,8 @@ mod tests {
         assert!(args.contains(&"--metrics".to_string()));
         // M100：--alias API 层模型名回显（值 = 规范化完整名）
         assert_eq!(args[idx("--alias") + 1], "m:latest");
+        // M186（迭代49）：--jinja 固定启用（GGUF 内嵌官方模板渲染工具调用）
+        assert!(args.contains(&"--jinja".to_string()));
         // ctx 下限保护：0 → 512×parallel
         let mut low = spec.clone();
         low.ctx_size = 0;

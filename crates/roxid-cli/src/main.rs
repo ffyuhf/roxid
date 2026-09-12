@@ -274,13 +274,16 @@ enum RuntimeCmd {
     List,
     /// Install a runtime version by tag (e.g. b10700) or a custom URL
     Install {
-        /// 版本 tag（b\d+ 形态，如 b10700）
+        /// 版本 tag（b\d+ 形态，如 b10700；Tab 补全候选为 GitHub 最新
+        /// 预发布 tag——迭代48 M183）
         tag: Option<String>,
         /// 自定义包链接（tar.gz 或裸 llama-server；等价 setup --llama-url，
         /// 落位 manual 目录）
         #[arg(long = "url")]
         url: Option<String>,
     },
+    /// Update to the latest llama.cpp prerelease and set it as default
+    Update,
     /// Set the default runtime version (tag or "manual")
     Use { tag: String },
     /// Remove an installed runtime version
@@ -396,14 +399,15 @@ async fn main() {
         .init();
     // 联网命令首次运行触发引导（Q4 裁决 2026-08-26 05:25）：
     // serve 拉起运行时下载、pull/create 触发模型拉取，均为代理生效场景；
-    // M37：runtime install 下载官方包同为联网场景，一并触发
+    // M37：runtime install 下载官方包同为联网场景，一并触发；
+    // M182（迭代48）：runtime update 查 API + 下载同为联网场景，一并触发
     if matches!(
         cli.command,
         Commands::Serve { .. } | Commands::Pull { .. } | Commands::Create { .. }
     ) || matches!(
         cli.command,
         Commands::Runtime {
-            cmd: RuntimeCmd::Install { .. },
+            cmd: RuntimeCmd::Install { .. } | RuntimeCmd::Update,
         }
     ) {
         setup::maybe_run_first_use_wizard().await;
@@ -597,6 +601,71 @@ async fn cmd_runtime(cmd: RuntimeCmd) -> i32 {
                     eprintln!(
                         "安装 {tag} 失败：{e}（tag 不存在或网络问题；可用 ROXID_GH_PROXY 加速）"
                     );
+                    1
+                }
+            }
+        }
+        // 迭代48 M182（Q2-A 裁决 2026-09-12 04:23）：查 GitHub 最新预发布
+        // 版本 → 未装带进度条下载 → 自动写 default_version 设为默认；
+        // 已装且已是默认提示「已是最新」退出 0；已装未设默认补写默认
+        //（不重复下载）。显式命令语义：写配置失败报错退出 1（区别于
+        // serve 兜底链的仅告警——缓存已就位，重跑走「已装未设默认」
+        // 分支收敛，无半途态）
+        RuntimeCmd::Update => {
+            // 变体探测（对齐 Install 分支：未知架构显式报错引导手动链）
+            let variant = match rt::detect_backend().asset_variant() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            // 查最新预发布 tag（3 次重试；失败报错含手动路线引导）
+            let tag = match rt::latest_llama_cpp_tags(1).await {
+                Ok(mut tags) => tags.remove(0),
+                Err(e) => {
+                    eprintln!("查询最新版本失败：{e}");
+                    return 1;
+                }
+            };
+            let cur = roxid_server::config::load_persist_config()
+                .runtime
+                .default_version;
+            let installed = rt::variant_cache_dir(&variant, &tag)
+                .join("llama-server")
+                .is_file();
+            if installed && cur.as_deref() == Some(tag.as_str()) {
+                println!("已是最新版本 {tag}（{variant}），无需更新");
+                return 0;
+            }
+            if !installed {
+                println!(
+                    "探测后端变体：{variant}（宿主 {}；GPU → vulkan / 无 GPU → cpu）",
+                    rt::host_arch_fragment().unwrap_or("未知")
+                );
+                // M105 既有进度链复用（量纲/速度/剩余时间）
+                let (bar, on_progress) = runtime_download_progress("更新运行时");
+                let result = rt::install_version(&tag, &variant, on_progress).await;
+                bar.finish_and_clear();
+                if let Err(e) = result {
+                    eprintln!("更新 {tag} 失败：{e}");
+                    return 1;
+                }
+            }
+            // 设为默认（Q2-A「自动写 default_version 设为默认」）
+            let mut cfg = roxid_server::config::load_persist_config();
+            cfg.runtime.default_version = Some(tag.clone());
+            match roxid_server::config::save_persist_config(&cfg) {
+                Ok(()) => {
+                    if installed {
+                        println!("最新版 {tag} 先前已安装（{variant}），已设为默认");
+                    } else {
+                        println!("已更新至 {tag}（{variant}）并设为默认");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("写入默认版本失败：{e}");
                     1
                 }
             }

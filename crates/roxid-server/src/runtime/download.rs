@@ -52,6 +52,11 @@
 //! 流式累计（content-length 为总量）+ install_version/install_manual
 //! 透传回调 + serve 自动下载场景 5s 周期日志（原全程静默无总量/速度/
 //! 剩余时间，下大包形似卡死；用户实测报告）2026-09-10 21-38
+//! M181（迭代48，Q2/Q3/Q4 裁决 2026-09-12 04:23/04:24/04:25）：
+//! pick_prerelease_tags 泛化（limit 截断，install tag 补全数据源）+
+//! latest_llama_cpp_tags 多 tag 查询（runtime update 与补全共用）+
+//! 查询核心抽取 fetch_releases_with_retry（重试语义逐字不变），
+//! config [runtime].tag_complete_limit 补全数量通道 2026-09-12 04-30
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -64,13 +69,12 @@ use super::backend::diagnose_arch_mismatch;
 use crate::config::llama_runtime_root;
 use crate::error::{RoxidError, RoxidResult};
 
-/// 从 Releases JSON 数组选取最新预发布 tag（迭代46 M173）：过滤
-/// prerelease==true 且 draft==false，按 created_at 降序取首个 tag_name
-///（用户 curl 命令 jq 管道的 Rust 等价实现；抽纯函数供单测锚定语义）。
-///
-/// - 参数 releases：GitHub Releases 列表（已解析 JSON）
-/// - 返回：最新 tag_name（无候选 None）
-fn pick_latest_prerelease_tag(releases: &[serde_json::Value]) -> Option<String> {
+/// 预发布条目降序候选（M181 共享核心）：过滤 prerelease==true 且
+/// draft!=false，按 created_at 降序——M173 pick_latest_prerelease_tag
+/// 与 M181 pick_prerelease_tags 共用（提取自 M173 原内联实现，语义逐字
+/// 保持：created_at 同格式 ISO8601 下字典序即时间序，GitHub 返回形态
+/// 恒定前提成立——迭代46 注记②延续）。
+fn sorted_prerelease_candidates(releases: &[serde_json::Value]) -> Vec<(&str, &str)> {
     let mut candidates: Vec<(&str, &str)> = releases
         .iter()
         .filter(|r| r["prerelease"].as_bool() == Some(true) && r["draft"].as_bool() != Some(true))
@@ -78,20 +82,49 @@ fn pick_latest_prerelease_tag(releases: &[serde_json::Value]) -> Option<String> 
         .collect();
     candidates.sort_by(|a, b| b.1.cmp(a.1));
     candidates
+}
+
+/// 从 Releases JSON 数组选取最新预发布 tag（迭代46 M173）：过滤
+/// prerelease==true 且 draft==false，按 created_at 降序取首个 tag_name
+///（用户 curl 命令 jq 管道的 Rust 等价实现；抽纯函数供单测锚定语义）。
+/// 注意：首个候选**不做** is_valid_tag 过滤——非法形态由调用方报错
+/// （ensure 兜底链 M173 语义），与 pick_prerelease_tags 的宽容剔除
+/// 语义刻意不同（双链漂移防护：修改任一处须同步注释说明）。
+///
+/// - 参数 releases：GitHub Releases 列表（已解析 JSON）
+/// - 返回：最新 tag_name（无候选 None）
+fn pick_latest_prerelease_tag(releases: &[serde_json::Value]) -> Option<String> {
+    sorted_prerelease_candidates(releases)
         .into_iter()
         .next()
         .map(|(tag, _)| tag.to_string())
 }
 
-/// 查询 llama.cpp 官方 GitHub Releases 最新预发布版本 tag（迭代46 M173，
-/// 用户裁决 2026-09-12 02:06 提供 curl 命令 / 02:17 下载时才查 / 02:41
-/// 完整逻辑确认）：GET releases 列表，过滤 prerelease==true 且
-/// draft==false，按 created_at 降序取首个 tag_name——curl+jq 管道的
-/// Rust 等价实现。重试语义对齐 M32/M49：3 次指数退避，4xx 确定性失败
-/// （429 限流除外）快速报错；无任何写死兜底值（用户裁决 02:11）。
+/// 从 Releases JSON 数组选取预发布 tag 列表（迭代48 M181，Q3-B/Q4-A
+/// 裁决 2026-09-12 04:24/04:25）：共享核心降序候选 → is_valid_tag 剔除
+/// 非法形态 → 取前 limit 个——`runtime install` tag 补全候选数据源
+///（宽容语义：补全列表剔除非法 tag，不因个别异常条目整体失败）。
 ///
-/// - 返回：最新预发布 tag（如 "b10909"，经 is_valid_tag 校验）
-async fn latest_llama_cpp_tag() -> RoxidResult<String> {
+/// - 参数 releases：GitHub Releases 列表（已解析 JSON）
+/// - 参数 limit：最多返回的 tag 数（补全数量通道，调用方来自
+///   config [runtime].tag_complete_limit，默认 10）
+/// - 返回：降序 tag 列表（无合法候选时空 Vec）
+pub fn pick_prerelease_tags(releases: &[serde_json::Value], limit: usize) -> Vec<String> {
+    sorted_prerelease_candidates(releases)
+        .into_iter()
+        .map(|(tag, _)| tag.to_string())
+        .filter(|tag| is_valid_tag(tag))
+        .take(limit)
+        .collect()
+}
+
+/// Releases 列表查询共享核心（M181 抽取自 M173 原内联实现，查询参数/
+/// 重试节奏/错误文案逐字保持）：GET api.github.com releases?per_page=100，
+/// 3 次指数退避重试；4xx 确定性失败（429 限流除外）快速报错——重试
+/// 语义对齐 M32/M49；无任何写死兜底值（用户裁决 2026-09-12 02:11）。
+///
+/// - 返回：已解析的 Releases JSON 列表
+async fn fetch_releases_with_retry() -> RoxidResult<Vec<serde_json::Value>> {
     const API_URL: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100";
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -111,15 +144,7 @@ async fn latest_llama_cpp_tag() -> RoxidResult<String> {
                 let releases: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
                     RoxidError::RegistryRequest(format!("解析 Releases 响应失败：{e}"))
                 })?;
-                return match pick_latest_prerelease_tag(&releases) {
-                    Some(tag) if is_valid_tag(&tag) => Ok(tag),
-                    Some(tag) => Err(RoxidError::RegistryRequest(format!(
-                        "最新版本 tag 非法：{tag}"
-                    ))),
-                    None => Err(RoxidError::RegistryRequest(
-                        "GitHub Releases 无预发布版本（prerelease 均为 false）".into(),
-                    )),
-                };
+                return Ok(releases);
             }
             // M49 语义：4xx 确定性失败快速报错；429 限流属瞬态保留重试
             Ok(resp) if resp.status().is_client_error() && resp.status().as_u16() != 429 => {
@@ -143,6 +168,49 @@ async fn latest_llama_cpp_tag() -> RoxidResult<String> {
         "查询 llama.cpp 最新版本失败（{last_error}）。可手动安装：roxid runtime install \
          --llama-url <包地址>；或设置 gh 代理（ROXID_GH_PROXY env / config [proxy].gh）后重试"
     )))
+}
+
+/// 查询 llama.cpp 官方 GitHub Releases 最新预发布版本 tag（迭代46 M173，
+/// 用户裁决 2026-09-12 02:06 提供 curl 命令 / 02:17 下载时才查 / 02:41
+/// 完整逻辑确认）：GET releases 列表，过滤 prerelease==true 且
+/// draft==false，按 created_at 降序取首个 tag_name——curl+jq 管道的
+/// Rust 等价实现。重试语义对齐 M32/M49：3 次指数退避，4xx 确定性失败
+/// （429 限流除外）快速报错；无任何写死兜底值（用户裁决 02:11）。
+/// M181 起查询体走 fetch_releases_with_retry 共享核心。
+///
+/// - 返回：最新预发布 tag（如 "b10909"，经 is_valid_tag 校验）
+async fn latest_llama_cpp_tag() -> RoxidResult<String> {
+    let releases = fetch_releases_with_retry().await?;
+    match pick_latest_prerelease_tag(&releases) {
+        Some(tag) if is_valid_tag(&tag) => Ok(tag),
+        Some(tag) => Err(RoxidError::RegistryRequest(format!(
+            "最新版本 tag 非法：{tag}"
+        ))),
+        None => Err(RoxidError::RegistryRequest(
+            "GitHub Releases 无预发布版本（prerelease 均为 false）".into(),
+        )),
+    }
+}
+
+/// 查询 llama.cpp 官方 GitHub Releases 最新预发布版本 tag 列表（迭代48
+/// M181，Q2-A/Q3-B/Q4-A 裁决链 2026-09-12 04:23-04:25）：与
+/// latest_llama_cpp_tag 同款查询与重试语义（共享核心），返回按
+/// created_at 降序的前 limit 个合法 tag——`runtime update`（limit=1
+/// 取首）与 `runtime install` tag 补全（limit 来自 config
+/// [runtime].tag_complete_limit）共用数据源。
+///
+/// - 参数 limit：最多返回的 tag 数
+/// - 返回：降序 tag 列表（全量剔除后无合法候选时报错——与 M173
+///   「无预发布版本」同语义）
+pub async fn latest_llama_cpp_tags(limit: usize) -> RoxidResult<Vec<String>> {
+    let releases = fetch_releases_with_retry().await?;
+    let tags = pick_prerelease_tags(&releases, limit);
+    if tags.is_empty() {
+        return Err(RoxidError::RegistryRequest(
+            "GitHub Releases 无预发布版本（prerelease 均为 false）".into(),
+        ));
+    }
+    Ok(tags)
 }
 
 /// 覆盖运行时二进制的环境变量（来源：用户确认 2026-08-24 18:51 Q10 方案 B：
@@ -965,6 +1033,36 @@ mod tests {
         assert_eq!(pick_latest_prerelease_tag(&[]), None, "空列表无候选");
     }
 
+    /// 迭代48 M181：pick_prerelease_tags 语义——prerelease 过滤 / draft
+    /// 排除 / created_at 降序 / is_valid_tag 剔除 / limit 截断（Q3-B/Q4-A
+    /// 裁决 2026-09-12 04:24/04:25，install tag 补全候选数据源锚定）
+    #[test]
+    fn pick_prerelease_tags_semantics() {
+        let releases: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+              {"tag_name":"b10909","prerelease":true,"draft":false,"created_at":"2026-09-11T10:00:00Z"},
+              {"tag_name":"b10883","prerelease":true,"draft":false,"created_at":"2026-09-10T08:00:00Z"},
+              {"tag_name":"v1.0.0","prerelease":false,"draft":false,"created_at":"2026-09-11T12:00:00Z"},
+              {"tag_name":"not-a-tag","prerelease":true,"draft":false,"created_at":"2026-09-11T11:00:00Z"},
+              {"tag_name":"b10910","prerelease":true,"draft":true,"created_at":"2026-09-11T11:30:00Z"}
+            ]"#,
+        )
+        .unwrap();
+        // 宽容语义：非法形态剔除（not-a-tag 不出现）、非预发布与草稿排除、降序
+        assert_eq!(
+            pick_prerelease_tags(&releases, 10),
+            vec!["b10909".to_string(), "b10883".to_string()],
+            "not-a-tag 剔除、v1.0.0/b10910 干扰排除、created_at 降序"
+        );
+        // limit 截断：只取最新一个
+        assert_eq!(
+            pick_prerelease_tags(&releases, 1),
+            vec!["b10909".to_string()]
+        );
+        // 空列表零候选
+        assert!(pick_prerelease_tags(&[], 10).is_empty());
+    }
+
     /// M36：list_installed 扫描 {tag}/{variant} 两级目录——manual 与
     /// .installing 残留不计入；空 tag 目录（无变体）不计入；结果按 tag 排序
     #[test]
@@ -1097,6 +1195,8 @@ mod tests {
             runtime: crate::config::RuntimeSection {
                 llama_url: None,
                 default_version: Some("b99999".into()),
+                // M181（迭代48）：新字段补 None（本测试只锚定 default_version 优先级）
+                tag_complete_limit: None,
             },
         })
         .unwrap();

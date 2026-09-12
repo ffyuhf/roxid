@@ -33,6 +33,7 @@
 | `500` | `llama-server process error: ...` | 推理子进程异常（拉起失败、异常退出） | 服务端 |
 | `500` | `io error: ...` | 本地文件系统操作失败（磁盘、权限） | 服务端 |
 | `500` | `registry request failed: ...` | 上游 registry（ollama / HF）请求失败 | 服务端/网络 |
+| `500` | `{"error":{...}}`（嵌套） | 上游 llama-server 错误体原文透传 | 服务端 |
 | `502` | `模型实例已停止或卸载，请求中断` | `rm` / `stop` 卸载实例后在途请求连接中断 | 服务端 |
 | `502` | `This server does not support embeddings. Please use an embedding model` | 对生成模型请求向量化（Pooling none 整形为官方口径） | 客户端 |
 | `502` | 上游错误整形文案 | llama-server 返回非 JSON 响应体等上游失败 | 服务端 |

@@ -285,11 +285,14 @@ REPL 命令：/bye 退出、/clear 清空对话、Ctrl-D 退出。
     (
         "roxid runtime",
         CmdHelp {
+            // 迭代48 M182：示例增 update 行；「锁定链」措辞修正为在线
+            // 最新版兜底（迭代46 起生效，Q5-A 裁决 2026-09-12 04:25）
             about: "管理 llama.cpp 运行时版本",
-            after: r##"运行时解析优先级：环境变量 ROXID_LLAMA_SERVER → manual → 默认版本 → 锁定链。
+            after: r##"运行时解析优先级：环境变量 ROXID_LLAMA_SERVER → manual → 默认版本 → 在线最新版兜底。
 示例：
   roxid runtime list
   roxid runtime install b10700
+  roxid runtime update
   roxid runtime use b10700
   roxid runtime rm b10700"##,
             args: &[],
@@ -306,17 +309,39 @@ REPL 命令：/bye 退出、/clear 清空对话、Ctrl-D 退出。
     (
         "roxid runtime install",
         CmdHelp {
+            // 迭代48 M183：tag 位 Tab 补全说明（GitHub 最新预发布 tag，
+            // 数量经 config [runtime].tag_complete_limit 可配，默认 10）
             about: "安装运行时版本（官方 tag 或自定义链接）",
             after: r##"示例：
   roxid runtime install b10700          # 官方 tag
   roxid runtime install --url <url>     # 自定义包（落位 manual）
 
 自动探测后端变体（GPU → vulkan / 无 GPU → cpu）；
-国内网络可用 ROXID_GH_PROXY 加速。"##,
+国内网络可用 ROXID_GH_PROXY 加速。
+tag 位 Tab 补全候选为 GitHub 最新预发布版本（默认 10 个，
+config.toml [runtime].tag_complete_limit 可配；查询 2 秒超时，
+失败静默零候选）。"##,
             args: &[
-                ("tag", "版本 tag（b\\d+ 形态，如 b10700）"),
+                (
+                    "tag",
+                    "版本 tag（b\\d+ 形态，如 b10700；Tab 补全列 GitHub 最新版）",
+                ),
                 ("url", "自定义包链接（tar.gz 或裸 llama-server）"),
             ],
+        },
+    ),
+    // 迭代48 M182（Q2-A 裁决 2026-09-12 04:23）：update 子命令双语条目
+    (
+        "roxid runtime update",
+        CmdHelp {
+            about: "更新到 llama.cpp 最新预发布版本并设为默认",
+            after: r##"示例：
+  roxid runtime update
+
+查 GitHub Releases 最新预发布版本：未安装则下载（进度可见）
+并设为默认；已安装且已是默认则提示「已是最新」；
+已安装未设默认则补写默认（不重复下载）。"##,
+            args: &[],
         },
     ),
     (
@@ -634,12 +659,16 @@ the wizard automatically on first use."##,
     (
         "roxid runtime",
         CmdHelp {
+            // Iteration 48 M182: update example line; "locked tag" wording
+            // fixed to the online latest-release fallback (in effect since
+            // iteration 46; ruling Q5-A 2026-09-12 04:25)
             about: "Manage llama.cpp runtime versions",
             after: r##"Resolution order: ROXID_LLAMA_SERVER env -> manual ->
-default version -> locked tag.
+default version -> online latest-release fallback.
 Examples:
   roxid runtime list
   roxid runtime install b10700
+  roxid runtime update
   roxid runtime use b10700
   roxid runtime rm b10700"##,
             args: &[],
@@ -657,17 +686,42 @@ along with the default marker."##,
     (
         "roxid runtime install",
         CmdHelp {
+            // Iteration 48 M183: tag-position completion note (latest
+            // GitHub prerelease tags, configurable via
+            // [runtime].tag_complete_limit, default 10)
             about: "Install a runtime version by tag or custom URL",
             after: r##"Examples:
   roxid runtime install b10700          # official tag
   roxid runtime install --url <url>     # custom package (manual)
 
 Detects the backend variant automatically (GPU -> vulkan /
-otherwise cpu); ROXID_GH_PROXY accelerates downloads."##,
+otherwise cpu); ROXID_GH_PROXY accelerates downloads.
+Tab completion at the tag position offers the latest GitHub
+prerelease tags (10 by default, configurable via config.toml
+[runtime].tag_complete_limit; 2s query timeout, silent zero
+candidates on failure)."##,
             args: &[
-                ("tag", "Version tag (b\\d+ form, e.g. b10700)"),
+                (
+                    "tag",
+                    "Version tag (b\\d+ form, e.g. b10700; Tab lists the latest GitHub tags)",
+                ),
                 ("url", "Custom package URL (tar.gz or bare llama-server)"),
             ],
+        },
+    ),
+    // Iteration 48 M182 (ruling Q2-A 2026-09-12 04:23): update subcommand
+    (
+        "roxid runtime update",
+        CmdHelp {
+            about: "Update to the latest llama.cpp prerelease and set it as default",
+            after: r##"Example:
+  roxid runtime update
+
+Queries GitHub Releases for the latest prerelease: downloads it
+with visible progress and sets it as default when missing;
+prints \"already up to date\" when installed and default;
+otherwise only re-points the default (no re-download)."##,
+            args: &[],
         },
     ),
     (
@@ -885,7 +939,9 @@ fn error_headline(e: &clap::Error, lang: Lang) -> Option<String> {
         ErrorKind::ArgumentConflict => match (zh, single(ContextKind::InvalidArg)) {
             (true, Some(a)) => format!("参数 '{a}' 不能与其他互斥参数同时使用"),
             (true, None) => "参数不能与其他互斥参数同时使用".to_string(),
-            (false, Some(a)) => format!("the argument '{a}' cannot be used with other conflicting arguments"),
+            (false, Some(a)) => {
+                format!("the argument '{a}' cannot be used with other conflicting arguments")
+            }
             (false, None) => "arguments cannot be used together".to_string(),
         },
         ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
@@ -930,8 +986,18 @@ fn error_headline(e: &clap::Error, lang: Lang) -> Option<String> {
             "invalid UTF-8 was detected in one or more arguments"
         }
         .to_string(),
-        ErrorKind::Io => if zh { "标准流读写失败" } else { "I/O error" }.to_string(),
-        ErrorKind::Format => if zh { "输出格式化失败" } else { "formatting error" }.to_string(),
+        ErrorKind::Io => if zh {
+            "标准流读写失败"
+        } else {
+            "I/O error"
+        }
+        .to_string(),
+        ErrorKind::Format => if zh {
+            "输出格式化失败"
+        } else {
+            "formatting error"
+        }
+        .to_string(),
         // Display* 三类不经本函数（help/version 正常输出路径）；ErrorKind
         // 标记 non_exhaustive——未来新增变体一并走英文兜底（clap 升级防炸）
         _ => return None,
@@ -1037,7 +1103,8 @@ mod tests {
     /// M177：help 段落标题与 -h 说明替换锚定——四标题、help flag 三形态
     #[test]
     fn help_headings_localization() {
-        let src = "Usage: roxid create [OPTIONS] <MODEL>\nOptions:\n  -h, --help\nArguments:\nCommands:";
+        let src =
+            "Usage: roxid create [OPTIONS] <MODEL>\nOptions:\n  -h, --help\nArguments:\nCommands:";
         let zh = localize_help_headings(src);
         assert!(zh.starts_with("用法： roxid create"), "{zh}");
         assert!(zh.contains("选项：\n"), "{zh}");
@@ -1055,9 +1122,7 @@ mod tests {
         assert_eq!(localize_help_headings("Print help"), "打印帮助");
         // clap 自动生成的 help 子命令条目
         assert_eq!(
-            localize_help_headings(
-                "Print this message or the help of the given subcommand(s)"
-            ),
+            localize_help_headings("Print this message or the help of the given subcommand(s)"),
             "打印本消息或指定子命令的帮助"
         );
         // 正文行内的同形词（非标题语境）同样被替换——经核对双语表正文

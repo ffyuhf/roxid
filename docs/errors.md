@@ -33,6 +33,7 @@ Error text is single-layer and human-readable (nested upstream errors are unwrap
 | `500` | `llama-server process error: ...` | inference subprocess failure (spawn failure, abnormal exit) | server |
 | `500` | `io error: ...` | local filesystem failure (disk, permissions) | server |
 | `500` | `registry request failed: ...` | upstream registry (ollama / HF) request failure | server/network |
+| `500` | `{"error":{...}}` (nested) | upstream llama-server error body passed through as-is | server |
 | `502` | `模型实例已停止或卸载，请求中断` (model instance stopped or unloaded; request interrupted) | in-flight requests after `rm` / `stop` unloaded the instance | server |
 | `502` | `This server does not support embeddings. Please use an embedding model` | embedding request against a generation model (Pooling none reshaped to the official message) | client |
 | `502` | reshaped upstream error text | upstream failures such as non-JSON llama-server bodies | server |

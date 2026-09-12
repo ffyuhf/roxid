@@ -10,6 +10,16 @@
 //! - model 位 → `repo::list_models`（与 cmd_list 同源的 tags 枚举能力）
 //! - runtime use/rm 位 → `runtime::list_installed` + manual 可用性
 //!
+//! 联网例外（各自裁决留痕）：
+//! - stop 值位 → GET /api/ps（1s 超时，迭代36 M125，Q1/Q7 裁决
+//!   2026-09-11 05:43/06:02）
+//! - runtime install 值位 → GET GitHub Releases（2s 超时单次不重试，
+//!   迭代48 M183，Q3-B 裁决 2026-09-12 04:24 裁决区间「1-2 秒」内取 2s
+//!   ——实测 GitHub API 响应常超 1s，1s 掐断致候选恒空（2026-09-12
+//!   04:42 实测 1008ms 被掐断 0 候选，update 无超时链路同刻查询成功）；
+//!   限流 60 次/时风险用户裁决自担；候选数量经 config
+//!   [runtime].tag_complete_limit，默认 10）
+//!
 //! 候选为空时静默输出零行（shell 自然不补，不误报）。
 //!
 //! 修改历史：M57 新增 2026-09-09 21-45
@@ -36,8 +46,8 @@ const TOP_COMMANDS: &[&str] = &[
     "completion",
 ];
 
-/// runtime 二级子命令位候选
-const RUNTIME_SUBS: &[&str] = &["list", "install", "use", "rm"];
+/// runtime 二级子命令位候选（迭代48 M182 增 update）
+const RUNTIME_SUBS: &[&str] = &["list", "install", "update", "use", "rm"];
 
 /// completion 二级子命令位候选
 const COMPLETION_SUBS: &[&str] = &["bash", "zsh", "fish", "install"];
@@ -127,12 +137,16 @@ where
 /// - 参数 runtime_tags：已装 runtime tag（含可用时的 manual）
 /// - 参数 running_models：运行中模型名（stop 值位专用源，来自 /api/ps；
 ///   serve 未运行时为空。迭代36 M125，Q1 裁决 2026-09-11 05:43）
+/// - 参数 install_tags：GitHub 最新预发布 tag（install 值位专用源，
+///   联网 1s 超时查得；失败时为空。迭代48 M183，Q3-B 裁决
+///   2026-09-12 04:24）
 /// - 返回：候选列表（调用方逐行打印）
 pub fn complete_for(
     words: &[String],
     models: &[String],
     runtime_tags: &[String],
     running_models: &[String],
+    install_tags: &[String],
 ) -> Vec<String> {
     let cur = words.last().map(String::as_str).unwrap_or("");
     let prior = &words[..words.len().saturating_sub(1)];
@@ -148,6 +162,11 @@ pub fn complete_for(
         ("roxid", _) => filter_prefix(TOP_COMMANDS, cur),
         ("roxid runtime", _) => filter_prefix(RUNTIME_SUBS, cur),
         ("roxid completion", _) => filter_prefix(COMPLETION_SUBS, cur),
+        // install 值位：GitHub 最新预发布 tag（联网 2s 超时，失败零候选
+        // ——迭代48 M183，Q3-B 裁决 2026-09-12 04:24 + Q6-A 实测修正
+        // 2026-09-12 04:44 维持区间上限 2s；--url 值位误触发联网查询按
+        // 既有「误计零影响」先例维持，失败静默无干扰）
+        ("roxid runtime install", 0) => filter_prefix(install_tags.iter().map(String::as_str), cur),
         // runtime 动态值位：已装 tag（+manual）
         ("roxid runtime use", 0) | ("roxid runtime rm", 0) => {
             filter_prefix(runtime_tags.iter().map(String::as_str), cur)
@@ -194,23 +213,69 @@ fn local_runtime_tags() -> Vec<String> {
 /// `__complete` 子命令入口：计算候选并逐行打印到 stdout。
 /// 迭代36 M125（Q1/Q7 裁决 2026-09-11 05:43/06:02）：stop 值位候选改为
 /// 运行中模型——GET /api/ps，客户端 1s 超时；serve 未运行/超时/响应异常
-/// → 零候选静默（Tab 不卡顿不报错）。其余命令保持本地直读零网络。
+/// → 零候选静默（Tab 不卡顿不报错）。
+/// 迭代48 M183（Q3-B 裁决 2026-09-12 04:24）：install 值位候选改为
+/// GitHub 最新预发布 tag——GET Releases，2s 超时单次不重试，失败零候选
+/// 静默。其余命令保持本地直读零网络。
 ///
 /// - 参数 words：光标上下文 token（到当前词为止，不含程序名与 __complete）
 pub async fn complete(words: &[String]) {
-    // 仅 stop 值位发起网络查询；选项位（- 开头词）走 complete_for 选项分支
+    // 仅 stop / install 值位发起网络查询；选项位（- 开头词）走
+    // complete_for 选项分支
     let cur = words.last().map(String::as_str).unwrap_or("");
     let (path, positional) = analyze(&words[..words.len().saturating_sub(1)]);
-    let is_stop_value =
-        path == "roxid stop" && positional == 0 && !(cur.starts_with('-') && cur != "-");
-    let running = if is_stop_value {
-        running_model_names().await
+    let is_value_pos = !(cur.starts_with('-') && cur != "-");
+    let is_stop_value = path == "roxid stop" && positional == 0 && is_value_pos;
+    let is_install_value = path == "roxid runtime install" && positional == 0 && is_value_pos;
+    let (running, install_tags) = if is_stop_value {
+        (running_model_names().await, Vec::new())
+    } else if is_install_value {
+        (Vec::new(), remote_install_tags().await)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
-    let candidates = complete_for(words, &local_model_names(), &local_runtime_tags(), &running);
+    let candidates = complete_for(
+        words,
+        &local_model_names(),
+        &local_runtime_tags(),
+        &running,
+        &install_tags,
+    );
     for candidate in candidates {
         println!("{candidate}");
+    }
+}
+
+/// install 值位的 GitHub 最新 tag 候选（迭代48 M183，Q3-B 裁决
+/// 2026-09-12 04:24：每次实时联网查，2 秒总超时（裁决区间 1-2s 内取
+/// 上限——实测 API 响应常超 1s，1s 恒空候选），失败零候选静默——
+/// 对齐 stop 值位 /api/ps 先例（M125）；GitHub API 未认证限流 60 次/时
+/// 风险用户裁决自担）。单次尝试不重试（Tab 场景重试徒增卡顿）；
+/// 过滤复用 server 侧 pick_prerelease_tags 纯函数（与 ensure 兜底链
+/// 同源语义），数量经 config [runtime].tag_complete_limit（默认 10）。
+///
+/// - 返回：最新预发布 tag 列表（降序）；超时/网络失败/响应异常时为空
+async fn remote_install_tags() -> Vec<String> {
+    let fetch = async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?;
+        let releases: Vec<serde_json::Value> = client
+            .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100")
+            .header("User-Agent", "roxid")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok::<_, reqwest::Error>(releases)
+    };
+    match fetch.await {
+        Ok(releases) => roxid_server::runtime::pick_prerelease_tags(
+            &releases,
+            roxid_server::config::tag_complete_limit(),
+        ),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -260,16 +325,31 @@ mod tests {
     /// 运行中模型（迭代36 M125：stop 值位专用候选源；刻意为 MODELS
     /// 的真子集以验证 stop 不再吃本地全量）
     const RUNNING: &[&str] = &["qwen3:4b"];
+    /// GitHub 最新 tag（迭代48 M183：install 值位专用候选源；刻意与
+    /// 本地 TAGS 部分交叠以验证两源不串）
+    const INSTALL_TAGS: &[&str] = &["b10909", "b10883"];
 
     /// 顶层子命令位：空当前词出全量（含 ls 别名）；前缀过滤生效
     #[test]
     fn top_level_subcommand_position() {
-        let all = complete_for(&v(&[]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let all = complete_for(
+            &v(&[]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert!(all.contains(&"serve".to_string()));
         assert!(all.contains(&"ls".to_string()));
         assert_eq!(all.len(), TOP_COMMAND_COUNT);
 
-        let s = complete_for(&v(&["s"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let s = complete_for(
+            &v(&["s"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert_eq!(
             s,
             vec!["serve", "show", "stop", "signin", "signout", "setup"]
@@ -279,10 +359,22 @@ mod tests {
     /// model 值位：run/show/pull/push/rm 首位补本地模型名
     #[test]
     fn model_value_position() {
-        let out = complete_for(&v(&["run", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let out = complete_for(
+            &v(&["run", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert_eq!(out, sv(MODELS));
         // 前缀过滤
-        let out = complete_for(&v(&["run", "ll"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let out = complete_for(
+            &v(&["run", "ll"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert_eq!(out, vec!["llama3.2:3b".to_string()]);
     }
 
@@ -290,26 +382,45 @@ mod tests {
     /// 候选来自 running 源而非本地全量；serve 未运行（running 空）零候选
     #[test]
     fn stop_value_position_uses_running_models() {
-        let out = complete_for(&v(&["stop", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let out = complete_for(
+            &v(&["stop", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert_eq!(out, sv(RUNNING), "stop 候选必须是运行中模型而非本地全量");
         // 前缀过滤：本地有但未运行的不出现
-        let out = complete_for(&v(&["stop", "ll"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let out = complete_for(
+            &v(&["stop", "ll"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert!(out.is_empty(), "未运行的 llama3.2:3b 不得出现在 stop 候选");
         // serve 未运行：零候选静默
-        let out = complete_for(&v(&["stop", ""]), &sv(MODELS), &sv(TAGS), &[]);
+        let out = complete_for(&v(&["stop", ""]), &sv(MODELS), &sv(TAGS), &[], &[]);
         assert!(out.is_empty(), "running 为空时 stop 零候选");
     }
 
     /// cp 两位置参数均补模型；run 第二位起（prompt 段）不补
     #[test]
     fn cp_both_positions_and_prompt_silent() {
-        let src = complete_for(&v(&["cp", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let src = complete_for(
+            &v(&["cp", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert_eq!(src, sv(MODELS));
         let dst = complete_for(
             &v(&["cp", "llama3.2:3b", ""]),
             &sv(MODELS),
             &sv(TAGS),
             &sv(RUNNING),
+            &sv(INSTALL_TAGS),
         );
         assert_eq!(dst, sv(MODELS));
         let prompt = complete_for(
@@ -317,20 +428,29 @@ mod tests {
             &sv(MODELS),
             &sv(TAGS),
             &sv(RUNNING),
+            &sv(INSTALL_TAGS),
         );
         assert!(prompt.is_empty(), "prompt 段不补全");
     }
 
-    /// runtime 族：二级子命令位与 use/rm 的动态 tag 位
+    /// runtime 族：二级子命令位与 use/rm/install 的动态 tag 位
+    ///（install 值位为 GitHub 最新 tag——迭代48 M183；use/rm 维持本地已装源）
     #[test]
     fn runtime_nested_and_tag_values() {
-        let subs = complete_for(&v(&["runtime", ""]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
-        assert_eq!(subs, vec!["list", "install", "use", "rm"]);
+        let subs = complete_for(
+            &v(&["runtime", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
+        assert_eq!(subs, vec!["list", "install", "update", "use", "rm"]);
         let use_tags = complete_for(
             &v(&["runtime", "use", ""]),
             &sv(MODELS),
             &sv(TAGS),
             &sv(RUNNING),
+            &sv(INSTALL_TAGS),
         );
         assert_eq!(use_tags, vec!["b10605", "b10700", "manual"]);
         let rm_b = complete_for(
@@ -338,25 +458,76 @@ mod tests {
             &sv(MODELS),
             &sv(TAGS),
             &sv(RUNNING),
+            &sv(INSTALL_TAGS),
         );
         assert_eq!(rm_b, vec!["b10605", "b10700"]);
+        // install 值位：GitHub 最新 tag 源（与本地已装源独立，不串）
+        let inst = complete_for(
+            &v(&["runtime", "install", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
+        assert_eq!(inst, vec!["b10909", "b10883"]);
+        // 前缀过滤 + 联网失败（install_tags 空）零候选静默
+        let inst_b = complete_for(
+            &v(&["runtime", "install", "b108"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
+        assert_eq!(inst_b, vec!["b10883"]);
+        let inst_offline = complete_for(
+            &v(&["runtime", "install", ""]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &[],
+        );
+        assert!(inst_offline.is_empty(), "联网失败时 install 零候选静默");
     }
 
     /// 选项位：- 前缀词补该命令选项；全局选项仅在顶层上下文
     #[test]
     fn option_position() {
-        let run_opts = complete_for(&v(&["run", "--"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let run_opts = complete_for(
+            &v(&["run", "--"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert_eq!(run_opts, vec!["--hf", "--runtime", "--help"]);
-        let top_opts = complete_for(&v(&["--"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let top_opts = complete_for(
+            &v(&["--"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert!(top_opts.contains(&"--nowordwrap".to_string()));
-        let prefix = complete_for(&v(&["run", "--h"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let prefix = complete_for(
+            &v(&["run", "--h"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert_eq!(prefix, vec!["--hf", "--help"]);
     }
 
     /// ls 别名归一：进入 list 后上下文正确（无动态值位，零候选）
     #[test]
     fn ls_alias_canonicalized() {
-        let out = complete_for(&v(&["ls", "x"]), &sv(MODELS), &sv(TAGS), &sv(RUNNING));
+        let out = complete_for(
+            &v(&["ls", "x"]),
+            &sv(MODELS),
+            &sv(TAGS),
+            &sv(RUNNING),
+            &sv(INSTALL_TAGS),
+        );
         assert!(out.is_empty(), "list 无位置参数，第二 token 后零候选");
     }
 
@@ -368,6 +539,7 @@ mod tests {
             &sv(MODELS),
             &sv(TAGS),
             &sv(RUNNING),
+            &sv(INSTALL_TAGS),
         );
         assert_eq!(out, vec!["bash", "zsh", "fish", "install"]);
     }

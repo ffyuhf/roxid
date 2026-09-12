@@ -16,6 +16,11 @@
 //! M36（迭代16）：RuntimeSection 增加 default_version——roxid runtime use
 //! 的持久化落地字段（env 临时覆盖 + config 持久默认两层并存，用户裁决
 //! 2026-09-09 04:33）2026-09-09 04-35
+//! M181（迭代48，Q4-A 裁决 2026-09-12 04:25）：RuntimeSection 增加
+//! tag_complete_limit——runtime install tag 补全候选数量通道（默认 10，
+//! 用户手改 config.toml 生效，无 CLI 写入命令）；顺带修正本段两条
+//! 「b10605 锁定链」失真注释（迭代46 起兜底链为在线最新版，注释漏更）
+//! 2026-09-12 04-32
 
 use std::path::PathBuf;
 
@@ -93,15 +98,40 @@ pub struct PersistConfig {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RuntimeSection {
     /// 手动指定的 llama.cpp 包下载链接（tar.gz 或裸 llama-server 二进制）；
-    /// None 表示未配置（走 b10605 版本锁定自动链）
+    /// None 表示未配置（走在线最新版兜底自动链——M181 注释修正，原
+    /// 「b10605 版本锁定」措辞为迭代46 前旧态）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llama_url: Option<String>,
     /// 默认后端版本 tag（M36，迭代16 用户裁决 Q1-B）：
     /// `roxid runtime use <tag>` 的持久化落地；ensure 链在 manual 未命中后
-    /// 按此版本解析变体缓存；None 表示未设置（兜底 b10605 锁定链，存量零感知）。
+    /// 按此版本解析变体缓存；None 表示未设置（兜底在线查最新版，存量零感知）。
     /// 特殊值 "manual" 表示默认走手动版本目录。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_version: Option<String>,
+    /// runtime install tag 补全候选数量（迭代48 M181，Q4-A 裁决
+    /// 2026-09-12 04:25）：`__complete` 在 install 值位联网查 GitHub
+    /// Releases 时返回的最新预发布 tag 数；None 表示未配置（回退
+    /// DEFAULT_TAG_COMPLETE_LIMIT=10）。用户手动编辑 config.toml 生效，
+    /// 无 CLI 写入命令（Q4-A「同款持久化链」＝ serde 往返保全）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_complete_limit: Option<usize>,
+}
+
+/// install tag 补全候选数量的缺省值（迭代48 M181，Q4-A 裁决
+/// 2026-09-12 04:25「默认 10」）。
+pub const DEFAULT_TAG_COMPLETE_LIMIT: usize = 10;
+
+/// 读取 install tag 补全候选数量：config.toml [runtime].tag_complete_limit
+/// 缺省/未设置时回退默认 10；结果 clamp 至 1..=100（上限依据 GitHub
+/// Releases API per_page=100 单页上限，超出无意义）。
+///
+/// - 返回：补全候选数量（恒在 1..=100 区间）
+pub fn tag_complete_limit() -> usize {
+    load_persist_config()
+        .runtime
+        .tag_complete_limit
+        .unwrap_or(DEFAULT_TAG_COMPLETE_LIMIT)
+        .clamp(1, 100)
 }
 
 /// 代理配置段：键名与既有环境变量语义一一对应（Q3 裁决：仅 GH/HF 两项，ollama 主源不设）。
@@ -234,10 +264,12 @@ mod tests {
                 gh: Some("https://gh.example.dev/".into()),
                 hf: Some("https://hf.example.com".into()),
             },
-            // M31：runtime 段一并往返（迭代11 F2）；M36：default_version 一并往返
+            // M31：runtime 段一并往返（迭代11 F2）；M36：default_version
+            // 一并往返；M181：tag_complete_limit 一并往返
             runtime: RuntimeSection {
                 llama_url: Some("https://example.dev/llama-custom.tar.gz".into()),
                 default_version: Some("b10700".into()),
+                tag_complete_limit: Some(12),
             },
         };
         save_persist_config(&cfg).expect("写盘必须成功");
@@ -255,6 +287,11 @@ mod tests {
             load_persist_config().runtime.default_version.as_deref(),
             Some("b10700"),
             "M36：runtime.default_version 必须完整往返"
+        );
+        assert_eq!(
+            load_persist_config().runtime.tag_complete_limit,
+            Some(12),
+            "M181：runtime.tag_complete_limit 必须完整往返"
         );
         assert_eq!(
             load_persist_config().proxy.hf.as_deref(),

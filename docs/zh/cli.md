@@ -244,15 +244,16 @@ roxid setup [--llama-url <url>]
 |---|---|---|---|
 | `--llama-url` | string | — | 手动指定 llama.cpp 包下载链接（tar.gz 或裸 llama-server 二进制）并立即安装；安装成功记录至 config.toml `[runtime].llama_url`。`https://github.com/` 开头的链接自动经已配置的 GitHub 代理前缀下载，其余链接原样直用 |
 
-交互向导流程：中国网络环境检测（时区 / locale）→ 代理配置（推荐值预填，可改可清除）→ 自定义 llama.cpp 链接（可选，默认跳过）→ shell 补全安装（默认 Y）。联网命令（serve / pull / create / runtime install）首次运行时自动触发引导（config.toml 存在即不再触发）。
+交互向导流程：中国网络环境检测（时区 / locale）→ 代理配置（推荐值预填，可改可清除）→ 自定义 llama.cpp 链接（可选，默认跳过）→ shell 补全安装（默认 Y）。联网命令（serve / pull / create / runtime install / runtime update）首次运行时自动触发引导（config.toml 存在即不再触发）。
 
 ## runtime 族
 
-llama.cpp 后端多版本管理（本地操作，不经 serve）。运行时解析优先级：`ROXID_LLAMA_SERVER` 环境变量 → manual → 默认版本（`default_version`）→ 锁定链兜底。
+llama.cpp 后端多版本管理（本地操作，不经 serve）。运行时解析优先级：`ROXID_LLAMA_SERVER` 环境变量 → manual → 默认版本（`default_version`）→ 在线最新版兜底（查 GitHub Releases 最新预发布版本，落定后写入 `default_version`）。
 
 ```text
 roxid runtime list
 roxid runtime install <tag> | --url <url>
+roxid runtime update
 roxid runtime use <tag | manual>
 roxid runtime rm <tag>
 ```
@@ -260,20 +261,22 @@ roxid runtime rm <tag>
 | 子命令 | 参数 | 说明 |
 |---|---|---|
 | `list` | — | 列出已装版本（标注 `[默认]`）与 manual；含解析优先级说明 |
-| `install` | `<tag>`（`b\d+` 形态，如 `b10700`）或 `--url <url>`（二选一） | 按官方 tag 下载（变体按宿主 CPU 架构 `x64`/`arm64` 自动匹配 + GPU → vulkan / 无 GPU → cpu）；`--url` 安装为 manual 版本 |
+| `install` | `<tag>`（`b\d+` 形态，如 `b10700`）或 `--url <url>`（二选一） | 按官方 tag 下载（变体按宿主 CPU 架构 `x64`/`arm64` 自动匹配 + GPU → vulkan / 无 GPU → cpu）；`--url` 安装为 manual 版本；tag 位 Tab 补全候选为 GitHub 最新预发布版本（默认 10 个，经 `[runtime].tag_complete_limit` 可配；查询 2 秒超时，失败静默零候选） |
+| `update` | — | 查 GitHub Releases 最新预发布版本：未安装则下载（进度可见）并设为默认；已安装且已是默认则提示「已是最新」；已安装未设默认则仅补写默认（不重复下载） |
 | `use` | `<tag>` 或 `manual` | 设默认版本并持久化；切换后首个请求即卸旧实例、以新版本拉起 |
 | `rm` | `<tag>` | 删除已装版本；默认版本需先切换后才能删除 |
 
 ```sh
 roxid runtime list
 roxid runtime install b10700
+roxid runtime update
 roxid runtime install --url https://example.com/llama-server.tar.gz
 roxid runtime use manual
 ```
 
 ## completion 族
 
-shell 补全管理（bash / zsh / fish；静态候选 + 动态值候选——模型名与 runtime tag 直读本地 `~/.roxid`，零网络零延迟）。
+shell 补全管理（bash / zsh / fish；静态候选 + 动态值候选——模型名与 `runtime use`/`rm` 的 tag 直读本地 `~/.roxid`，零网络零延迟；`runtime install` tag 位在线查 GitHub Releases——2 秒超时，失败静默零候选——候选数量经 `[runtime].tag_complete_limit` 可配，默认 10）。
 
 ```text
 roxid completion bash | zsh | fish    # 输出 shim 脚本（供 eval / 管道）

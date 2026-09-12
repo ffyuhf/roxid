@@ -244,15 +244,16 @@ roxid setup [--llama-url <url>]
 |---|---|---|---|
 | `--llama-url` | string | — | Manually specified llama.cpp package download link (tar.gz or a bare llama-server binary), installed immediately; recorded in config.toml `[runtime].llama_url` on success. Links starting with `https://github.com/` are automatically downloaded through the configured GitHub proxy prefix; other links are used verbatim |
 
-Wizard flow: mainland-China network detection (timezone / locale) → proxy configuration (recommended prefills, editable/clearable) → optional custom llama.cpp link (skipped by default) → shell completion install (default Y). Networked commands (serve / pull / create / runtime install) trigger the wizard automatically on first run (suppressed once config.toml exists).
+Wizard flow: mainland-China network detection (timezone / locale) → proxy configuration (recommended prefills, editable/clearable) → optional custom llama.cpp link (skipped by default) → shell completion install (default Y). Networked commands (serve / pull / create / runtime install / runtime update) trigger the wizard automatically on first run (suppressed once config.toml exists).
 
 ## runtime family
 
-llama.cpp backend multi-version management (local operations, no serve required). Resolution order: `ROXID_LLAMA_SERVER` env → manual → default version (`default_version`) → locked-tag fallback.
+llama.cpp backend multi-version management (local operations, no serve required). Resolution order: `ROXID_LLAMA_SERVER` env → manual → default version (`default_version`) → online latest-release fallback (queries GitHub Releases for the latest prerelease and writes `default_version` once landed).
 
 ```text
 roxid runtime list
 roxid runtime install <tag> | --url <url>
+roxid runtime update
 roxid runtime use <tag | manual>
 roxid runtime rm <tag>
 ```
@@ -260,20 +261,22 @@ roxid runtime rm <tag>
 | Subcommand | Arguments | Description |
 |---|---|---|
 | `list` | — | List installed versions (default marked `[默认]`) plus manual; includes the resolution order |
-| `install` | `<tag>` (form `b\d+`, e.g. `b10700`) or `--url <url>` (mutually exclusive) | Download by official tag (variant auto-detected per host CPU arch `x64`/`arm64` + GPU → vulkan / otherwise cpu); `--url` installs as the manual version |
+| `install` | `<tag>` (form `b\d+`, e.g. `b10700`) or `--url <url>` (mutually exclusive) | Download by official tag (variant auto-detected per host CPU arch `x64`/`arm64` + GPU → vulkan / otherwise cpu); `--url` installs as the manual version; Tab completion at the tag position offers the latest GitHub prerelease tags (10 by default, configurable via `[runtime].tag_complete_limit`; 2s query timeout, silent zero candidates on failure) |
+| `update` | — | Query GitHub Releases for the latest prerelease: download it with visible progress and set it as default when missing; print "already up to date" when installed and default; otherwise only re-point the default (no re-download) |
 | `use` | `<tag>` or `manual` | Set and persist the default version; the first request after switching tears down the old instance and starts the new version |
 | `rm` | `<tag>` | Remove an installed version; the current default must be switched away first |
 
 ```sh
 roxid runtime list
 roxid runtime install b10700
+roxid runtime update
 roxid runtime install --url https://example.com/llama-server.tar.gz
 roxid runtime use manual
 ```
 
 ## completion family
 
-Shell completion management (bash / zsh / fish; static candidates plus dynamic value candidates — model names and runtime tags are read directly from local `~/.roxid`, zero network, zero latency).
+Shell completion management (bash / zsh / fish; static candidates plus dynamic value candidates — model names and `runtime use`/`rm` tags are read directly from local `~/.roxid`, zero network, zero latency; the `runtime install` tag position queries GitHub Releases online — 2s timeout, silent zero candidates on failure — with the candidate count configurable via `[runtime].tag_complete_limit`, default 10).
 
 ```text
 roxid completion bash | zsh | fish    # print the shim script (for eval / piping)

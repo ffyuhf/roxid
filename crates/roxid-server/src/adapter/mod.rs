@@ -615,6 +615,25 @@ pub fn strip_think_blocks(content: &str) -> String {
     out.trim().to_string()
 }
 
+/// M187（迭代49）：llama-server tool_calls 的 function.arguments 字符串 →
+/// Ollama 官方对象形态。官方 /api/chat 的 arguments 为 map 对象（如
+/// {"city":"Tokyo"}），llama-server 按 OpenAI 协议返回 JSON 字符串；
+/// 客户端（Roo Code 等）按官方形态消费时字符串直传引发解析失败。
+/// parse 失败（空串/畸形/流式部分分片）宽容保留字符串原值，避免二次
+/// 伤害（流式完整重组不在本轮范围，形态差异已记入架构文档注记）。
+///
+/// - 参数 raw：上游 function.arguments 值（预期字符串形态）
+/// - 返回：解析成功为 JSON 值（对象/数组等），失败为原值克隆
+fn tool_call_arguments_to_ollama(raw: &Value) -> Value {
+    match raw
+        .as_str()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    {
+        Some(parsed) => parsed,
+        None => raw.clone(),
+    }
+}
+
 /// OpenAI 非流式 chat 响应 → Ollama /api/chat 响应。
 ///
 /// - 参数 model：模型名
@@ -644,7 +663,8 @@ pub fn openai_chat_response_to_ollama(model: &str, openai: &Value) -> Value {
                 json!({
                     "function": {
                         "name": c["function"]["name"],
-                        "arguments": c["function"]["arguments"],
+                        // M187：arguments 字符串 → Ollama 官方对象形态
+                        "arguments": tool_call_arguments_to_ollama(&c["function"]["arguments"]),
                     }
                 })
             })
@@ -711,7 +731,11 @@ pub fn openai_chunk_to_ollama_chat_events(model: &str, chunk: &Value) -> Vec<Val
                     json!({
                         "function": {
                             "name": c["function"]["name"],
-                            "arguments": c["function"]["arguments"],
+                            // M187：arguments 字符串 → Ollama 官方对象形态
+                            // （流式部分分片 parse 失败回退字符串原值）
+                            "arguments": tool_call_arguments_to_ollama(
+                                &c["function"]["arguments"]
+                            ),
                         }
                     })
                 })
@@ -1116,6 +1140,60 @@ mod tests {
         assert_eq!(
             events[0]["done_reason"], "tools",
             "tool_calls 必须映射为 tools"
+        );
+    }
+
+    /// M187（迭代49）：arguments 字符串 → Ollama 官方对象形态三态——
+    /// 合法 JSON 字符串对象化、畸形/部分分片宽容回退字符串原值
+    #[test]
+    fn tool_call_arguments_objectified() {
+        // 非流式：合法 JSON 字符串 → 对象（对齐官方 map 形态）
+        let resp = json!({"choices": [{"message": {"role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "get_weather",
+                "arguments": "{\"city\": \"Tokyo\", \"unit\": \"c\"}"}}]},
+            "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 3, "completion_tokens": 7}});
+        let out = openai_chat_response_to_ollama("m", &resp);
+        assert_eq!(
+            out["message"]["tool_calls"][0]["function"]["arguments"],
+            json!({"city": "Tokyo", "unit": "c"}),
+            "字符串必须对象化为官方 map 形态"
+        );
+        // 空对象字符串 → 空对象（非空字符串）
+        let resp = json!({"choices": [{"message": {"role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "f", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]});
+        let out = openai_chat_response_to_ollama("m", &resp);
+        assert_eq!(
+            out["message"]["tool_calls"][0]["function"]["arguments"],
+            json!({}),
+            "空对象字符串对象化为空对象"
+        );
+        // 畸形字符串（用户报错原始形态：截断仅剩 "{"）→ 回退字符串原值
+        let resp = json!({"choices": [{"message": {"role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "f", "arguments": "{"}}]},
+            "finish_reason": "tool_calls"}]});
+        let out = openai_chat_response_to_ollama("m", &resp);
+        assert_eq!(
+            out["message"]["tool_calls"][0]["function"]["arguments"],
+            json!("{"),
+            "畸形字符串宽容保留原值，不产生二次伤害"
+        );
+        // 流式：单片完整 JSON → 对象；部分分片（token 级片段）→ 字符串原值
+        let chunk = json!({"choices": [{"delta": {"tool_calls": [
+            {"function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}]}}]});
+        let events = openai_chunk_to_ollama_chat_events("m", &chunk);
+        assert_eq!(
+            events[0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json!({"city": "Tokyo"}),
+            "流式单片中完整 JSON 同样对象化"
+        );
+        let frag = json!({"choices": [{"delta": {"tool_calls": [
+            {"function": {"name": "", "arguments": "{\"ci"}}]}}]});
+        let events = openai_chunk_to_ollama_chat_events("m", &frag);
+        assert_eq!(
+            events[0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"ci"),
+            "流式部分分片 parse 失败回退字符串原值（客户端累积）"
         );
     }
 

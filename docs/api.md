@@ -146,6 +146,8 @@ Request fields:
 
 Message roles: `system` / `user` / `assistant` / `tool`; assistant thinking is passed back via `thinking` to preserve multi-turn context.
 
+Tool calling: the backend is launched with `--jinja` (models' embedded chat templates are used). In non-stream responses `tool_calls[].function.arguments` is returned as an object; in streams, argument fragments arrive as string pieces for client-side accumulation.
+
 Streaming response (each NDJSON line):
 
 ```json

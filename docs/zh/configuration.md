@@ -27,7 +27,8 @@ hf = "https://hf-mirror.com/"      # HuggingFace 镜像基址（整体替换官�
 
 [runtime]                    # llama.cpp 后端
 llama_url = "https://example.com/llama.tar.gz"  # 手动后端来源链接（setup --llama-url 记录）；可省略
-default_version = "b10700"   # 默认后端版本（runtime use 写入；特殊值 "manual" 走手动版本）；可省略
+default_version = "b10700"   # 默认后端版本（runtime use / runtime update 写入；特殊值 "manual" 走手动版本）；可省略
+tag_complete_limit = 10      # runtime install tag 补全候选数量（手动编辑生效；clamp 至 1..=100）；可省略
 ```
 
 | 字段 | 类型 | 默认 | 取值约束 | 写入方 |
@@ -36,7 +37,8 @@ default_version = "b10700"   # 默认后端版本（runtime use 写入；特殊�
 | `[proxy].gh` | string? | 未设置 | URL 前缀，语义同 `ROXID_GH_PROXY` | setup 向导 |
 | `[proxy].hf` | string? | 未设置 | 镜像基址，语义同 `ROXID_HF_PROXY` | setup 向导 |
 | `[runtime].llama_url` | string? | 未设置 | tar.gz 或裸二进制链接；`https://github.com/` 开头的链接下载时自动前置拼接已配置的 GitHub 代理前缀（记录值保持用户输入原样） | `setup --llama-url` |
-| `[runtime].default_version` | string? | 未设置 | `b\d+` 形态 tag 或 `"manual"` | `runtime use` |
+| `[runtime].default_version` | string? | 未设置 | `b\d+` 形态 tag 或 `"manual"` | `runtime use` / `runtime update` |
+| `[runtime].tag_complete_limit` | usize? | 未设置（回退 10） | `runtime install` tag 位补全候选数量；clamp 至 1..=100（per_page 单页上限） | 手动编辑 |
 
 ## 环境变量全表
 
@@ -46,7 +48,7 @@ default_version = "b10700"   # 默认后端版本（runtime use 写入；特殊�
 |---|---|---|
 | `ROXID_GH_PROXY` | env > `[proxy].gh` > 直连 | GitHub 代理前缀（后端自动/手动下载、HF 镜像回退链等 GitHub 资源；手动链 `https://github.com/` 开头自动拼接，其余链接原样直用） |
 | `ROXID_HF_PROXY` | env > `HF_ENDPOINT` > `[proxy].hf` > 官方 | HuggingFace 镜像基址（整体替换官方域名） |
-| `ROXID_LLAMA_SERVER` | **后端解析链最高**：env → manual → `default_version` → 锁定链 `b10605` | 直指 llama-server 二进制路径（自编译 CUDA 版逃生口；不可被配置覆盖） |
+| `ROXID_LLAMA_SERVER` | **后端解析链最高**：env → manual → `default_version` → 在线最新预发布版 | 直指 llama-server 二进制路径（自编译 CUDA 版逃生口；不可被配置覆盖） |
 | `ROXID_HOME` | env > `~/.roxid` | roxid 数据根目录（config.toml / models / llama.cpp / auth.json 全部随之迁移） |
 | `ROXID_ORIGINS` | env > `OLLAMA_ORIGINS` > 默认 localhost 系 | CORS 放行来源（逗号分隔，支持 `*` 通配） |
 | `OLLAMA_ORIGINS` | 同上回退位 | 兼容原版 Ollama 惯例 |
@@ -68,7 +70,7 @@ default_version = "b10700"   # 默认后端版本（runtime use 写入；特殊�
 
 | 配置域 | 优先级（高 → 低） |
 |---|---|
-| 后端版本选择 | `ROXID_LLAMA_SERVER`（env）→ manual（`runtime.llama_url` 安装物）→ `default_version`（config）→ 锁定链自动下载 |
+| 后端版本选择 | `ROXID_LLAMA_SERVER`（env）→ manual（`runtime.llama_url` 安装物）→ `default_version`（config）→ 在线最新版自动下载 |
 | GitHub 代理 | `ROXID_GH_PROXY`（env）→ `[proxy].gh`（config）→ 直连 |
 | HF 镜像 | `ROXID_HF_PROXY`（env）→ `HF_ENDPOINT`（env）→ `[proxy].hf`（config）→ 官方直连 |
 | 服务地址（CLI） | `ROXID_HOST`（env）→ `OLLAMA_HOST`（env）→ 默认 `127.0.0.1:11434`（`serve --addr` 仅影响服务端监听地址，二者独立） |

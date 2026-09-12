@@ -20,6 +20,9 @@
 //! 第四键的 resolve-only 解析（runtime use 切换感知）2026-09-09 20-30
 //! M173/M174（迭代46）：LOCKED_LLAMA_CPP_TAG 常量删除（兜底链改在线查
 //! 最新版 + resolve 第4步 None 放行）2026-09-12 02-45
+//! M181（迭代48）：latest_llama_cpp_tags / pick_prerelease_tags 导出
+//! ——runtime update 子命令与 install tag 补全的共用数据源
+//! （Q2-A/Q3-B 裁决 2026-09-12 04:23/04:24）2026-09-12 04-32
 
 mod backend;
 mod download;
@@ -33,7 +36,8 @@ pub use backend::{
 };
 pub use download::{
     asset_url, ensure_llama_server, install_manual, install_version,
-    installed_variant_arch_mismatch, is_valid_tag, list_installed, manual_dir, manual_server_path,
-    remove_version, resolve_llama_server_path, url_is_archive, variant_cache_dir,
-    warn_installed_arch_mismatch, ENV_LLAMA_SERVER_OVERRIDE,
+    installed_variant_arch_mismatch, is_valid_tag, latest_llama_cpp_tags, list_installed,
+    manual_dir, manual_server_path, pick_prerelease_tags, remove_version,
+    resolve_llama_server_path, url_is_archive, variant_cache_dir, warn_installed_arch_mismatch,
+    ENV_LLAMA_SERVER_OVERRIDE,
 };
