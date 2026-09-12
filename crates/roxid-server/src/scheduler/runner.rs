@@ -43,10 +43,14 @@
 //! M170（迭代45 Q5-A 裁决 2026-09-12 01:45）：expires_at() getter
 //! 公开——registry 空闲实例 LRU 卸载（evict_one_idle）按到期时刻
 //! 最早优先的比较键 2026-09-12 01-56
-//! M196（迭代51 Q4-A/Q5-A/Q6-A 裁决 2026-09-12 18:03/18:11）：spawn_args
+//! M196（迭代51 Q4-A/Q5-A 裁决 2026-09-12 18:03/18:11）：spawn_args
 //! 推理优化自动注入——生成类注入 --spec-type（MTP 头在位则
-//! draft-mtp,ngram-mod + n-max 2，否则 ngram-mod）+ --spec-autotune，
-//! RUNTIME 显式接管时整段跳过 2026-09-12 18-17
+//! draft-mtp,ngram-mod + n-max 2，否则 ngram-mod），
+//! RUNTIME 显式接管时整段跳过 2026-09-12 18-17；
+//! M199（迭代52 Q1-A 勘误裁决 2026-09-12 19:30）：原附
+//! --spec-autotune 为幻觉参数（ik_llama.cpp 分支 PR 1595 专有，
+//! ggml-org 主仓库查无此参数，任何官方版本均拒启）——删除
+//! 2026-09-12 19-34
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -164,12 +168,16 @@ pub fn spawn_args(spec: &SpawnSpec, port: u16, alias: &str) -> Vec<String> {
         // RUNTIME flags 追加段在其后，用户仍可后写覆盖（2026-09-12 07:04）
         "--jinja".into(),
     ];
-    // M196（迭代51，Q4-A/Q5-A/Q6-A 裁决 2026-09-12 18:03/18:11）：
+    // M196（迭代51，Q4-A/Q5-A 裁决 2026-09-12 18:03/18:11）：
     // 推理优化自动注入——仅生成类；llama-server --spec-type 默认 none，
     // 不注入则 MTP/ngram 加速全部旁置。组合：MTP 头在位 →
     // draft-mtp,ngram-mod 并存（逗号多选）+ --spec-draft-n-max 2
     // （官方 PR #22673 推荐值）；否则 ngram-mod（官方 --spec-default 同款，
-    // 无 draft 模型依赖）；均附 --spec-autotune 自动调优 tokens/sec。
+    // 无 draft 模型依赖）。
+    // M199（迭代52 Q1-A 勘误 2026-09-12 19:30）：原 Q6 附带的
+    // --spec-autotune 为幻觉参数——ik_llama.cpp 分支（PR 1595）专有，
+    // ggml-org/llama.cpp 主仓库查无此参数（官方文档/源码三轮查证 +
+    // 用户侧独立核实），任何官方版本均拒启——删除。
     // RUNTIME 显式含 spec 类参数（--spec-type/-md/--spec-draft-model）时
     // 整段跳过——用户接管；注入段位于 RUNTIME 追加段之前，后写覆盖
     // 语义保持用户最终控制权。embedding/TTS 类零注入（投机仅对生成有意义）
@@ -191,7 +199,6 @@ pub fn spawn_args(spec: &SpawnSpec, port: u16, alias: &str) -> Vec<String> {
         } else {
             args.push("ngram-mod".into());
         }
-        args.push("--spec-autotune".into());
     }
     if let Some(mmproj) = &spec.mmproj {
         args.push("--mmproj".into());
@@ -1150,20 +1157,21 @@ mod tests {
         };
         let idx = |args: &[String], k: &str| args.iter().position(|a| a == k).unwrap();
 
-        // 无 MTP 生成类：ngram-mod + autotune，无 draft-mtp 段
+        // 无 MTP 生成类：ngram-mod，无 draft-mtp 段；
+        // M199 勘误：幻觉参数 --spec-autotune 必须绝迹于 argv
         let args = spawn_args(&base(), 1, "m:latest");
         assert_eq!(args[idx(&args, "--spec-type") + 1], "ngram-mod");
-        assert!(args.contains(&"--spec-autotune".to_string()));
+        assert!(!args.contains(&"--spec-autotune".to_string()));
         assert!(!args.contains(&"draft-mtp".to_string()));
         assert!(!args.contains(&"--spec-draft-n-max".to_string()));
 
-        // 有 MTP：draft-mtp,ngram-mod 并存 + n-max 2 + autotune
+        // 有 MTP：draft-mtp,ngram-mod 并存 + n-max 2（M199 勘误：无 autotune）
         let mut mtp = base();
         mtp.has_mtp = true;
         let args = spawn_args(&mtp, 1, "m:latest");
         assert_eq!(args[idx(&args, "--spec-type") + 1], "draft-mtp,ngram-mod");
         assert_eq!(args[idx(&args, "--spec-draft-n-max") + 1], "2");
-        assert!(args.contains(&"--spec-autotune".to_string()));
+        assert!(!args.contains(&"--spec-autotune".to_string()));
 
         // RUNTIME 显式 --spec-type：自动段整段跳过（用户接管）
         let mut takeover = base();
